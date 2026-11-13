@@ -79,6 +79,16 @@ def _surface_distances(pred: np.ndarray, target: np.ndarray) -> tuple[np.ndarray
     return dist_pred_to_tgt, dist_tgt_to_pred
 
 
+def _empty_mask_distance(pred: np.ndarray, target: np.ndarray) -> float:
+    """Return 0 for two empty masks, otherwise the image diagonal penalty."""
+    pred_empty = not np.any(pred)
+    target_empty = not np.any(target)
+    if pred_empty and target_empty:
+        return 0.0
+    extents = np.maximum(np.asarray(pred.shape, dtype=float) - 1.0, 0.0)
+    return float(np.linalg.norm(extents))
+
+
 def _erode(mask: np.ndarray) -> np.ndarray:
     from scipy.ndimage import binary_erosion
     return binary_erosion(mask)
@@ -86,6 +96,8 @@ def _erode(mask: np.ndarray) -> np.ndarray:
 
 def hausdorff_distance_95(pred: np.ndarray, target: np.ndarray) -> float:
     """95th-percentile Hausdorff distance (in voxels)."""
+    if not np.any(pred) or not np.any(target):
+        return _empty_mask_distance(pred, target)
     d1, d2 = _surface_distances(pred, target)
     if np.isnan(d1).all() or np.isnan(d2).all():
         return float("inf")
@@ -95,6 +107,8 @@ def hausdorff_distance_95(pred: np.ndarray, target: np.ndarray) -> float:
 
 
 def average_surface_distance(pred: np.ndarray, target: np.ndarray) -> float:
+    if not np.any(pred) or not np.any(target):
+        return _empty_mask_distance(pred, target)
     d1, d2 = _surface_distances(pred, target)
     if np.isnan(d1).all() or np.isnan(d2).all():
         return float("inf")

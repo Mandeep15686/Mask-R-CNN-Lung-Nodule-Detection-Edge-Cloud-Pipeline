@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import itertools
+import random
 from pathlib import Path
 from copy import deepcopy
 from typing import Optional
@@ -44,7 +45,7 @@ PHASE1_CONFIGS = [
     {"config_id": "C-DICE",     "mask_loss": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0}},
     {"config_id": "C-BDRY",     "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 1.0, "delta": 0.0, "epsilon": 0.0}},
     {"config_id": "C-FOCAL",    "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 1.0, "epsilon": 0.0}},
-    {"config_id": "C-TVK",      "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0}},  # placeholder
+    {"config_id": "C-TVK",      "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0, "zeta": 1.0}},
     {"config_id": "C-HD95",     "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 1.0}},
 ]
 
@@ -198,8 +199,12 @@ class ExperimentRunner:
     def run_phase2(self, max_configs: Optional[int] = None):
         logger.info("=== PHASE 2: Grid search (alpha, beta, gamma) ===")
         configs = generate_phase2_configs()
-        if max_configs:
-            configs = configs[:max_configs]
+        if max_configs is not None:
+            if max_configs < 1:
+                raise ValueError("max_configs must be at least 1")
+            if max_configs < len(configs):
+                rng = random.Random(42)
+                configs = rng.sample(configs, k=max_configs)
         logger.info(f"Running {len(configs)} configurations...")
         for i, cfg_override in enumerate(configs):
             logger.info(f"[{i+1}/{len(configs)}] {cfg_override['config_id']}")

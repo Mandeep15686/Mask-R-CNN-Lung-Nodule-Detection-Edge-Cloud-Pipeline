@@ -284,19 +284,44 @@ class LUNA16Dataset(Dataset):
 
 
 def build_dataloaders(
-    data_root: str,
+    data_root: str | Path,
     fold: int = 0,
     batch_size: int = 8,
     num_workers: int = 2,
     patch_size: int = 64,
 ) -> tuple[DataLoader, DataLoader]:
     """
-    Build train/val DataLoaders using LUNA16's 10-fold CV structure.
-    fold ∈ [0, 9] — the given subset is used for validation.
+    Build train/val DataLoaders using the subsets available under data_root.
+    The requested fold is used for validation; all other discovered subsets
+    are used for training.
     """
-    all_subsets = list(range(10))
-    val_subset = [fold % 10]
-    train_subsets = [s for s in all_subsets if s not in val_subset]
+    data_root = Path(data_root)
+
+    # Automatically discover available LUNA16 subsets
+    all_subsets = sorted(
+        int(p.name.replace("subset", ""))
+        for p in data_root.glob("subset*")
+        if p.is_dir() and p.name.replace("subset", "").isdigit()
+    )
+
+    if len(all_subsets) < 2:
+        raise ValueError(
+            f"At least 2 subsets are required. Found: {all_subsets}"
+        )
+
+    if fold not in all_subsets:
+        raise ValueError(
+            f"Validation fold {fold} is unavailable. "
+            f"Available subsets: {all_subsets}"
+        )
+
+    val_subset = [fold]
+    train_subsets = [s for s in all_subsets if s != fold]
+
+    logger.info(
+        f"Available subsets: {all_subsets} | "
+        f"Training: {train_subsets} | Validation: {val_subset}"
+    )
 
     train_ds = LUNA16Dataset(
         data_root, train_subsets, patch_size=patch_size, augment=True

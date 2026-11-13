@@ -7,6 +7,8 @@
 data/
 datasets/
 experiments/
+experiments_phase2_screen/
+experiments_phase2_5ep_20cfg/
 *.pth
 *.pt
 *.ckpt
