@@ -1,0 +1,24 @@
+{
+  "description": "Phase 2 — Hand-picked grid search configurations (α·BCE + β·Dice + γ·Boundary).",
+  "base": {
+    "epochs": 30,
+    "batch_size": 4,
+    "lr": 0.005,
+    "fold": 0,
+    "data_root": "./data/luna16"
+  },
+  "experiments": [
+    {"config_id":"G-a05-b05-g00","phase":2,"loss_weights":{"alpha":0.5,"beta":0.5,"gamma":0.0,"delta":0.0,"epsilon":0.0},"note":"BCE+Dice equal"},
+    {"config_id":"G-a00-b05-g05","phase":2,"loss_weights":{"alpha":0.0,"beta":0.5,"gamma":0.5,"delta":0.0,"epsilon":0.0},"note":"Dice+Boundary equal, no BCE anchor"},
+    {"config_id":"G-a03-b05-g05","phase":2,"loss_weights":{"alpha":0.3,"beta":0.5,"gamma":0.5,"delta":0.0,"epsilon":0.0},"note":"Hypothesised best — balanced all three"},
+    {"config_id":"G-a03-b07-g03","phase":2,"loss_weights":{"alpha":0.3,"beta":0.7,"gamma":0.3,"delta":0.0,"epsilon":0.0},"note":"Overlap-dominant"},
+    {"config_id":"G-a03-b03-g07","phase":2,"loss_weights":{"alpha":0.3,"beta":0.3,"gamma":0.7,"delta":0.0,"epsilon":0.0},"note":"Boundary-dominant"},
+    {"config_id":"G-a07-b03-g03","phase":2,"loss_weights":{"alpha":0.7,"beta":0.3,"gamma":0.3,"delta":0.0,"epsilon":0.0},"note":"BCE-dominant / conservative"},
+    {"config_id":"G-a05-b00-g05","phase":2,"loss_weights":{"alpha":0.5,"beta":0.0,"gamma":0.5,"delta":0.0,"epsilon":0.0},"note":"BCE+Boundary — no Dice"},
+    {"config_id":"G-a10-b10-g10","phase":2,"loss_weights":{"alpha":1.0,"beta":1.0,"gamma":1.0,"delta":0.0,"epsilon":0.0},"note":"All equal weight (unnormalised)"},
+    {"config_id":"G-a05-b03-g07","phase":2,"loss_weights":{"alpha":0.5,"beta":0.3,"gamma":0.7,"delta":0.0,"epsilon":0.0},"note":"High boundary — juxta-pleural focus"},
+    {"config_id":"G-a00-b07-g05","phase":2,"loss_weights":{"alpha":0.0,"beta":0.7,"gamma":0.5,"delta":0.0,"epsilon":0.0},"note":"No BCE anchor — high Dice weight"},
+    {"config_id":"G-a03-b05-g05-d01","phase":2,"loss_weights":{"alpha":0.3,"beta":0.5,"gamma":0.5,"delta":0.1,"epsilon":0.0},"note":"+ Focal for FP reduction"},
+    {"config_id":"G-a03-b05-g05-e01","phase":2,"loss_weights":{"alpha":0.3,"beta":0.5,"gamma":0.5,"delta":0.0,"epsilon":0.1},"note":"+ HD95 for direct boundary opt"}
+  ]
+}

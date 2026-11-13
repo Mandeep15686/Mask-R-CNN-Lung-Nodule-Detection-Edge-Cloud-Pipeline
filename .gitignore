@@ -1,0 +1,38 @@
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+
+# Local datasets and generated experiment artifacts
+data/
+datasets/
+experiments/
+*.pth
+*.pt
+*.ckpt
+
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+build/
+
+# Local databases, logs, and evaluation output
+*.db
+*.sqlite*
+*.log
+.deepeval/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

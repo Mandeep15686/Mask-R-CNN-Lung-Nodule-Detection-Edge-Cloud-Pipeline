@@ -1,0 +1,42 @@
+{
+  "description": "Phase 1 — Single-loss ablation experiments. Each uses exactly one loss function.",
+  "base": {
+    "epochs": 30,
+    "batch_size": 4,
+    "lr": 0.005,
+    "fold": 0,
+    "data_root": "./data/luna16"
+  },
+  "experiments": [
+    {
+      "config_id": "P1-BCE",
+      "phase": 1,
+      "loss_weights": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0},
+      "note": "Pixel-wise BCE baseline — stable training, blind to class imbalance"
+    },
+    {
+      "config_id": "P1-DICE",
+      "phase": 1,
+      "loss_weights": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0},
+      "note": "Pure Dice — robust to imbalance, maximises overlap"
+    },
+    {
+      "config_id": "P1-BOUNDARY",
+      "phase": 1,
+      "loss_weights": {"alpha": 0.0, "beta": 0.0, "gamma": 1.0, "delta": 0.0, "epsilon": 0.0},
+      "note": "Boundary loss only — may diverge early without overlap anchor"
+    },
+    {
+      "config_id": "P1-FOCAL",
+      "phase": 1,
+      "loss_weights": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 1.0, "epsilon": 0.0},
+      "note": "Focal loss — down-weights easy negatives, helps with FP-heavy batches"
+    },
+    {
+      "config_id": "P1-HD95",
+      "phase": 1,
+      "loss_weights": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 1.0},
+      "note": "Hausdorff DT loss only — directly optimises boundary deviation metric"
+    }
+  ]
+}

@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+Generates synthetic CT-like patches and a fake LUNA16 annotation CSV.
+Useful for testing the full pipeline without downloading the real dataset.
+
+Usage:
+  python scripts/generate_test_data.py --out ./data/luna16 --n-scans 20 --n-nodules 3
+"""
+import argparse
+import csv
+import os
+import uuid
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+
+def gaussian_sphere(shape, center, radius, amplitude=0.6):
+    """Draw a 3D Gaussian blob (simulates a nodule)."""
+    Z, Y, X = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    cz, cy, cx = center
+    dist = np.sqrt((Z - cz)**2 + (Y - cy)**2 + (X - cx)**2)
+    return amplitude * np.exp(-dist**2 / (2 * (radius / 2)**2))
+
+
+def generate_ct_volume(shape=(64, 128, 128), n_nodules=2):
+    """
+    Generate a synthetic lung CT volume in Hounsfield-like range [-1000, 400].
+    Returns (volume_HU, nodule_annotations)
+    """
+    # Background: air (~-800 HU) with lung parenchyma noise
+    rng = np.random.default_rng(seed=42)
+    volume = rng.normal(-700, 80, shape).astype(np.float32)
+
+    # Add a soft tissue cylinder (body boundary)
+    Z, Y, X = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    dist_from_center = np.sqrt((Y - shape[1]//2)**2 + (X - shape[2]//2)**2)
+    body_mask = dist_from_center < (min(shape[1], shape[2]) // 2 - 5)
+    volume[body_mask] = rng.normal(-300, 150, body_mask.sum()).astype(np.float32)
+
+    # Add vessel-like structures
+    for _ in range(5):
+        vx = rng.integers(20, shape[2] - 20)
+        vy = rng.integers(20, shape[1] - 20)
+        volume[:, vy-2:vy+2, vx-2:vx+2] = rng.normal(-100, 30, (shape[0], 4, 4))
+
+    # Add nodules
+    annotations = []
+    spacing = np.array([1.5, 0.7, 0.7])   # mm per voxel (Z, Y, X)
+    origin  = np.array([0.0, 0.0, 0.0])
+
+    for _ in range(n_nodules):
+        margin = 20
+        cz = rng.integers(margin, shape[0] - margin)
+        cy = rng.integers(margin, shape[1] - margin)
+        cx = rng.integers(margin, shape[2] - margin)
+        radius_vox = rng.integers(3, 15)
+        diameter_mm = radius_vox * np.mean(spacing[1:]) * 2
+
+        nodule = gaussian_sphere(shape, (cz, cy, cx), radius_vox, amplitude=400)
+        volume += nodule
+
+        # World coordinates
+        coord_world = np.array([cx, cy, cz], dtype=float) * spacing[::-1] + origin
+        annotations.append({
+            "coordX": float(coord_world[0]),
+            "coordY": float(coord_world[1]),
+            "coordZ": float(coord_world[2]),
+            "diameter_mm": float(diameter_mm),
+        })
+
+    volume = np.clip(volume, -1000, 400)
+    return volume, annotations, spacing, origin
+
+
+def save_mhd(volume: np.ndarray, spacing: np.ndarray, origin: np.ndarray, out_path: str):
+    """Save volume as SimpleITK .mhd / .raw pair."""
+    try:
+        import SimpleITK as sitk
+        itk_img = sitk.GetImageFromArray(volume)
+        itk_img.SetSpacing(tuple(spacing[::-1].tolist()))   # ITK: X,Y,Z
+        itk_img.SetOrigin(tuple(origin.tolist()))
+        sitk.WriteImage(itk_img, out_path)
+        return True
+    except ImportError:
+        # Fallback: save as numpy binary + minimal header
+        raw_path = out_path.replace(".mhd", ".raw")
+        volume.tofile(raw_path)
+        with open(out_path, "w") as f:
+            f.write(f"ObjectType = Image\n")
+            f.write(f"NDims = 3\n")
+            f.write(f"BinaryData = True\n")
+            f.write(f"BinaryDataByteOrderMSB = False\n")
+            f.write(f"CompressedData = False\n")
+            f.write(f"TransformMatrix = 1 0 0 0 1 0 0 0 1\n")
+            f.write(f"Offset = {' '.join(str(o) for o in origin)}\n")
+            f.write(f"CenterOfRotation = 0 0 0\n")
+            f.write(f"ElementSpacing = {' '.join(str(s) for s in spacing[::-1])}\n")
+            f.write(f"DimSize = {volume.shape[2]} {volume.shape[1]} {volume.shape[0]}\n")
+            f.write(f"ElementType = MET_FLOAT\n")
+            f.write(f"ElementDataFile = {os.path.basename(raw_path)}\n")
+        return True
+
+
+def save_png_patch(volume: np.ndarray, center_vox: tuple, out_dir: str, uid: str, patch_size=64):
+    """Extract and save a 2.5D PNG patch centred on a nodule."""
+    cz, cy, cx = center_vox
+    half = patch_size // 2
+    Z, Y, X = volume.shape
+    cz = max(1, min(Z - 2, cz))
+    cy = max(half, min(Y - half, cy))
+    cx = max(half, min(X - half, cx))
+
+    hu_min, hu_max = -1000, 400
+    slices = []
+    for dz in (-1, 0, 1):
+        sl = volume[cz + dz, cy - half: cy + half, cx - half: cx + half]
+        sl_norm = ((sl - hu_min) / (hu_max - hu_min) * 255).clip(0, 255).astype(np.uint8)
+        slices.append(sl_norm)
+
+    rgb = np.stack(slices, axis=2)   # (H, W, 3)
+    img = Image.fromarray(rgb)
+    path = os.path.join(out_dir, f"{uid}_patch.png")
+    img.save(path)
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate synthetic LUNA16-like test data")
+    parser.add_argument("--out",         default="./data/luna16",  help="Output root directory")
+    parser.add_argument("--n-scans",     type=int, default=20,     help="Number of synthetic CT scans")
+    parser.add_argument("--n-nodules",   type=int, default=3,      help="Nodules per scan")
+    parser.add_argument("--subsets",     type=int, default=2,      help="Number of subset folders (0..N-1)")
+    parser.add_argument("--patch-dir",   default="./data/sample_patches", help="Where to save PNG patches")
+    args = parser.parse_args()
+
+    out_root   = Path(args.out)
+    patch_dir  = Path(args.patch_dir)
+    patch_dir.mkdir(parents=True, exist_ok=True)
+
+    all_annotations = []
+    all_candidates  = []
+
+    print(f"Generating {args.n_scans} synthetic CT scans into {out_root}...")
+
+    for i in range(args.n_scans):
+        subset_id = i % args.subsets
+        subset_dir = out_root / f"subset{subset_id}"
+        subset_dir.mkdir(parents=True, exist_ok=True)
+
+        uid = str(uuid.uuid4()).replace("-", "")
+        volume, anns, spacing, origin = generate_ct_volume(
+            shape=(64, 128, 128), n_nodules=args.n_nodules
+        )
+
+        # Save .mhd / .raw
+        mhd_path = str(subset_dir / f"{uid}.mhd")
+        save_mhd(volume, spacing, origin, mhd_path)
+
+        # Save PNG patches + annotation CSV rows
+        for ann in anns:
+            cz = int(ann["coordZ"] / spacing[0])
+            cy = int(ann["coordY"] / spacing[1])
+            cx = int(ann["coordX"] / spacing[2])
+            save_png_patch(volume, (cz, cy, cx), str(patch_dir), uid)
+
+            all_annotations.append({
+                "seriesuid":   uid,
+                "coordX":      ann["coordX"],
+                "coordY":      ann["coordY"],
+                "coordZ":      ann["coordZ"],
+                "diameter_mm": ann["diameter_mm"],
+            })
+            # Positive candidate
+            all_candidates.append({
+                "seriesuid": uid,
+                "coordX": ann["coordX"],
+                "coordY": ann["coordY"],
+                "coordZ": ann["coordZ"],
+                "class": 1,
+            })
+
+        # Add some negative candidates
+        rng = np.random.default_rng(seed=i)
+        for _ in range(args.n_nodules * 5):
+            cx_ = float(rng.integers(20, 108)) * spacing[2]
+            cy_ = float(rng.integers(20, 108)) * spacing[1]
+            cz_ = float(rng.integers(5, 59))   * spacing[0]
+            all_candidates.append({
+                "seriesuid": uid,
+                "coordX": cx_, "coordY": cy_, "coordZ": cz_, "class": 0,
+            })
+
+        print(f"  [{i+1}/{args.n_scans}] subset{subset_id}/{uid[:8]}... "
+              f"({args.n_nodules} nodules)")
+
+    # Write annotation CSVs
+    ann_path = out_root / "annotations.csv"
+    with open(ann_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["seriesuid","coordX","coordY","coordZ","diameter_mm"])
+        writer.writeheader()
+        writer.writerows(all_annotations)
+
+    cand_path = out_root / "candidates.csv"
+    with open(cand_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["seriesuid","coordX","coordY","coordZ","class"])
+        writer.writeheader()
+        writer.writerows(all_candidates)
+
+    print(f"\n✓ Generated:")
+    print(f"  {args.n_scans} CT volumes in {out_root}/subset0..subset{args.subsets-1}/")
+    print(f"  {len(all_annotations)} annotations → {ann_path}")
+    print(f"  {len(all_candidates)} candidates  → {cand_path}")
+    print(f"  {len(list(patch_dir.glob('*.png')))} PNG patches → {patch_dir}/")
+    print(f"\nNow run training with:")
+    print(f"  python scripts/run_experiments.py --phase 1 --data {out_root} --epochs 5")
+
+
+if __name__ == "__main__":
+    main()

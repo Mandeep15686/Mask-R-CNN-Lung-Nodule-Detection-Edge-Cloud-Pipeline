@@ -1,0 +1,106 @@
+version: "3.9"
+
+services:
+  # -------------------------------------------------------------------------
+  # FastAPI Backend (Cloud)
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: lung_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./experiments:/data/experiments
+      - ./backend:/app/backend
+      - ./training:/app/training
+    environment:
+      - DATABASE_URL=sqlite:////data/lung_nodule.db
+      - MODEL_PATH=/data/experiments/best_model.pth
+      - SCORE_THRESHOLD=0.3
+      - PATCH_SIZE=64
+    networks:
+      - lung_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # React Frontend
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    container_name: lung_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lung_net
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Edge Node (simulated)
+  # -------------------------------------------------------------------------
+  edge:
+    build:
+      context: edge
+      dockerfile: Dockerfile
+    container_name: lung_edge
+    ports:
+      - "9090:9090"
+    environment:
+      - CLOUD_API_URL=http://backend:8000
+      - NODE_ID=edge-node-docker
+      - HOSTNAME=edge-docker.local
+      - NODE_IP=172.20.0.10
+      - SPLIT_LAYER=layer2
+      - COMPRESSION=int8
+      - PATCH_SIZE=64
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lung_net
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Optional: MLflow tracking server
+  # -------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.15.1
+    container_name: lung_mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow_data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - lung_net
+    restart: unless-stopped
+    profiles:
+      - mlflow   # start with: docker compose --profile mlflow up
+
+networks:
+  lung_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  lung_data:
+  lung_experiments:
