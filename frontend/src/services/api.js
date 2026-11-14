@@ -25,6 +25,7 @@ export const api = {
   // Experiments CRUD
   listExperiments: (params = {})  => http.get("/experiments/", { params }),
   getExperiment:   (id)           => http.get(`/experiments/${id}`),
+  getExperimentDetails:(id)       => http.get(`/experiments/${id}/details`),
   createExperiment:(data)         => http.post("/experiments/", data),
   startExperiment: (id)           => http.post(`/experiments/${id}/start`),
   deleteExperiment:(id)           => http.delete(`/experiments/${id}`),

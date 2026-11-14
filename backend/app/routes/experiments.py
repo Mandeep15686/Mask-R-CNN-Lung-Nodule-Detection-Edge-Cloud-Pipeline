@@ -9,6 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from ..database import get_db, Experiment, TrainingRun
 from ..json_utils import json_safe
@@ -104,9 +105,39 @@ async def get_experiment_logs(exp_id: int, db: Session = Depends(get_db)):
     exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
     if not exp:
         raise HTTPException(status_code=404, detail="Experiment not found")
-    log_path = _experiment_run_dir(exp.config_id) / "terminal.log"
+    config_id, status = exp.config_id, exp.status
+    db.close()
+    log_path = _experiment_run_dir(config_id) / "terminal.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    return {"experiment_id": exp_id, "status": exp.status, "log": log_text}
+    return {"experiment_id": exp_id, "status": status, "log": log_text}
+
+
+@router.get("/{exp_id}/details")
+async def get_experiment_details(exp_id: int, db: Session = Depends(get_db)):
+    """Fetch experiment configuration, epoch metrics, and log in one request."""
+    exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    runs = (
+        db.query(TrainingRun)
+        .filter(TrainingRun.experiment_id == exp_id)
+        .order_by(TrainingRun.epoch)
+        .all()
+    )
+    experiment_data = ExperimentResponse.model_validate(exp).model_dump()
+    run_data = [
+        {column.name: getattr(run, column.name) for column in TrainingRun.__table__.columns}
+        for run in runs
+    ]
+    config_id = exp.config_id
+    db.close()
+    log_path = _experiment_run_dir(config_id) / "terminal.log"
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    return json_safe({
+        "experiment": experiment_data,
+        "runs": run_data,
+        "log": log_text,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -135,16 +166,21 @@ async def start_experiment(
 async def _run_experiment_bg(exp_id: int, config_json: dict):
     """Background task: run full training and log each epoch."""
     from ..database import SessionLocal
+    event_loop = asyncio.get_running_loop()
     db = SessionLocal()
+    log_handler = None
     try:
         exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
         if not exp:
             return
 
+        experiment_id = exp.config_id
+        experiment_config = exp.config_json or config_json or {}
+        fold = experiment_config.get("fold", 0)
         # Build full config
         full_cfg = {
-            **config_json,
-            "config_id": exp.config_id,
+            **experiment_config,
+            "config_id": experiment_id,
             "mask_loss": {
                 "alpha": exp.alpha,
                 "beta": exp.beta,
@@ -154,7 +190,12 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
             },
         }
 
-        run_dir = _experiment_run_dir(exp.config_id)
+        # Do not hold a pooled DB connection during model initialization or
+        # training. Epoch/status writes below each use short-lived sessions.
+        db.close()
+        db = None
+
+        run_dir = _experiment_run_dir(experiment_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         log_handler = logging.FileHandler(run_dir / "terminal.log", mode="a", encoding="utf-8")
         log_handler.setFormatter(logging.Formatter(
@@ -168,7 +209,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
             sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
             from training.trainer import Trainer
 
-            logger.info("Starting experiment %s (id=%s)", exp.config_id, exp_id)
+            logger.info("Starting experiment %s (id=%s)", experiment_id, exp_id)
             logger.info("Run directory: %s", run_dir)
             logger.info("Configuration: %s", json.dumps(full_cfg, sort_keys=True))
 
@@ -186,74 +227,105 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
                         "lr": self.optimizer.param_groups[0]["lr"],
                     }
                     _log_epoch_to_db(
-                        db, exp_id, exp.config_json.get("fold", 0),
-                        epoch, train_metrics, result,
+                        exp_id, fold, epoch, train_metrics, result,
                     )
                     _broadcast_progress(exp_id, epoch, {
                         **train_metrics,
                         **result,
-                    })
+                    }, event_loop)
                     return result
 
-            trainer = DBCallbackTrainer(full_cfg, str(run_dir))
-            summary = trainer.train()
+            def train_run():
+                trainer = DBCallbackTrainer(full_cfg, str(run_dir))
+                return trainer.train()
 
-            exp.status = "done"
-            exp.finished_at = datetime.utcnow()
-            db.commit()
-            logger.info("Experiment %s completed successfully", exp.config_id)
+            summary = await run_in_threadpool(train_run)
+
+            _set_experiment_status(exp_id, "done")
+            logger.info("Experiment %s completed successfully", experiment_id)
 
         except Exception as e:
             logger.exception(f"Training failed for experiment {exp_id}")
-            exp.status = "failed"
-            exp.finished_at = datetime.utcnow()
-            db.commit()
+            _set_experiment_status(exp_id, "failed")
         finally:
             root_logger.removeHandler(log_handler)
             log_handler.close()
 
     finally:
+        if db is not None:
+            db.close()
+
+
+def _set_experiment_status(exp_id: int, status: str):
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+        if exp:
+            exp.status = status
+            exp.finished_at = datetime.utcnow()
+            db.commit()
+    finally:
         db.close()
 
 
-def _log_epoch_to_db(db, exp_id: int, fold: int, epoch: int, train_m: dict, val_m: dict):
-    run = TrainingRun(
-        experiment_id=exp_id,
-        fold=fold,
-        epoch=epoch,
-        train_total_loss=train_m.get("total_loss"),
-        train_bce_loss=train_m.get("bce"),
-        train_dice_loss=train_m.get("dice"),
-        train_boundary_loss=train_m.get("boundary"),
-        train_focal_loss=train_m.get("focal"),
-        train_hd_loss=train_m.get("hd"),
-        lr=train_m.get("lr"),
-        val_dice=val_m.get("val_dice"),
-        val_iou=val_m.get("val_iou"),
-        val_hd95=val_m.get("val_hd95"),
-        val_boundary_f1=val_m.get("val_boundary_f1"),
-        val_sensitivity=val_m.get("val_sensitivity"),
-        val_specificity=val_m.get("val_specificity"),
-        val_asd=val_m.get("val_asd"),
-        val_vol_err=val_m.get("val_vol_err"),
-    )
-    db.add(run)
-    db.commit()
+def _log_epoch_to_db(exp_id: int, fold: int, epoch: int, train_m: dict, val_m: dict):
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        run = TrainingRun(
+            experiment_id=exp_id,
+            fold=fold,
+            epoch=epoch,
+            train_total_loss=train_m.get("total_loss"),
+            train_bce_loss=train_m.get("bce"),
+            train_dice_loss=train_m.get("dice"),
+            train_boundary_loss=train_m.get("boundary"),
+            train_focal_loss=train_m.get("focal"),
+            train_hd_loss=train_m.get("hd"),
+            lr=train_m.get("lr"),
+            val_dice=val_m.get("val_dice"),
+            val_iou=val_m.get("val_iou"),
+            val_hd95=val_m.get("val_hd95"),
+            val_boundary_f1=val_m.get("val_boundary_f1"),
+            val_sensitivity=val_m.get("val_sensitivity"),
+            val_specificity=val_m.get("val_specificity"),
+            val_asd=val_m.get("val_asd"),
+            val_vol_err=val_m.get("val_vol_err"),
+        )
+        db.add(run)
+        db.commit()
+    finally:
+        db.close()
 
 
-def _broadcast_progress(exp_id: int, epoch: int, metrics: dict):
-    """Send epoch update to all WebSocket listeners."""
+async def _send_progress_to_clients(exp_id: int, message: str):
+    """Send one progress message on the application event loop."""
     if exp_id not in _ws_connections:
         return
-    msg = json.dumps(json_safe({"epoch": epoch, "metrics": metrics}), allow_nan=False)
     dead = []
-    for ws in _ws_connections[exp_id]:
+    for ws in list(_ws_connections[exp_id]):
         try:
-            asyncio.get_event_loop().run_until_complete(ws.send_text(msg))
+            await ws.send_text(message)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        _ws_connections[exp_id].remove(ws)
+        if ws in _ws_connections.get(exp_id, []):
+            _ws_connections[exp_id].remove(ws)
+
+
+def _broadcast_progress(exp_id: int, epoch: int, metrics: dict, event_loop):
+    """Bridge worker-thread progress events to active WebSocket clients."""
+    if not _ws_connections.get(exp_id) or not event_loop.is_running():
+        return
+    message = json.dumps(json_safe({"epoch": epoch, "metrics": metrics}), allow_nan=False)
+    future = asyncio.run_coroutine_threadsafe(
+        _send_progress_to_clients(exp_id, message), event_loop
+    )
+    try:
+        future.result(timeout=5)
+    except Exception:
+        logger.debug("Could not broadcast progress for experiment %s", exp_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

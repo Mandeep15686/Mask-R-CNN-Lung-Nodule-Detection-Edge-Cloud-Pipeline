@@ -142,25 +142,27 @@ function ExperimentRow({ exp, onDelete, onStart }) {
   useEffect(() => {
     if (!expanded) return undefined;
     let active = true;
+    let inFlight = false;
     const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const [freshDetails, freshRuns, freshLogs] = await Promise.all([
-          api.getExperiment(exp.id), api.getRuns(exp.id), api.getExperimentLogs(exp.id),
-        ]);
+        const snapshot = await api.getExperimentDetails(exp.id);
         if (!active) return;
-        setDetails(freshDetails);
-        setRuns(freshRuns);
-        setLogs(freshLogs.log ?? "");
+        setDetails(snapshot.experiment);
+        setRuns(snapshot.runs ?? []);
+        setLogs(snapshot.log ?? "");
         setDetailError("");
       } catch (error) {
         if (active) setDetailError(error.message);
       } finally {
+        inFlight = false;
         if (active) setLoading(false);
       }
     };
     setLoading(true);
     refresh();
-    const timer = displayStatus === "running" ? setInterval(refresh, 2000) : null;
+    const timer = displayStatus === "running" ? setInterval(refresh, 5000) : null;
     return () => {
       active = false;
       if (timer) clearInterval(timer);
@@ -300,7 +302,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
             <div className="flex items-center gap-2 mb-3">
               <Terminal size={15} className="text-green-400" />
               <h3 className="text-sm font-semibold text-white">Experiment terminal output</h3>
-              <span className="text-xs text-slate-500">{displayStatus === "running" ? "Live · refreshes every 2 seconds" : "Saved run log"}</span>
+              <span className="text-xs text-slate-500">{displayStatus === "running" ? "Live · refreshes every 5 seconds" : "Saved run log"}</span>
             </div>
             <pre ref={logRef} className="max-h-96 min-h-28 overflow-auto rounded-lg border border-slate-800 bg-black/80 p-4 text-xs leading-5 text-green-300 whitespace-pre-wrap break-words">
               {logs || "No run output captured yet. Start this experiment to see its logs here."}

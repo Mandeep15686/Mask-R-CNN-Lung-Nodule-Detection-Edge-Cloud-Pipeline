@@ -10,7 +10,10 @@ Evaluation metrics for lung nodule segmentation.
 """
 import numpy as np
 from scipy.ndimage import distance_transform_edt
-from typing import Union
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    import torch
 
 
 EPS = 1e-7
