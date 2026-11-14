@@ -187,16 +187,19 @@ def evaluate_batch(
 
     for i in range(len(preds)):
         p, t = pred_bin[i], targets[i]
-        metrics["dice"].append(dice_score(p, t))
-        metrics["iou"].append(iou_score(p, t))
-        metrics["sensitivity"].append(sensitivity(p, t))
+        has_gt = bool(np.any(t))
+        # Specificity is defined over negatives and positives, so keep all
+        # samples. Foreground overlap/sensitivity/surface metrics are averaged
+        # over GT-positive samples only; empty-empty cases otherwise inflate
+        # Dice and boundary scores or deflate distance scores.
         metrics["specificity"].append(specificity(p, t))
-        metrics["hd95"].append(hausdorff_distance_95(p, t))
-        metrics["boundary_f1"].append(boundary_f1(p, t))
-        metrics["asd"].append(average_surface_distance(p, t))
-        # Relative volume error has no meaningful denominator for negative
-        # samples, so report it only on samples containing a target nodule.
-        if np.any(t):
+        if has_gt:
+            metrics["dice"].append(dice_score(p, t))
+            metrics["iou"].append(iou_score(p, t))
+            metrics["sensitivity"].append(sensitivity(p, t))
+            metrics["hd95"].append(hausdorff_distance_95(p, t))
+            metrics["boundary_f1"].append(boundary_f1(p, t))
+            metrics["asd"].append(average_surface_distance(p, t))
             metrics["vol_err"].append(volume_error_percent(p, t))
 
     return {key: _safe_mean(values) for key, values in metrics.items()}

@@ -117,9 +117,12 @@ def run_bayesian_optimisation(
 
         # Composite objective: 50% Dice + 30% (1 - HD95_norm) + 20% BoundaryF1
         metrics = summary.get("final_metrics", {})
-        dice = metrics.get("val_dice", 0.0)
-        hd95 = min(metrics.get("val_hd95", 999.0), 100.0)
-        bdf1 = metrics.get("val_boundary_f1", 0.0)
+        dice = metrics.get("val_dice")
+        dice = 0.0 if dice is None else dice
+        hd95 = metrics.get("val_hd95")
+        hd95 = 999.0 if hd95 is None else min(hd95, 100.0)
+        bdf1 = metrics.get("val_boundary_f1")
+        bdf1 = 0.0 if bdf1 is None else bdf1
         score = 0.5 * dice + 0.3 * (1.0 - hd95 / 100.0) + 0.2 * bdf1
 
         trial.set_user_attr("dice", dice)
@@ -223,13 +226,17 @@ class ExperimentRunner:
         pareto = []
         for r in self.results:
             m = r.get("final_metrics", {})
-            dice = m.get("val_dice", 0.0)
-            hd95 = m.get("val_hd95", 999.0)
+            dice = m.get("val_dice")
+            dice = 0.0 if dice is None else dice
+            hd95 = m.get("val_hd95")
+            hd95 = 999.0 if hd95 is None else hd95
             dominated = False
             for other in self.results:
                 om = other.get("final_metrics", {})
-                o_dice = om.get("val_dice", 0.0)
-                o_hd95 = om.get("val_hd95", 999.0)
+                o_dice = om.get("val_dice")
+                o_dice = 0.0 if o_dice is None else o_dice
+                o_hd95 = om.get("val_hd95")
+                o_hd95 = 999.0 if o_hd95 is None else o_hd95
                 if o_dice >= dice and o_hd95 <= hd95 and other is not r:
                     dominated = True
                     break

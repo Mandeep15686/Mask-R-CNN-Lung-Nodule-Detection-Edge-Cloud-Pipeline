@@ -23,6 +23,13 @@ from .losses import CompositeMaskLoss
 logger = logging.getLogger(__name__)
 
 
+def _fmt_metric(value, fmt: str = ".4f") -> str:
+    """Format a metric safely, showing unavailable values as N/A."""
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return format(float(value), fmt)
+
+
 class Trainer:
     """
     Manages a single training run for a given loss weight configuration.
@@ -249,7 +256,7 @@ class Trainer:
             self.history.append(epoch_log)
 
             # Checkpoint
-            val_dice = val_metrics.get("val_dice", 0.0)
+            val_dice = val_metrics.get("val_dice") or 0.0
             if val_dice > self.best_dice:
                 self.best_dice = val_dice
                 self.best_epoch = epoch
@@ -275,9 +282,9 @@ class Trainer:
             logger.info(
                 f"Epoch {epoch}/{self.epochs} | "
                 f"train_loss={train_metrics.get('total_loss', 0):.4f} | "
-                f"val_dice={val_dice:.4f} | "
-                f"val_hd95={val_metrics.get('val_hd95', 999):.2f} | "
-                f"val_boundary_f1={val_metrics.get('val_boundary_f1', 0):.4f}"
+                f"val_dice={_fmt_metric(val_metrics.get('val_dice'))} | "
+                f"val_hd95={_fmt_metric(val_metrics.get('val_hd95'), '.2f')} | "
+                f"val_boundary_f1={_fmt_metric(val_metrics.get('val_boundary_f1'))}"
             )
 
         # Final summary
