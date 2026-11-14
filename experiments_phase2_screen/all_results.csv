@@ -1,0 +1,2 @@
+config_id,loss_description,best_epoch,best_dice,loss_weights,final_metrics
+G-a07-b03-g05,0.70·BCE + 0.30·Dice + 0.50·Boundary,5,0.7768676840161939,,

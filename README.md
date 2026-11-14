@@ -62,7 +62,7 @@ nvidia-smi
 
 ### 2. Clone and configure
 ```bash
-git clone https://github.com/Mandeep15686/Mask-R-CNN-Lung-Nodule-Detection-Edge-Cloud-Pipeline.git lung-nodule
+git clone <repo-url> lung-nodule
 cd lung-nodule
 cp .env.example .env
 ```

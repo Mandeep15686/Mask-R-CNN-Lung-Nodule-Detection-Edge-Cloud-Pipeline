@@ -1,40 +1,73 @@
-# Local credentials and environment configuration
-.env
-.env.*
-!.env.example
-
-# Local datasets and generated experiment artifacts
-data/
-datasets/
-experiments/
-experiments_phase2_screen/
-experiments_phase2_5ep_20cfg/
-*.pth
-*.pt
-*.ckpt
-
-# Python environments and caches
-venv/
-.venv/
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Frontend dependencies and build output
-node_modules/
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
 dist/
 build/
+.eggs/
+.venv/
+venv/
+env/
+.env
 
-# Local databases, logs, and evaluation output
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data & models (too large for git — use DVC or direct download)
+data/
+*.pth
+*.ckpt
+*.pt
+*.h5
+*.pkl
+
+# Experiment outputs
+experiments/
+eval_results/
+mlflow_data/
+
+# Database
 *.db
-*.sqlite*
-*.log
-.deepeval/
+*.sqlite
+*.sqlite3
 
-# Editor and OS files
-.vscode/
-.idea/
+# Logs
+*.log
+logs/
+
+# Docker
+.docker/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Secrets
+.env
+!.env.example
+
+# Optuna
+optuna.db

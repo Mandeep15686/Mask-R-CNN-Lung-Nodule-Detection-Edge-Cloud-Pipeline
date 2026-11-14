@@ -1,0 +1,35 @@
+{
+  "config_id": "G-a05-b07-g00",
+  "loss_description": "0.50\u00b7BCE + 0.70\u00b7Dice",
+  "best_epoch": 5,
+  "best_dice": 0.8231588629889239,
+  "loss_weights": {
+    "alpha": 0.5,
+    "beta": 0.7,
+    "gamma": 0.0,
+    "delta": 0.0,
+    "epsilon": 0.0,
+    "zeta": 0
+  },
+  "final_metrics": {
+    "epoch": 5,
+    "lr": 0.005000000000000001,
+    "loss_classifier": 0.00691958181823793,
+    "loss_box_reg": 0.00719921860127215,
+    "loss_mask": 0.3491131062619388,
+    "loss_objectness": 0.018619742812006734,
+    "loss_rpn_box_reg": 0.0006540504613212761,
+    "total_loss": 0.382505699628382,
+    "epoch_time_s": 139.0722587108612,
+    "val_bce": 0.18927381004739022,
+    "val_dice": 0.8231588629889239,
+    "val_total": 0.2975908924293305,
+    "val_iou": 0.759300265722272,
+    "val_sensitivity": 0.39287149760704054,
+    "val_specificity": 0.9966274002261305,
+    "val_hd95": 6.292763966036452,
+    "val_boundary_f1": 0.8633116193486041,
+    "val_asd": 5.315718969326953,
+    "val_vol_err": Infinity
+  }
+}

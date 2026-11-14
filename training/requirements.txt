@@ -8,5 +8,5 @@ optuna==3.6.1
 mlflow==2.15.1
 scikit-learn==1.5.1
 pandas==2.2.2
-matplotlib==3.9.2
+matplotlib==3.9.1
 tqdm==4.66.5
