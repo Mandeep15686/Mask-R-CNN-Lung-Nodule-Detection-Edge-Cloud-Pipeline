@@ -158,7 +158,7 @@ class Trainer:
     # Validation epoch
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _val_epoch(self, epoch: int) -> dict[str, float]:
+    def _val_epoch(self, epoch: int) -> dict[str, float | None]:
         self.model.eval()
         all_preds: list[np.ndarray] = []
         all_targets: list[np.ndarray] = []
@@ -204,7 +204,15 @@ class Trainer:
 
         preds_arr = np.stack(all_preds)
         targets_arr = np.stack(all_targets)
+        # Both CLI and API training use the same finite-safe metric aggregation.
+        # None means a metric is not defined for this validation set.
         seg_metrics = evaluate_batch(preds_arr, targets_arr)
+        # Guard the API training/history path as well, so a non-finite metric
+        # from any future metric implementation cannot reach JSON or SQLite.
+        seg_metrics = {
+            key: (float(value) if value is not None and np.isfinite(value) else None)
+            for key, value in seg_metrics.items()
+        }
 
         result = loss_tracker.averages()
         result.update({f"val_{k}": v for k, v in seg_metrics.items()})
@@ -262,7 +270,7 @@ class Trainer:
 
             # Save history
             with open(self.run_dir / "history.json", "w") as f:
-                json.dump(self.history, f, indent=2)
+                json.dump(self.history, f, indent=2, allow_nan=False)
 
             logger.info(
                 f"Epoch {epoch}/{self.epochs} | "
@@ -284,12 +292,13 @@ class Trainer:
                 "gamma": self.config.get("mask_loss", {}).get("gamma", 0),
                 "delta": self.config.get("mask_loss", {}).get("delta", 0),
                 "epsilon": self.config.get("mask_loss", {}).get("epsilon", 0),
+                "zeta": self.config.get("mask_loss", {}).get("zeta", 0),
             },
             "final_metrics": self.history[-1] if self.history else {},
         }
 
         with open(self.run_dir / "summary.json", "w") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, allow_nan=False)
 
         logger.info(
             f"Training complete. Best Dice: {self.best_dice:.4f} at epoch {self.best_epoch}"

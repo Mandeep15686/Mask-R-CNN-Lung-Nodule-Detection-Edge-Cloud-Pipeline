@@ -29,6 +29,7 @@ export const api = {
   startExperiment: (id)           => http.post(`/experiments/${id}/start`),
   deleteExperiment:(id)           => http.delete(`/experiments/${id}`),
   getRuns:         (id)           => http.get(`/experiments/${id}/runs`),
+  getExperimentLogs:(id)          => http.get(`/experiments/${id}/logs`),
   getSummary:      (id)           => http.get(`/experiments/${id}/summary`),
   getLearningCurve:(id)           => http.get(`/results/experiment/${id}/learning-curve`),
 

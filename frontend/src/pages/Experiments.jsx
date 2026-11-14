@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback } from "react";
-import { api, openTrainingWS } from "../services/api.js";
-import { Plus, Play, Trash2, ChevronDown, ChevronRight, Loader2, AlertCircle } from "lucide-react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
+import { api } from "../services/api.js";
+import { Plus, Play, Trash2, ChevronDown, ChevronRight, Loader2, AlertCircle, Terminal } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend,
 } from "recharts";
@@ -131,46 +131,61 @@ function CreateForm({ onCreated }) {
 // ---------------------------------------------------------------------------
 function ExperimentRow({ exp, onDelete, onStart }) {
   const [expanded, setExpanded] = useState(false);
-  const [curve, setCurve]       = useState(null);
-  const [wsData, setWsData]     = useState([]);
-  const [loading, setLoading]   = useState(false);
+  const [details, setDetails] = useState(exp);
+  const [runs, setRuns] = useState([]);
+  const [logs, setLogs] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const logRef = useRef(null);
+  const displayStatus = details?.status ?? exp.status;
 
-  const toggleExpand = async () => {
-    if (!expanded && !curve) {
-      setLoading(true);
-      try {
-        const data = await api.getLearningCurve(exp.id);
-        const rows = data.epochs.map((ep, i) => ({
-          epoch: ep,
-          "Train Loss": data.train_loss[i],
-          "Val Dice":   data.val_dice[i],
-          "HD95":       data.val_hd95[i],
-          "Boundary F1": data.val_boundary_f1[i],
-        }));
-        setCurve(rows);
-      } catch {}
-      setLoading(false);
-    }
-    setExpanded((e) => !e);
-  };
-
-  // Live WS for running experiments
   useEffect(() => {
-    if (exp.status !== "running") return;
-    const ws = openTrainingWS(exp.id, (msg) => {
-      if (msg.epoch) {
-        setWsData((d) => [...d, {
-          epoch: msg.epoch,
-          "Val Dice": msg.metrics?.val_dice,
-          "Train Loss": msg.metrics?.total_loss,
-          "HD95": msg.metrics?.val_hd95,
-        }]);
+    if (!expanded) return undefined;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const [freshDetails, freshRuns, freshLogs] = await Promise.all([
+          api.getExperiment(exp.id), api.getRuns(exp.id), api.getExperimentLogs(exp.id),
+        ]);
+        if (!active) return;
+        setDetails(freshDetails);
+        setRuns(freshRuns);
+        setLogs(freshLogs.log ?? "");
+        setDetailError("");
+      } catch (error) {
+        if (active) setDetailError(error.message);
+      } finally {
+        if (active) setLoading(false);
       }
-    }, () => {});
-    return () => ws.close();
-  }, [exp.id, exp.status]);
+    };
+    setLoading(true);
+    refresh();
+    const timer = displayStatus === "running" ? setInterval(refresh, 2000) : null;
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [expanded, exp.id, displayStatus]);
 
-  const chartData = wsData.length > 0 ? wsData : (curve ?? []);
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  }, [logs]);
+
+  const chartData = runs.map((run) => ({
+    epoch: run.epoch,
+    "Train Loss": run.train_total_loss,
+    "Val Dice": run.val_dice,
+    "HD95": run.val_hd95,
+    "Boundary F1": run.val_boundary_f1,
+  }));
+  const config = details?.config_json ?? {};
+  const weights = ["alpha", "beta", "gamma", "delta", "epsilon"];
+  const lossNames = { alpha: "BCE", beta: "Dice", gamma: "Boundary", delta: "Focal", epsilon: "HD95" };
+  const shown = (value, digits = 4) => Number.isFinite(value) ? value.toFixed(digits) : "—";
+  const toggleExpand = () => setExpanded((value) => !value);
 
   return (
     <div className="card">
@@ -181,9 +196,9 @@ function ExperimentRow({ exp, onDelete, onStart }) {
         {expanded ? <ChevronDown size={16} className="text-slate-400" /> : <ChevronRight size={16} className="text-slate-400" />}
         <span className="font-mono text-sm text-cyan-400 flex-1 truncate">{exp.config_id}</span>
         <span className="hidden md:block text-xs text-slate-400 flex-1">{exp.loss_description}</span>
-        <StatusBadge status={exp.status} />
+        <StatusBadge status={displayStatus} />
         <div className="flex gap-2 ml-2" onClick={(e) => e.stopPropagation()}>
-          {exp.status === "pending" && (
+          {displayStatus === "pending" && (
             <button className="btn-primary py-1 px-3 flex items-center gap-1 text-xs"
                     onClick={() => onStart(exp.id)}>
               <Play size={12} /> Start
@@ -191,7 +206,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
           )}
           <button className="btn-secondary py-1 px-2 text-xs"
                   onClick={() => onDelete(exp.id)}
-                  disabled={exp.status === "running"}>
+                  disabled={displayStatus === "running"}>
             <Trash2 size={12} />
           </button>
         </div>
@@ -199,7 +214,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
 
       {/* Loss weights pills */}
       <div className="flex flex-wrap gap-2 mt-3 pl-6">
-        {["alpha","beta","gamma","delta","epsilon"].map((k) => (
+        {weights.map((k) => (
           exp[k] > 0 && (
             <span key={k} className="text-xs bg-slate-800 px-2 py-0.5 rounded text-slate-300">
               {k[0].toUpperCase()} = {exp[k]}
@@ -210,26 +225,87 @@ function ExperimentRow({ exp, onDelete, onStart }) {
 
       {/* Expandable curve */}
       {expanded && (
-        <div className="mt-4 pl-6">
-          {loading && <div className="text-xs text-slate-400 flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading...</div>}
-          {!loading && chartData.length > 0 && (
-            <ResponsiveContainer width="100%" height={200}>
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e2a3a" />
-                <XAxis dataKey="epoch" tick={{ fill: "#64748b", fontSize: 10 }} />
-                <YAxis tick={{ fill: "#64748b", fontSize: 10 }} />
-                <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8 }}
-                         labelStyle={{ color: "#cbd5e1" }} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="Train Loss" stroke="#f87171" strokeWidth={1.5} dot={false} />
-                <Line type="monotone" dataKey="Val Dice"   stroke="#34d399" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="Boundary F1" stroke="#a78bfa" strokeWidth={1.5} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          )}
-          {!loading && chartData.length === 0 && (
-            <div className="text-xs text-slate-500">No epoch data yet — start the experiment first.</div>
-          )}
+        <div className="mt-5 space-y-5 border-t border-slate-800 pt-5">
+          {loading && <div className="text-xs text-slate-400 flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading run details...</div>}
+          {detailError && <div className="text-sm text-red-400">{detailError}</div>}
+
+          <section>
+            <h3 className="text-sm font-semibold text-white mb-3">Run configuration</h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+              {[
+                ["Phase", details?.phase], ["Validation fold", config.fold],
+                ["Epochs", config.epochs], ["Batch size", config.batch_size],
+                ["Learning rate", config.lr], ["Data root", config.data_root],
+                ["Created", details?.created_at], ["Started", details?.started_at],
+                ["Finished", details?.finished_at],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded bg-slate-900/70 p-3 min-w-0">
+                  <div className="text-slate-500 mb-1">{label}</div>
+                  <div className="text-slate-200 break-all">{value ? String(value) : "—"}</div>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-2 mt-3">
+              {weights.map((key) => (
+                <span key={key} className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-300">
+                  {lossNames[key]}: {details?.[key] ?? "—"}
+                </span>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h3 className="text-sm font-semibold text-white mb-3">Epoch metrics ({runs.length})</h3>
+            {chartData.length > 0 && (
+              <div className="mb-4">
+                <ResponsiveContainer width="100%" height={220}>
+                  <LineChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e2a3a" />
+                    <XAxis dataKey="epoch" tick={{ fill: "#64748b", fontSize: 10 }} />
+                    <YAxis tick={{ fill: "#64748b", fontSize: 10 }} />
+                    <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8 }}
+                             labelStyle={{ color: "#cbd5e1" }} />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Line type="monotone" dataKey="Train Loss" stroke="#f87171" strokeWidth={1.5} dot={false} />
+                    <Line type="monotone" dataKey="Val Dice" stroke="#34d399" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="Boundary F1" stroke="#a78bfa" strokeWidth={1.5} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+            {runs.length > 0 ? (
+              <div className="overflow-x-auto rounded border border-slate-800">
+                <table className="min-w-[1450px] w-full text-xs">
+                  <thead className="bg-slate-900 text-slate-400">
+                    <tr>{["Epoch", "LR", "Train total", "BCE", "Dice loss", "Boundary", "Focal", "HD loss", "Val Dice", "IoU", "HD95", "Boundary F1", "Sensitivity", "Specificity", "ASD", "Volume error %"].map((h) => <th key={h} className="p-2 text-right first:text-left">{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {runs.map((run) => (
+                      <tr key={run.id} className="border-t border-slate-800/70 text-slate-300">
+                        <td className="p-2">{run.epoch}</td>
+                        {[run.lr, run.train_total_loss, run.train_bce_loss, run.train_dice_loss,
+                          run.train_boundary_loss, run.train_focal_loss, run.train_hd_loss,
+                          run.val_dice, run.val_iou, run.val_hd95, run.val_boundary_f1,
+                          run.val_sensitivity, run.val_specificity, run.val_asd, run.val_vol_err]
+                          .map((value, i) => <td key={i} className="p-2 text-right">{shown(value, i === 0 ? 6 : 4)}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <p className="text-xs text-slate-500">No epoch metrics recorded yet.</p>}
+          </section>
+
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Terminal size={15} className="text-green-400" />
+              <h3 className="text-sm font-semibold text-white">Experiment terminal output</h3>
+              <span className="text-xs text-slate-500">{displayStatus === "running" ? "Live · refreshes every 2 seconds" : "Saved run log"}</span>
+            </div>
+            <pre ref={logRef} className="max-h-96 min-h-28 overflow-auto rounded-lg border border-slate-800 bg-black/80 p-4 text-xs leading-5 text-green-300 whitespace-pre-wrap break-words">
+              {logs || "No run output captured yet. Start this experiment to see its logs here."}
+            </pre>
+          </section>
         </div>
       )}
     </div>

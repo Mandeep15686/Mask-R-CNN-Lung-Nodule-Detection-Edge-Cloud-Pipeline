@@ -284,30 +284,86 @@ class LUNA16Dataset(Dataset):
 
 
 def build_dataloaders(
-    data_root: str,
+    data_root: str | Path,
     fold: int = 0,
     batch_size: int = 8,
     num_workers: int = 2,
     patch_size: int = 64,
 ) -> tuple[DataLoader, DataLoader]:
     """
-    Build train/val DataLoaders using LUNA16's 10-fold CV structure.
-    fold ∈ [0, 9] — the given subset is used for validation.
+    Build train/val DataLoaders using the LUNA16 subsets available on disk.
+    The requested fold is used for validation; all other subsets are training.
     """
-    all_subsets = list(range(10))
-    val_subset = [fold % 10]
-    train_subsets = [s for s in all_subsets if s not in val_subset]
+    root_arg = Path(data_root).expanduser()
+    if root_arg.is_absolute():
+        root_candidates = [root_arg]
+    else:
+        project_root = Path(__file__).resolve().parents[1]
+        root_candidates = [Path.cwd() / root_arg, project_root / root_arg]
+
+    # Prefer the candidate containing real subset directories. This lets the
+    # same relative config work when launched from either the repo root or
+    # backend/.
+    data_root_path = None
+    all_subsets = []
+    for candidate in root_candidates:
+        candidate = candidate.resolve()
+        subsets = sorted(
+            int(path.name.removeprefix("subset"))
+            for path in candidate.glob("subset*")
+            if path.is_dir() and path.name.removeprefix("subset").isdigit()
+        )
+        if len(subsets) > len(all_subsets):
+            data_root_path = candidate
+            all_subsets = subsets
+        if len(subsets) >= 2:
+            break
+
+    if data_root_path is None:
+        checked = ", ".join(str(path.resolve()) for path in root_candidates)
+        raise FileNotFoundError(
+            f"No LUNA16 subset directories found for data_root={data_root!r}. "
+            f"Checked: {checked}"
+        )
+
+    if len(all_subsets) < 2:
+        raise ValueError(
+            f"At least 2 LUNA16 subsets are required under {data_root_path}. "
+            f"Found: {all_subsets}"
+        )
+    if fold not in all_subsets:
+        raise ValueError(
+            f"Validation fold {fold} is unavailable under {data_root_path}. "
+            f"Available subsets: {all_subsets}"
+        )
+
+    val_subset = [fold]
+    train_subsets = [subset for subset in all_subsets if subset != fold]
+
+    logger.info(
+        f"Using LUNA16 data at {data_root_path} | Available subsets: "
+        f"{all_subsets} | Training: {train_subsets} | Validation: {val_subset}"
+    )
 
     train_ds = LUNA16Dataset(
-        data_root, train_subsets, patch_size=patch_size, augment=True
+        data_root_path, train_subsets, patch_size=patch_size, augment=True
     )
     val_ds = LUNA16Dataset(
-        data_root, val_subset, patch_size=patch_size, augment=False
+        data_root_path, val_subset, patch_size=patch_size, augment=False
     )
+
+    if not len(train_ds) or not len(val_ds):
+        raise ValueError(
+            f"LUNA16 produced an empty dataset at {data_root_path}: "
+            f"training={len(train_ds)} samples from {train_subsets}, "
+            f"validation={len(val_ds)} samples from {val_subset}. "
+            "Check annotations.csv and that each subset contains matching .mhd files."
+        )
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True
+        num_workers=num_workers, pin_memory=True,
+        drop_last=len(train_ds) >= batch_size,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,

@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
@@ -10,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocke
 from sqlalchemy.orm import Session
 
 from ..database import get_db, Experiment, TrainingRun
+from ..json_utils import json_safe
 from ..schemas import (
     ExperimentCreate, ExperimentResponse,
     TrainingRunResponse, ExperimentSummaryResponse,
@@ -20,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 # WebSocket connections for live progress streaming
 _ws_connections: dict[int, list[WebSocket]] = {}
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _experiment_run_dir(config_id: str) -> Path:
+    # Keep generated artifacts under the repository's ignored experiments dir,
+    # independent of whether Uvicorn was launched from backend/ or repo root.
+    return PROJECT_ROOT / "experiments" / Path(config_id).name
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +99,16 @@ async def get_experiment(exp_id: int, db: Session = Depends(get_db)):
     return exp
 
 
+@router.get("/{exp_id}/logs")
+async def get_experiment_logs(exp_id: int, db: Session = Depends(get_db)):
+    exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    log_path = _experiment_run_dir(exp.config_id) / "terminal.log"
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    return {"experiment_id": exp_id, "status": exp.status, "log": log_text}
+
+
 # ---------------------------------------------------------------------------
 # POST /api/experiments/{exp_id}/start
 # ---------------------------------------------------------------------------
@@ -135,33 +154,63 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
             },
         }
 
-        run_dir = f"./experiments/{exp.config_id}"
-        os.makedirs(run_dir, exist_ok=True)
+        run_dir = _experiment_run_dir(exp.config_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        log_handler = logging.FileHandler(run_dir / "terminal.log", mode="a", encoding="utf-8")
+        log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(log_handler)
 
         try:
             import sys
             sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
             from training.trainer import Trainer
 
+            logger.info("Starting experiment %s (id=%s)", exp.config_id, exp_id)
+            logger.info("Run directory: %s", run_dir)
+            logger.info("Configuration: %s", json.dumps(full_cfg, sort_keys=True))
+
             class DBCallbackTrainer(Trainer):
+                def _train_epoch(self, epoch):
+                    self._latest_train_metrics = super()._train_epoch(epoch)
+                    return self._latest_train_metrics
+
                 def _val_epoch(self, epoch):
                     result = super()._val_epoch(epoch)
                     # Log to DB
-                    _log_epoch_to_db(db, exp_id, exp.config_json.get("fold", 0), epoch, {}, result)
-                    _broadcast_progress(exp_id, epoch, result)
+                    train_metrics = getattr(self, "_latest_train_metrics", {})
+                    train_metrics = {
+                        **train_metrics,
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                    }
+                    _log_epoch_to_db(
+                        db, exp_id, exp.config_json.get("fold", 0),
+                        epoch, train_metrics, result,
+                    )
+                    _broadcast_progress(exp_id, epoch, {
+                        **train_metrics,
+                        **result,
+                    })
                     return result
 
-            trainer = DBCallbackTrainer(full_cfg, run_dir)
+            trainer = DBCallbackTrainer(full_cfg, str(run_dir))
             summary = trainer.train()
 
             exp.status = "done"
             exp.finished_at = datetime.utcnow()
             db.commit()
+            logger.info("Experiment %s completed successfully", exp.config_id)
 
         except Exception as e:
             logger.exception(f"Training failed for experiment {exp_id}")
             exp.status = "failed"
+            exp.finished_at = datetime.utcnow()
             db.commit()
+        finally:
+            root_logger.removeHandler(log_handler)
+            log_handler.close()
 
     finally:
         db.close()
@@ -178,6 +227,7 @@ def _log_epoch_to_db(db, exp_id: int, fold: int, epoch: int, train_m: dict, val_
         train_boundary_loss=train_m.get("boundary"),
         train_focal_loss=train_m.get("focal"),
         train_hd_loss=train_m.get("hd"),
+        lr=train_m.get("lr"),
         val_dice=val_m.get("val_dice"),
         val_iou=val_m.get("val_iou"),
         val_hd95=val_m.get("val_hd95"),
@@ -195,7 +245,7 @@ def _broadcast_progress(exp_id: int, epoch: int, metrics: dict):
     """Send epoch update to all WebSocket listeners."""
     if exp_id not in _ws_connections:
         return
-    msg = json.dumps({"epoch": epoch, "metrics": metrics})
+    msg = json.dumps(json_safe({"epoch": epoch, "metrics": metrics}), allow_nan=False)
     dead = []
     for ws in _ws_connections[exp_id]:
         try:
@@ -211,12 +261,16 @@ def _broadcast_progress(exp_id: int, epoch: int, metrics: dict):
 # ---------------------------------------------------------------------------
 @router.get("/{exp_id}/runs", response_model=list[TrainingRunResponse])
 async def get_runs(exp_id: int, db: Session = Depends(get_db)):
-    return (
+    runs = (
         db.query(TrainingRun)
         .filter(TrainingRun.experiment_id == exp_id)
         .order_by(TrainingRun.epoch)
         .all()
     )
+    return json_safe([
+        {column.name: getattr(run, column.name) for column in TrainingRun.__table__.columns}
+        for run in runs
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +297,7 @@ async def get_summary(exp_id: int, db: Session = Depends(get_db)):
         final_hd95 = last_run.val_hd95
         final_bdf1 = last_run.val_boundary_f1
 
-    return ExperimentSummaryResponse(
+    return json_safe(ExperimentSummaryResponse(
         experiment_id=exp.id,
         config_id=exp.config_id,
         loss_description=exp.loss_description or "",
@@ -253,7 +307,7 @@ async def get_summary(exp_id: int, db: Session = Depends(get_db)):
         final_boundary_f1=final_bdf1,
         total_epochs=len(runs),
         status=exp.status,
-    )
+    ).model_dump())
 
 
 # ---------------------------------------------------------------------------

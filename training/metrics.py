@@ -63,7 +63,10 @@ def _surface_distances(pred: np.ndarray, target: np.ndarray) -> tuple[np.ndarray
     pred_b = pred.astype(bool)
     tgt_b = target.astype(bool)
 
-    if pred_b.sum() == 0 or tgt_b.sum() == 0:
+    if not pred_b.any() and not tgt_b.any():
+        zeros = np.array([0.0])
+        return zeros, zeros
+    if not pred_b.any() or not tgt_b.any():
         nan = np.array([np.nan])
         return nan, nan
 
@@ -79,28 +82,46 @@ def _surface_distances(pred: np.ndarray, target: np.ndarray) -> tuple[np.ndarray
     return dist_pred_to_tgt, dist_tgt_to_pred
 
 
+def _empty_mask_distance(pred: np.ndarray, target: np.ndarray) -> float:
+    """Use 0 for two empty masks and the image diagonal for one empty mask."""
+    pred_empty = not np.any(pred)
+    target_empty = not np.any(target)
+    if pred_empty and target_empty:
+        return 0.0
+    extents = np.maximum(np.asarray(pred.shape, dtype=float) - 1.0, 0.0)
+    return float(np.linalg.norm(extents))
+
+
 def _erode(mask: np.ndarray) -> np.ndarray:
     from scipy.ndimage import binary_erosion
     return binary_erosion(mask)
 
 
 def hausdorff_distance_95(pred: np.ndarray, target: np.ndarray) -> float:
-    """95th-percentile Hausdorff distance (in voxels)."""
+    """95th-percentile Hausdorff distance in voxels.
+
+    Empty-empty masks score 0; a single empty mask receives the image-diagonal
+    penalty so aggregate metrics remain finite and JSON-safe.
+    """
+    if not np.any(pred) or not np.any(target):
+        return _empty_mask_distance(pred, target)
     d1, d2 = _surface_distances(pred, target)
     if np.isnan(d1).all() or np.isnan(d2).all():
-        return float("inf")
+        return _empty_mask_distance(pred, target)
     combined = np.concatenate([d1, d2])
     combined = combined[~np.isnan(combined)]
-    return float(np.percentile(combined, 95)) if len(combined) > 0 else float("inf")
+    return float(np.percentile(combined, 95)) if len(combined) > 0 else _empty_mask_distance(pred, target)
 
 
 def average_surface_distance(pred: np.ndarray, target: np.ndarray) -> float:
+    if not np.any(pred) or not np.any(target):
+        return _empty_mask_distance(pred, target)
     d1, d2 = _surface_distances(pred, target)
     if np.isnan(d1).all() or np.isnan(d2).all():
-        return float("inf")
+        return _empty_mask_distance(pred, target)
     combined = np.concatenate([d1, d2])
     combined = combined[~np.isnan(combined)]
-    return float(combined.mean()) if len(combined) > 0 else float("inf")
+    return float(combined.mean()) if len(combined) > 0 else _empty_mask_distance(pred, target)
 
 
 def boundary_f1(pred: np.ndarray, target: np.ndarray, tolerance: int = 2) -> float:
@@ -130,10 +151,11 @@ def boundary_f1(pred: np.ndarray, target: np.ndarray, tolerance: int = 2) -> flo
 
 
 def volume_error_percent(pred: np.ndarray, target: np.ndarray) -> float:
+    """Absolute relative volume error, defined for positive target masks."""
     pred_vol = pred.astype(bool).sum()
     tgt_vol = target.astype(bool).sum()
     if tgt_vol == 0:
-        return float("inf") if pred_vol > 0 else 0.0
+        return 0.0 if pred_vol == 0 else 100.0
     return float(abs(pred_vol - tgt_vol) / tgt_vol) * 100.0
 
 
@@ -141,11 +163,17 @@ def volume_error_percent(pred: np.ndarray, target: np.ndarray) -> float:
 # Batch evaluation
 # ---------------------------------------------------------------------------
 
+def _safe_mean(values: list[float]) -> float | None:
+    """Average finite metric values; return None when none are applicable."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return float(np.mean(finite)) if finite.size else None
+
 def evaluate_batch(
     preds: np.ndarray,
     targets: np.ndarray,
     threshold: float = 0.5,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """
     Evaluate a batch of predictions.
     preds:   (N, H, W) sigmoid probabilities [0,1]
@@ -166,11 +194,12 @@ def evaluate_batch(
         metrics["hd95"].append(hausdorff_distance_95(p, t))
         metrics["boundary_f1"].append(boundary_f1(p, t))
         metrics["asd"].append(average_surface_distance(p, t))
-        metrics["vol_err"].append(volume_error_percent(p, t))
+        # Relative volume error has no meaningful denominator for negative
+        # samples, so report it only on samples containing a target nodule.
+        if np.any(t):
+            metrics["vol_err"].append(volume_error_percent(p, t))
 
-    return {
-        k: float(np.nanmean(v)) for k, v in metrics.items()
-    }
+    return {key: _safe_mean(values) for key, values in metrics.items()}
 
 
 # ---------------------------------------------------------------------------

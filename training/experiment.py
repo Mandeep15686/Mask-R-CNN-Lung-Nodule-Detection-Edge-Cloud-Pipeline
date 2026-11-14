@@ -44,7 +44,7 @@ PHASE1_CONFIGS = [
     {"config_id": "C-DICE",     "mask_loss": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0}},
     {"config_id": "C-BDRY",     "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 1.0, "delta": 0.0, "epsilon": 0.0}},
     {"config_id": "C-FOCAL",    "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 1.0, "epsilon": 0.0}},
-    {"config_id": "C-TVK",      "mask_loss": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0}, "_note": "Tversky approximated via Dice (alpha=0.5, beta=0.5); swap SoftDiceLoss for TverskyLoss in trainer"},
+    {"config_id": "C-TVK",      "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0, "zeta": 1.0}},
     {"config_id": "C-HD95",     "mask_loss": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 1.0}},
 ]
 
@@ -144,7 +144,7 @@ def run_bayesian_optimisation(
         "best_boundary_f1": best.user_attrs.get("boundary_f1"),
     }
     with open(Path(output_dir) / "phase3_best.json", "w") as f:
-        json.dump(result, f, indent=2)
+        json.dump(result, f, indent=2, allow_nan=False)
 
     return result
 
@@ -176,7 +176,7 @@ class ExperimentRunner:
 
     def _save_results(self):
         with open(self.output_dir / "all_results.json", "w") as f:
-            json.dump(self.results, f, indent=2)
+            json.dump(self.results, f, indent=2, allow_nan=False)
         # Also save CSV
         import csv
         if self.results:

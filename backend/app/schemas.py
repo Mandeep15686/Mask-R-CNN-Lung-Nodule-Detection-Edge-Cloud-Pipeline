@@ -50,6 +50,7 @@ class ExperimentResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
+    config_json: Optional[dict[str, Any]] = None
 
     model_config = {"from_attributes": True}
 
@@ -64,11 +65,19 @@ class TrainingRunResponse(BaseModel):
     fold: int
     epoch: int
     train_total_loss: Optional[float]
+    train_bce_loss: Optional[float]
+    train_dice_loss: Optional[float]
+    train_boundary_loss: Optional[float]
+    train_focal_loss: Optional[float]
+    train_hd_loss: Optional[float]
     val_dice: Optional[float]
     val_iou: Optional[float]
     val_hd95: Optional[float]
     val_boundary_f1: Optional[float]
     val_sensitivity: Optional[float]
+    val_specificity: Optional[float]
+    val_asd: Optional[float]
+    val_vol_err: Optional[float]
     lr: Optional[float]
     created_at: datetime
 

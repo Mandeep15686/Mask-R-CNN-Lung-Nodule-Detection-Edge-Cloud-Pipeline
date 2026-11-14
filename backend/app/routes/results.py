@@ -4,6 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import get_db, Experiment, TrainingRun, InferenceResult
+from ..json_utils import json_safe
 
 router = APIRouter()
 
@@ -35,7 +36,7 @@ async def leaderboard(db: Session = Depends(get_db)):
         .all()
     )
 
-    return [
+    return json_safe([
         {
             "rank": i + 1,
             "experiment_id": r.id,
@@ -52,7 +53,7 @@ async def leaderboard(db: Session = Depends(get_db)):
             "best_boundary_f1": round(r.best_boundary_f1, 4) if r.best_boundary_f1 else None,
         }
         for i, r in enumerate(rows)
-    ]
+    ])
 
 
 @router.get("/pareto")
@@ -97,7 +98,7 @@ async def pareto_frontier(db: Session = Depends(get_db)):
                 "best_boundary_f1": round(r.best_bf1, 4) if r.best_bf1 else None,
             })
 
-    return pareto
+    return json_safe(pareto)
 
 
 @router.get("/stats")
@@ -110,13 +111,13 @@ async def stats(db: Session = Depends(get_db)):
     best_dice_row = (
         db.query(func.max(TrainingRun.val_dice)).scalar()
     )
-    return {
+    return json_safe({
         "total_experiments": n_experiments,
         "running": n_running,
         "done": n_done,
         "total_inferences": n_inferences,
         "best_dice_overall": round(best_dice_row, 4) if best_dice_row else None,
-    }
+    })
 
 
 @router.get("/experiment/{exp_id}/learning-curve")
@@ -130,7 +131,7 @@ async def learning_curve(exp_id: int, db: Session = Depends(get_db)):
     )
     if not runs:
         raise HTTPException(status_code=404, detail="No runs for this experiment")
-    return {
+    return json_safe({
         "epochs":               [r.epoch for r in runs],
         "train_loss":           [r.train_total_loss for r in runs],
         "val_dice":             [r.val_dice for r in runs],
@@ -138,4 +139,4 @@ async def learning_curve(exp_id: int, db: Session = Depends(get_db)):
         "val_boundary_f1":      [r.val_boundary_f1 for r in runs],
         "val_sensitivity":      [r.val_sensitivity for r in runs],
         "lr":                   [r.lr for r in runs],
-    }
+    })
