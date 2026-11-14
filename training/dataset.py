@@ -360,13 +360,15 @@ def build_dataloaders(
             "Check annotations.csv and that each subset contains matching .mhd files."
         )
 
+    import platform
+    safe_workers = 0 if platform.system() == "Windows" else num_workers
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        drop_last=len(train_ds) >= batch_size,
+        num_workers=safe_workers, pin_memory=True, drop_last=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=safe_workers, pin_memory=True
     )
     return train_loader, val_loader
