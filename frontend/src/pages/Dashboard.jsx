@@ -13,8 +13,8 @@ function StatCard({ label, value, icon: Icon, color = "cyan", sub }) {
     orange: "text-orange-400 bg-orange-500/10 border-orange-500/20",
   };
   return (
-    <div className="card flex items-start gap-4">
-      <div className={`p-2.5 rounded-lg border ${colors[color]}`}>
+    <div className="card stat-card flex items-start gap-4">
+      <div className={`stat-icon p-2.5 rounded-lg border ${colors[color]}`}>
         <Icon size={18} className={colors[color].split(" ")[0]} />
       </div>
       <div>
@@ -61,6 +61,22 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      <section className="dashboard-hero">
+        <div className="hero-copy">
+          <div className="eyebrow"><span className="live-dot" /> Clinical research workspace</div>
+          <h2>Research <span>Overview</span></h2>
+          <p>Model performance, experiment progress, and inference activity in one view.</p>
+        </div>
+        <div className="hero-aside">
+          <div className="hero-orb"><Layers size={23} /></div>
+          <div>
+            <div className="hero-aside-label">PIPELINE</div>
+            <div className="hero-aside-value">LUNA16 · 2.5D</div>
+            <div className="hero-aside-sub">ResNet-50 with FPN</div>
+          </div>
+        </div>
+      </section>
+
       {/* Stat Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Total Experiments" value={stats?.total_experiments} icon={FlaskConical} color="cyan" />

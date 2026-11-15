@@ -31,14 +31,14 @@ function Sidebar({ open, setOpen }) {
       )}
       <aside
         className={clsx(
-          "fixed top-0 left-0 z-30 h-full w-64 bg-slate-900 border-r border-slate-800",
+          "sidebar-glass fixed top-0 left-0 z-30 h-full w-64 border-r",
           "flex flex-col transition-transform duration-200 ease-in-out",
           open ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
         )}
       >
         {/* Logo */}
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-slate-800">
-          <span className="text-2xl">🫁</span>
+        <div className="brand-header flex items-center gap-3 px-5 py-4 border-b">
+          <span className="brand-mark text-2xl">🫁</span>
           <div>
             <div className="text-sm font-bold text-white leading-tight">Lung Nodule</div>
             <div className="text-xs text-slate-400">Mask R-CNN Pipeline</div>
@@ -61,7 +61,7 @@ function Sidebar({ open, setOpen }) {
               onClick={() => setOpen(false)}
               className={({ isActive }) =>
                 clsx(
-                  "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors",
+                  "nav-link flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors",
                   isActive
                     ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/25"
                     : "text-slate-400 hover:text-slate-100 hover:bg-slate-800"
@@ -75,7 +75,7 @@ function Sidebar({ open, setOpen }) {
         </nav>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-slate-800">
+        <div className="sidebar-footer px-5 py-3 border-t">
           <div className="flex items-center gap-2">
             <Activity size={12} className="text-green-400" />
             <span className="text-xs text-slate-400">LUNA16 · ResNet-50-FPN</span>
@@ -95,14 +95,13 @@ export default function App() {
   )?.label ?? "Dashboard";
 
   return (
-    <div className="min-h-screen flex">
+    <div className="app-shell min-h-screen flex">
       <Sidebar open={sidebarOpen} setOpen={setSidebarOpen} />
 
       {/* Main area */}
       <div className="flex-1 flex flex-col lg:ml-64 min-h-screen">
         {/* Top bar */}
-        <header className="sticky top-0 z-10 flex items-center gap-4 px-5 py-3
-                           bg-slate-950/90 backdrop-blur border-b border-slate-800">
+        <header className="topbar-glass sticky top-0 z-10 flex items-center gap-4 px-5 py-3 border-b">
           <button
             className="text-slate-400 hover:text-white lg:hidden"
             onClick={() => setSidebarOpen(true)}
@@ -117,7 +116,7 @@ export default function App() {
         </header>
 
         {/* Page content */}
-        <main className="flex-1 p-5 md:p-6 overflow-auto">
+        <main className="main-stage flex-1 p-5 md:p-6 overflow-auto">
           <Routes>
             <Route path="/"            element={<Dashboard />}     />
             <Route path="/experiments/*" element={<Experiments />} />
