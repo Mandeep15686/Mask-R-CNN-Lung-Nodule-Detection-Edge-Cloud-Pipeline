@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Edge node registration
 # ---------------------------------------------------------------------------
+from fastapi import Request
+
+@router.post("/network-probe")
+async def network_probe(request: Request):
+    """Dedicated endpoint for edge-node bandwidth probes."""
+    await request.body()   # consume and discard
+    return {"status": "ok"}
+
+
 @router.post("/nodes/register", response_model=EdgeNodeResponse)
 async def register_node(payload: EdgeNodeRegister, db: Session = Depends(get_db)):
     node = db.query(EdgeNode).filter(EdgeNode.node_id == payload.node_id).first()
