@@ -20,6 +20,7 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +45,15 @@ def check_environment():
     except ImportError:
         warnings.append("PyTorch not installed — inference engine disabled")
 
-    model_path = os.getenv("MODEL_PATH", "./experiments/best_model.pth")
-    if not os.path.exists(model_path):
+    project_root = Path(__file__).resolve().parents[1]
+    configured_model_path = Path(
+        os.getenv("MODEL_PATH", str(project_root / "experiments" / "best_model.pth"))
+    ).expanduser()
+    model_path = configured_model_path if configured_model_path.is_absolute() else project_root / configured_model_path
+    if not model_path.is_file():
         warnings.append(
-            f"No checkpoint at {model_path} — running in dev mode (random predictions). "
-            f"Run 'make train-p1' to train a model."
+            f"No trained checkpoint at {model_path} — inference requests will return HTTP 503. "
+            f"Set MODEL_PATH to a valid trained checkpoint."
         )
 
     data_root = os.getenv("DATA_ROOT", "./data/luna16")

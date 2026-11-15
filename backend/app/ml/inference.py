@@ -1,12 +1,13 @@
-"""
-Inference engine: loads a trained Mask R-CNN model and runs prediction.
-Handles both full-image cloud inference and feature-continuation from edge.
-"""
-import io
-import os
+"""Strict checkpoint-backed inference for exported LUNA16 2.5D patches."""
+from __future__ import annotations
+
 import logging
+import os
+import sys
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -16,185 +17,361 @@ from ..schemas import NoduleDetection
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-MODEL_PATH = os.getenv("MODEL_PATH", str(_PROJECT_ROOT / "experiments" / "best_model.pth"))
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.05"))
-NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.5"))
+
+
+def _path_from_env(name: str, default: Path) -> Path:
+    raw = os.getenv(name)
+    path = Path(raw).expanduser() if raw else default
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+MODEL_PATH = str(_path_from_env("MODEL_PATH", _PROJECT_ROOT / "experiments" / "best_model.pth"))
+EXPERIMENTS_DIR = _path_from_env("EXPERIMENTS_DIR", _PROJECT_ROOT / "experiments")
+
+
+def _select_device() -> torch.device:
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return torch.device("cuda")
+    except Exception:
+        logger.exception("CUDA device discovery failed; using CPU inference")
+    return torch.device("cpu")
+
+
+DEVICE = _select_device()
+SCORE_THRESHOLD = _env_float("SCORE_THRESHOLD", 0.05, 0.0, 1.0)
+NMS_THRESHOLD = _env_float("NMS_THRESHOLD", 0.5, 0.0, 1.0)
 PATCH_SIZE = int(os.getenv("PATCH_SIZE", "64"))
-APP_ENV = os.getenv("APP_ENV", "development").lower()
-_allow_untrained_env = os.getenv("ALLOW_UNTRAINED_MODEL", "").strip().lower()
-ALLOW_UNTRAINED_MODEL = (
-    _allow_untrained_env == "true"
-    if _allow_untrained_env
-    else APP_ENV != "production"
-)
+DEFAULT_SPACING_MM = _env_float("PATCH_SPACING_MM", 1.0, 1e-6, 100.0)
 
 
-def _checkpoint_state_dict(checkpoint):
-    """Extract weights and migrate the pre-buffer BCE key name if present."""
-    state = dict(checkpoint.get("model_state", checkpoint))
+class InferenceUnavailableError(RuntimeError):
+    """Raised when a trained checkpoint cannot provide predictions."""
+
+
+class CheckpointNotFoundError(FileNotFoundError):
+    """Raised when the specifically requested checkpoint does not exist."""
+
+
+def _checkpoint_state_dict(checkpoint: dict) -> dict:
+    """Extract checkpoint weights and migrate the legacy BCE buffer key."""
+    state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Checkpoint does not contain a model state dictionary")
+    state = dict(state)
     old_key = "composite_mask_loss.bce.loss_fn.pos_weight"
     new_key = "composite_mask_loss.bce.pos_weight"
     if old_key in state and new_key not in state:
         state[new_key] = state.pop(old_key)
     return state
 
-# Average CT spacing for diameter estimation
-DEFAULT_SPACING_MM = 0.7
+
+@dataclass
+class LoadedCheckpoint:
+    model: torch.nn.Module
+    path: Path
+    config_id: str
+    config: dict
+    epoch: Optional[int]
+    metrics: dict
+    spacing_mm: tuple[float, float, float]
+    inference_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 class InferenceEngine:
-    """
-    Lazy-loads the best checkpoint and provides prediction methods.
-    Falls back to a randomly-initialised model if no checkpoint exists
-    (useful for development without training data).
-    """
+    """Loads trained models by exact checkpoint path and caches them read-only."""
 
-    def __init__(self):
-        self.model = None
-        self._load_model()
+    def __init__(
+        self,
+        default_checkpoint_path: str | Path | None = None,
+        experiments_dir: str | Path | None = None,
+        device: torch.device | str | None = None,
+        model_factory: Callable[[dict], torch.nn.Module] | None = None,
+    ):
+        self.device = torch.device(device) if device is not None else DEVICE
+        self.default_checkpoint_path = (
+            Path(default_checkpoint_path).expanduser().resolve()
+            if default_checkpoint_path is not None
+            else Path(MODEL_PATH)
+        )
+        self.experiments_dir = (
+            Path(experiments_dir).expanduser().resolve()
+            if experiments_dir is not None
+            else Path(EXPERIMENTS_DIR)
+        )
+        self.model_factory = model_factory
+        self._models: dict[str, LoadedCheckpoint] = {}
+        self._models_lock = threading.RLock()
+        self.model: Optional[torch.nn.Module] = None  # default checkpoint compatibility
+        self.model_loading_error: Optional[str] = None
+        self.default_config_id: Optional[str] = None
 
-    def _load_model(self):
+        if os.getenv("ALLOW_UNTRAINED_MODEL", "").strip().lower() in {"1", "true", "yes"}:
+            logger.warning("ALLOW_UNTRAINED_MODEL is ignored; predictions require trained checkpoint weights")
         try:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-            from training.model import LungNoduleMaskRCNN
-
-            self.model = LungNoduleMaskRCNN(
-                num_classes=2,
-                mask_loss_cfg={"alpha": 0.3, "beta": 0.5, "gamma": 0.5},
-                # Checkpoints contain the complete backbone; inference must not
-                # download unrelated ImageNet weights during API startup.
-                pretrained_backbone=False,
+            loaded = self._load_checkpoint(self.default_checkpoint_path)
+            self.model = loaded.model
+            self.default_config_id = loaded.config_id
+        except Exception as exc:
+            self.model_loading_error = str(exc)
+            logger.error(
+                "Default inference checkpoint unavailable at %s: %s",
+                self.default_checkpoint_path,
+                exc,
             )
-            self.model.to(DEVICE)
 
-            checkpoint_path = Path(MODEL_PATH)
-            if not checkpoint_path.exists():
-                candidates = sorted(
-                    _PROJECT_ROOT.joinpath("experiments").glob("*/best_model.pth"),
-                    key=lambda path: path.stat().st_mtime,
-                    reverse=True,
+    @property
+    def status(self) -> dict:
+        key = str(self.default_checkpoint_path)
+        loaded = self._models.get(key)
+        return {
+            "model_loaded": loaded is not None,
+            "checkpoint_path": str(self.default_checkpoint_path),
+            "config_id": loaded.config_id if loaded else None,
+            "device": str(self.device),
+            "score_threshold": SCORE_THRESHOLD,
+            "nms_threshold": NMS_THRESHOLD,
+            "model_loading_error": None if loaded else self.model_loading_error,
+        }
+
+    def checkpoint_for_experiment(self, config_id: str) -> Path:
+        """Resolve only the requested config's checkpoint; never fall back."""
+        if not config_id or Path(config_id).name != config_id or config_id in {".", ".."}:
+            raise ValueError("Invalid experiment config_id")
+        root = self.experiments_dir.resolve()
+        checkpoint = (root / config_id / "best_model.pth").resolve()
+        if root not in checkpoint.parents:
+            raise ValueError("Experiment checkpoint path escapes the experiments directory")
+        if not checkpoint.is_file():
+            raise CheckpointNotFoundError(
+                f"No best_model.pth checkpoint exists for experiment {config_id} at {checkpoint}"
+            )
+        return checkpoint
+
+    def _make_model(self, config: dict) -> torch.nn.Module:
+        model_config = dict(config)
+        model_config["pretrained_backbone"] = False
+        model_config["box_score_thresh"] = SCORE_THRESHOLD
+        model_config["box_nms_thresh"] = NMS_THRESHOLD
+        if "mask_loss" not in model_config:
+            model_config["mask_loss"] = {"alpha": 1.0, "beta": 0.0, "gamma": 0.0}
+        factory = self.model_factory
+        if factory is None:
+            if str(_PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(_PROJECT_ROOT))
+            from training.model import LungNoduleMaskRCNN
+            factory = LungNoduleMaskRCNN.from_config
+        return factory(model_config)
+
+    def _load_checkpoint(self, checkpoint_path: str | Path) -> LoadedCheckpoint:
+        path = Path(checkpoint_path).expanduser().resolve()
+        key = str(path)
+        with self._models_lock:
+            loaded = self._models.get(key)
+            if loaded is not None:
+                return loaded
+            if not path.is_file():
+                raise CheckpointNotFoundError(f"Trained checkpoint not found: {path}")
+
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+            if not isinstance(checkpoint, dict):
+                raise ValueError("Checkpoint root must be a dictionary")
+            state = _checkpoint_state_dict(checkpoint)
+            config = checkpoint.get("config", {})
+            if not isinstance(config, dict):
+                raise ValueError("Checkpoint config metadata must be a dictionary")
+            config = dict(config)
+            model = self._make_model(config)
+            try:
+                model.load_state_dict(state, strict=True)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Checkpoint keys or architecture do not match {path}: {exc}"
+                ) from exc
+            model.to(self.device)
+            model.eval()
+
+            spacing = config.get("target_spacing_mm")
+            if spacing is None:
+                spacing = (DEFAULT_SPACING_MM,) * 3
+                logger.warning(
+                    "Checkpoint %s has no target_spacing_mm metadata; using PATCH_SPACING_MM=%.4f",
+                    path,
+                    DEFAULT_SPACING_MM,
                 )
-                if candidates:
-                    checkpoint_path = candidates[0]
-            if checkpoint_path.exists():
-                ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
-                state_dict = _checkpoint_state_dict(ckpt)
-                self.model.load_state_dict(state_dict, strict=True)
-                logger.info(f"Loaded model weights from {checkpoint_path}")
-            else:
-                message = f"No trained checkpoint found at {MODEL_PATH}"
-                if not ALLOW_UNTRAINED_MODEL:
-                    raise FileNotFoundError(message)
-                logger.warning("%s. Using uninitialised model (development only).", message)
+            if not isinstance(spacing, (list, tuple)) or len(spacing) != 3:
+                raise ValueError(f"Invalid target_spacing_mm in checkpoint config: {spacing!r}")
+            spacing_mm = tuple(float(v) for v in spacing)
+            if any(not np.isfinite(v) or v <= 0 for v in spacing_mm):
+                raise ValueError(f"Invalid target_spacing_mm in checkpoint config: {spacing!r}")
 
-            self.model.eval()
+            metrics = checkpoint.get("metrics", {})
+            if not isinstance(metrics, dict):
+                metrics = {}
+            loaded = LoadedCheckpoint(
+                model=model,
+                path=path,
+                config_id=str(config.get("config_id") or path.parent.name),
+                config=config,
+                epoch=checkpoint.get("epoch"),
+                metrics=metrics,
+                spacing_mm=spacing_mm,
+            )
+            self._models[key] = loaded
+            if path == self.default_checkpoint_path:
+                self.model_loading_error = None
+                self.model = model
+                self.default_config_id = loaded.config_id
+            logger.info(
+                "Loaded trained checkpoint=%s config_id=%s epoch=%s val_dice=%s val_hd95=%s device=%s",
+                path,
+                loaded.config_id,
+                loaded.epoch,
+                metrics.get("val_dice"),
+                metrics.get("val_hd95"),
+                self.device,
+            )
+            return loaded
 
-        except Exception as e:
-            logger.exception("Failed to load model; inference will return empty results.")
-            self.model = None
-            if not ALLOW_UNTRAINED_MODEL:
-                raise
+    def _get_checkpoint(self, checkpoint_path: str | Path | None) -> LoadedCheckpoint:
+        path = Path(checkpoint_path).resolve() if checkpoint_path is not None else self.default_checkpoint_path
+        try:
+            return self._load_checkpoint(path)
+        except CheckpointNotFoundError:
+            raise
+        except Exception as exc:
+            if path == self.default_checkpoint_path:
+                self.model_loading_error = str(exc)
+            raise InferenceUnavailableError(
+                f"Could not load trained checkpoint {path}: {exc}"
+            ) from exc
+
+    def checkpoint_info(self, checkpoint_path: str | Path | None = None) -> dict:
+        loaded = self._get_checkpoint(checkpoint_path)
+        return {
+            "checkpoint_path": str(loaded.path),
+            "config_id": loaded.config_id,
+            "epoch": loaded.epoch,
+            "device": str(self.device),
+            "score_threshold": SCORE_THRESHOLD,
+            "nms_threshold": NMS_THRESHOLD,
+        }
 
     def _preprocess_image(self, image_bytes: bytes) -> torch.Tensor:
-        """Convert PNG/JPEG bytes → (3, H, W) float tensor in [0,1]."""
         from ..utils.preprocessing import preprocess_uploaded_image
-        array = preprocess_uploaded_image(image_bytes, patch_size=PATCH_SIZE)
-        return torch.from_numpy(array)
 
+        tensor = torch.from_numpy(
+            preprocess_uploaded_image(image_bytes, patch_size=PATCH_SIZE, enhance_contrast=False)
+        )
+        logger.info(
+            "Prepared RGB 2.5D patch shape=%s range=[%.5f, %.5f]",
+            tuple(tensor.shape),
+            float(tensor.min()),
+            float(tensor.max()),
+        )
+        return tensor
+
+    @staticmethod
     def _postprocess(
-        self, outputs: list[dict], original_size: Optional[tuple] = None
+        outputs: list[dict],
+        spacing_mm: tuple[float, float, float],
+        score_threshold: float = SCORE_THRESHOLD,
     ) -> list[NoduleDetection]:
-        """Convert raw model output to NoduleDetection list."""
-        detections = []
         if not outputs:
-            return detections
+            logger.info("Raw detections=0; after threshold=0")
+            return []
         out = outputs[0]
-
-        boxes = out.get("boxes", torch.zeros(0, 4)).cpu().numpy()
-        scores = out.get("scores", torch.zeros(0)).cpu().numpy()
-        masks = out.get("masks", torch.zeros(0, 1, 1, 1)).cpu().numpy()  # (N, 1, H, W)
-
-        for i, (box, score) in enumerate(zip(boxes, scores)):
-            if score < SCORE_THRESHOLD:
+        boxes = out.get("boxes", torch.zeros((0, 4))).detach().cpu().numpy()
+        scores = out.get("scores", torch.zeros(0)).detach().cpu().numpy()
+        masks = out.get("masks", torch.zeros((0, 1, PATCH_SIZE, PATCH_SIZE))).detach().cpu().numpy()
+        raw_count = min(len(boxes), len(scores))
+        detections = []
+        for i in range(raw_count):
+            score = float(scores[i])
+            if not np.isfinite(score) or score < score_threshold:
                 continue
-            x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-            # Estimate diameter from bounding box (in voxels → mm)
-            width_px = x2 - x1
-            height_px = y2 - y1
-            diameter_px = (width_px + height_px) / 2.0
-            diameter_mm = diameter_px * DEFAULT_SPACING_MM
-
-            # RLE encode mask
+            x1, y1, x2, y2 = (float(v) for v in boxes[i])
+            width_mm = max(0.0, x2 - x1) * spacing_mm[0]
+            height_mm = max(0.0, y2 - y1) * spacing_mm[1]
+            diameter_mm = float(np.sqrt(width_mm * height_mm))
+            mask_rle = None
             if i < len(masks):
-                mask_arr = (masks[i, 0] > 0.5).astype(np.uint8)
-                rle = _rle_encode(mask_arr)
-            else:
-                rle = None
-
+                mask_rle = _rle_encode((masks[i, 0] > 0.5).astype(np.uint8))
             detections.append(NoduleDetection(
                 box=[x1, y1, x2, y2],
-                score=float(score),
-                mask_rle=rle,
+                score=score,
+                mask_rle=mask_rle,
                 diameter_estimate_mm=round(diameter_mm, 2),
             ))
-
+        logger.info(
+            "Raw detections=%d; after score threshold %.3f=%d",
+            raw_count,
+            score_threshold,
+            len(detections),
+        )
         return detections
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_from_bytes(
-        self, image_bytes: bytes, experiment_id: Optional[int] = None
+        self,
+        image_bytes: bytes,
+        experiment_id: Optional[int] = None,
+        checkpoint_path: str | Path | None = None,
     ) -> list[NoduleDetection]:
-        """Full cloud inference from raw image bytes."""
-        if self.model is None:
-            return []
-        img_tensor = self._preprocess_image(image_bytes).to(DEVICE)
-        outputs = self.model([img_tensor])
-        return self._postprocess(outputs)
+        # experiment_id is retained for compatible callers; DB resolution is
+        # deliberately done in the API route, where a DB session is available.
+        del experiment_id
+        loaded = self._get_checkpoint(checkpoint_path)
+        image = self._preprocess_image(image_bytes).to(self.device)
+        with loaded.inference_lock:
+            outputs = loaded.model([image])
+        detections = self._postprocess(outputs, loaded.spacing_mm)
+        logger.info("Final inference detection count=%d", len(detections))
+        return detections
 
-    @torch.no_grad()
-    def predict_from_features(
-        self, features: dict, scan_uid: str
-    ) -> list[NoduleDetection]:
-        """
-        Continue inference from intermediate feature maps (edge-cloud split).
-        Features are the output of edge's early layers.
-        """
-        if self.model is None:
-            return []
-        # Move features to device
+    @torch.inference_mode()
+    def predict_from_features(self, features: dict, scan_uid: str) -> list[NoduleDetection]:
+        """Run the edge continuation using the configured default checkpoint."""
+        del scan_uid  # patient/scan identifiers are never logged
+        loaded = self._get_checkpoint(None)
         features_device = {
-            k: (v.dequantize().to(DEVICE) if v.is_quantized else v.to(DEVICE))
+            k: (v.dequantize().to(self.device) if v.is_quantized else v.to(self.device))
             if isinstance(v, torch.Tensor) else v
             for k, v in features.items()
         }
         try:
-            # Pass through remaining model layers (FPN + RPN + RoI + Mask head)
-            # This requires the model to support partial forward — handled via backbone hook
-            backbone = self.model.model.backbone
-            # Inject pre-computed features into FPN
-            dummy_img = torch.zeros(1, 3, PATCH_SIZE, PATCH_SIZE, device=DEVICE)
-            image_list, _ = self.model.model.transform([dummy_img], None)
-            # Directly pass features dict to RPN
-            proposals, _ = self.model.model.rpn(image_list, features_device, None)
-            detections, _ = self.model.model.roi_heads(
-                features_device, proposals, image_list.image_sizes, None
-            )
-            outputs = self.model.model.transform.postprocess(detections, image_list.image_sizes, [(PATCH_SIZE, PATCH_SIZE)])
-            return self._postprocess(outputs)
-        except Exception as e:
+            with loaded.inference_lock:
+                detection_model = loaded.model.model
+                dummy_img = torch.zeros(1, 3, PATCH_SIZE, PATCH_SIZE, device=self.device)
+                image_list, _ = detection_model.transform([dummy_img], None)
+                proposals, _ = detection_model.rpn(image_list, features_device, None)
+                detections, _ = detection_model.roi_heads(
+                    features_device, proposals, image_list.image_sizes, None
+                )
+                outputs = detection_model.transform.postprocess(
+                    detections,
+                    image_list.image_sizes,
+                    [(PATCH_SIZE, PATCH_SIZE)],
+                )
+            result = self._postprocess(outputs, loaded.spacing_mm)
+            logger.info("Final edge inference detection count=%d", len(result))
+            return result
+        except Exception as exc:
             logger.exception("Feature-based inference failed")
-            return []
+            raise InferenceUnavailableError(f"Feature inference failed: {exc}") from exc
 
     def load_checkpoint(self, checkpoint_path: str):
-        """Hot-reload a new checkpoint."""
-        if self.model is None:
-            return
-        ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
-        state_dict = _checkpoint_state_dict(ckpt)
-        self.model.load_state_dict(state_dict, strict=True)
-        logger.info(f"Reloaded checkpoint from {checkpoint_path}")
+        """Load/cache a checkpoint without mutating any model already in use."""
+        return self._load_checkpoint(checkpoint_path)
 
 
 def _rle_encode(mask: np.ndarray) -> str:
@@ -203,18 +380,18 @@ def _rle_encode(mask: np.ndarray) -> str:
     runs = []
     pos = 0
     while pos < len(flat):
-        val = flat[pos]
-        run_start = pos
-        while pos < len(flat) and flat[pos] == val:
+        value = flat[pos]
+        start = pos
+        while pos < len(flat) and flat[pos] == value:
             pos += 1
-        runs.append(f"{int(val)}:{pos - run_start}")
+        runs.append(f"{int(value)}:{pos - start}")
     return ",".join(runs)
 
 
 def _rle_decode(rle: str, shape: tuple) -> np.ndarray:
-    """Decode RLE string back to 2D binary mask."""
+    """Decode a binary mask from this module's simple RLE representation."""
     flat = []
     for token in rle.split(","):
-        val, count = token.split(":")
-        flat.extend([int(val)] * int(count))
-    return np.array(flat, dtype=np.uint8).reshape(shape)
+        value, count = token.split(":")
+        flat.extend([int(value)] * int(count))
+    return np.asarray(flat, dtype=np.uint8).reshape(shape)

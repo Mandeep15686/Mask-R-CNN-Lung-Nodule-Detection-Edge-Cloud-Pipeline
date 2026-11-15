@@ -142,6 +142,9 @@ class InferenceResponse(BaseModel):
     inference_time_ms: float
     source: str
     result_id: int
+    checkpoint_path: Optional[str] = None
+    config_id: Optional[str] = None
+    score_threshold: Optional[float] = None
 
 
 class InferenceResultResponse(BaseModel):

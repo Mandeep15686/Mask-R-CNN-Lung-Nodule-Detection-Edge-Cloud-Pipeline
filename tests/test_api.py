@@ -16,8 +16,25 @@ from unittest.mock import patch
 
 
 class TestInferenceEngine:
-    def predict_from_bytes(self, image_bytes, experiment_id=None):
+    status = {
+        "model_loaded": True,
+        "checkpoint_path": "test-checkpoint.pth",
+        "config_id": "test-model",
+        "device": "cpu",
+        "score_threshold": 0.05,
+        "nms_threshold": 0.5,
+        "model_loading_error": None,
+    }
+
+    def predict_from_bytes(self, image_bytes, experiment_id=None, checkpoint_path=None):
         return []
+
+    def checkpoint_info(self, checkpoint_path=None):
+        return {
+            "checkpoint_path": checkpoint_path or self.status["checkpoint_path"],
+            "config_id": self.status["config_id"],
+            "score_threshold": self.status["score_threshold"],
+        }
 
     def predict_from_features(self, features, scan_uid):
         return []

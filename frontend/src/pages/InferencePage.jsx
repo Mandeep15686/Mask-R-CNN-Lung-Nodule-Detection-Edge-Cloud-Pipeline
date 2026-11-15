@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
 import { api } from "../services/api.js";
-import { Upload, Loader2, AlertCircle, Eye, CheckCircle } from "lucide-react";
+import { Upload, Loader2, AlertCircle, Eye, CheckCircle, XCircle } from "lucide-react";
 
 // Model always works on 64×64 patches; box coords are in that space.
 const MODEL_PATCH_SIZE = 64;
@@ -40,6 +40,34 @@ function NoduleCanvas({ imageUrl, nodules, inferenceRan }) {
       }
 
       nodules.forEach((n, i) => {
+        if (n.mask_rle) {
+          const rgba = new Uint8ClampedArray(MODEL_PATCH_SIZE * MODEL_PATCH_SIZE * 4);
+          let offset = 0;
+          for (const run of n.mask_rle.split(",")) {
+            const [valueText, countText] = run.split(":");
+            const value = Number(valueText);
+            const count = Number(countText);
+            if (!Number.isInteger(count) || count < 0 || offset + count > MODEL_PATCH_SIZE ** 2) break;
+            if (value === 1) {
+              for (let pixel = offset; pixel < offset + count; pixel += 1) {
+                const idx = pixel * 4;
+                rgba[idx] = 34;
+                rgba[idx + 1] = 211;
+                rgba[idx + 2] = 238;
+                rgba[idx + 3] = 120;
+              }
+            }
+            offset += count;
+          }
+          const maskCanvas = document.createElement("canvas");
+          maskCanvas.width = MODEL_PATCH_SIZE;
+          maskCanvas.height = MODEL_PATCH_SIZE;
+          maskCanvas.getContext("2d").putImageData(
+            new ImageData(rgba, MODEL_PATCH_SIZE, MODEL_PATCH_SIZE), 0, 0
+          );
+          ctx.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
+        }
+
         const [x1raw, y1raw, x2raw, y2raw] = n.box;
         // Scale from model patch space to actual image pixels
         const x1 = x1raw * scaleX;
@@ -92,27 +120,51 @@ export default function InferencePage() {
   const [error, setError]       = useState(null);
   const [history, setHistory]   = useState([]);
   const [experiments, setExps]  = useState([]);
+  const [modelStatus, setModelStatus] = useState(null);
   const fileRef                 = useRef(null);
 
   useEffect(() => {
     api.listExperiments({ status: "done" }).then(setExps).catch(() => {});
     api.listInferences({ limit: 10 }).then(setHistory).catch(() => {});
+    api.getInferenceStatus().then(setModelStatus).catch((e) => {
+      setModelStatus({ model_loaded: false, model_loading_error: e.message });
+    });
   }, []);
 
-  const onFileChange = (e) => {
-    const f = e.target.files?.[0];
+  const chooseFile = useCallback(async (f) => {
     if (!f) return;
+    const extension = f.name.toLowerCase().split(".").pop();
+    if (!new Set(["png", "jpg", "jpeg"]).has(extension)
+        || !new Set(["image/png", "image/jpeg"]).has(f.type)) {
+      setError("Choose a PNG or JPEG exported as a 64×64 RGB 2.5D patch.");
+      return;
+    }
+    const previewUrl = URL.createObjectURL(f);
+    const dimensions = await new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => resolve([image.naturalWidth, image.naturalHeight]);
+      image.onerror = () => resolve(null);
+      image.src = previewUrl;
+    });
+    if (!dimensions || dimensions[0] !== MODEL_PATCH_SIZE || dimensions[1] !== MODEL_PATCH_SIZE) {
+      URL.revokeObjectURL(previewUrl);
+      setError(`Patch must be exactly ${MODEL_PATCH_SIZE}×${MODEL_PATCH_SIZE} pixels. Whole CT images are not accepted here.`);
+      return;
+    }
+    setError(null);
     setFile(f);
-    setUrl(URL.createObjectURL(f));
+    setUrl(previewUrl);
     setResult(null);
-    if (!scanUid) setScanUid(`scan_${Date.now()}`);
-  };
+    setScanUid((previous) => previous || `scan_${Date.now()}`);
+  }, []);
+
+  const onFileChange = (e) => { void chooseFile(e.target.files?.[0]); };
 
   const onDrop = useCallback((e) => {
     e.preventDefault();
     const f = e.dataTransfer.files?.[0];
-    if (f) { setFile(f); setUrl(URL.createObjectURL(f)); setResult(null); }
-  }, []);
+    if (f) void chooseFile(f);
+  }, [chooseFile]);
 
   const runInference = async () => {
     if (!file) return setError("Please select a CT patch image");
@@ -140,7 +192,9 @@ export default function InferencePage() {
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-bold text-white">Nodule Inference</h2>
-        <p className="text-sm text-slate-400">Upload a 2.5D CT patch — Mask R-CNN detects and segments nodules</p>
+        <p className="text-sm text-slate-400">
+          Upload an exported 64×64 RGB 2.5D patch. R, G and B must contain axial z−1, z and z+1 slices in that order. This page does not accept full CT scans or a single grayscale slice.
+        </p>
       </div>
 
       <div className="grid lg:grid-cols-2 gap-6">
@@ -156,10 +210,31 @@ export default function InferencePage() {
           >
             <Upload size={28} className={file ? "text-cyan-400" : "text-slate-500"} />
             <div className="text-sm text-slate-400 text-center">
-              {file ? file.name : "Drop a CT patch PNG/JPEG here\nor click to browse"}
+              {file ? file.name : "Drop a 64×64 RGB 2.5D PNG/JPEG here\nor click to browse"}
             </div>
             {file && <div className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB</div>}
-            <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onFileChange} />
+            <input ref={fileRef} type="file" accept="image/png,image/jpeg" className="hidden" onChange={onFileChange} />
+          </div>
+
+          <div className={`card flex items-start gap-3 ${modelStatus?.model_loaded ? "text-green-400" : "text-amber-400"}`}>
+            {modelStatus?.model_loaded ? <CheckCircle size={18} /> : <XCircle size={18} />}
+            <div className="min-w-0">
+              <div className="text-sm font-semibold">
+                {modelStatus?.model_loaded ? "Inference model ready" : "Inference model unavailable"}
+              </div>
+              <div className="text-xs text-slate-400 break-all">
+                {modelStatus?.checkpoint_path || "Checking backend checkpoint…"}
+              </div>
+              {modelStatus?.model_loaded ? (
+                <div className="text-xs text-slate-400 mt-1">
+                  {modelStatus.config_id} · {modelStatus.device} · score ≥ {modelStatus.score_threshold}
+                </div>
+              ) : (
+                <div className="text-xs text-amber-300 mt-1">
+                  {modelStatus?.model_loading_error || "Waiting for backend readiness status"}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Options */}
@@ -188,7 +263,7 @@ export default function InferencePage() {
 
           <button
             className="btn-primary w-full flex items-center justify-center gap-2"
-            onClick={runInference} disabled={loading || !file}
+            onClick={runInference} disabled={loading || !file || modelStatus?.model_loaded === false}
           >
             {loading ? <Loader2 size={16} className="animate-spin" /> : <Eye size={16} />}
             {loading ? "Running Inference..." : "Run Mask R-CNN"}
@@ -213,6 +288,11 @@ export default function InferencePage() {
                 </div>
                 <div className="text-xs text-slate-400">Latency</div>
               </div>
+            </div>
+          )}
+          {result && (
+            <div className="text-xs text-slate-500 break-all">
+              Checkpoint: {result.config_id || "default"} · {result.checkpoint_path}
             </div>
           )}
         </div>

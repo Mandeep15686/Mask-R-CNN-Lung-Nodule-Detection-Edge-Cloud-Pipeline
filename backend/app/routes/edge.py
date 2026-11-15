@@ -16,6 +16,7 @@ from ..schemas import (
     EdgeNodeRegister, EdgeNodeResponse,
     NetworkLogCreate, NetworkLogResponse,
 )
+from ..ml.inference import InferenceUnavailableError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -181,9 +182,11 @@ async def infer_from_features(
         )
     try:
         nodules = engine.predict_from_features(features, scan_uid)
+    except InferenceUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
         logger.exception("Cloud-side inference from features failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Cloud-side inference failed") from e
 
     inference_ms = (time.perf_counter() - t0) * 1000
 

@@ -5,7 +5,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -62,8 +62,16 @@ app.include_router(edge.router,        prefix="/api/edge",        tags=["Edge"])
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "version": "1.0.0"}
+async def health(request: Request):
+    engine = getattr(request.app.state, "inference_engine", None)
+    model_status = engine.status if engine is not None else {
+        "model_loaded": False,
+        "checkpoint_path": None,
+        "device": None,
+        "score_threshold": None,
+        "model_loading_error": "Inference engine has not initialized",
+    }
+    return {"status": "ok", "version": "1.0.0", **model_status}
 
 
 @app.get("/api/info")

@@ -29,6 +29,11 @@ WORKDIR /app/backend
 ENV PYTHONPATH=/app
 ENV DATABASE_URL=sqlite:////data/lung_nodule.db
 ENV MODEL_PATH=/app/experiments/best_model.pth
+ENV EXPERIMENTS_DIR=/app/experiments
+ENV SCORE_THRESHOLD=0.05
+ENV NMS_THRESHOLD=0.5
+ENV PATCH_SIZE=64
+ENV PATCH_SPACING_MM=1.0
 
 EXPOSE 8000
 

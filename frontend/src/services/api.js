@@ -39,6 +39,7 @@ export const api = {
   getPareto:       ()             => http.get("/results/pareto"),
 
   // Inference
+  getInferenceStatus:()           => http.get("/inference/status"),
   predictUpload:  (formData)      => http.post("/inference/upload", formData, {
     headers: { "Content-Type": "multipart/form-data" },
   }),

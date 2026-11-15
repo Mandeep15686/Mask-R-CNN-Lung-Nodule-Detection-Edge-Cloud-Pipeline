@@ -82,22 +82,19 @@ def resize_patch(image_np: np.ndarray, target_size: int) -> np.ndarray:
 def preprocess_uploaded_image(
     image_bytes: bytes,
     patch_size: int = PATCH_SIZE_DEFAULT,
-    enhance_contrast: bool = True,
+    enhance_contrast: bool = False,
 ) -> np.ndarray:
     """
-    Full preprocessing pipeline for an uploaded CT patch.
+    Decode an exported three-slice 2.5D RGB training patch without resampling.
 
-    1. Decode PNG/JPEG bytes
-    2. Convert to greyscale or 3-channel float
-    3. Normalise pixel values
-    4. Optionally apply CLAHE-like contrast enhancement
-    5. Resize to patch_size × patch_size
-    6. Return (3, H, W) float32 numpy array
+    The RGB channels are preserved in order and mapped from uint8 [0, 255] to
+    float32 [0, 1]. Single-channel images and non-patch dimensions are rejected
+    rather than replicated or resized into a different input distribution.
 
     Args:
         image_bytes: raw PNG or JPEG bytes
-        patch_size:  spatial dimension for the model (default 64)
-        enhance_contrast: apply contrast-limited enhancement
+        patch_size: required spatial dimension for the model (default 64)
+        enhance_contrast: opt-in legacy enhancement; inference leaves this off
 
     Returns:
         (3, patch_size, patch_size) float32 ndarray in [0, 1]
@@ -107,16 +104,37 @@ def preprocess_uploaded_image(
     except Exception as e:
         raise ValueError(f"Cannot decode image: {e}")
 
-    # Convert to RGB always (handles RGBA, P, L modes)
-    img_rgb = img.convert("RGB")
+    logger.info(
+        "Received inference patch format=%s mode=%s dimensions=%dx%d",
+        img.format or "unknown",
+        img.mode,
+        img.width,
+        img.height,
+    )
+
+    if img.format not in {"PNG", "JPEG"}:
+        raise ValueError(f"Unsupported image format: {img.format or 'unknown'}; use PNG or JPEG")
+    if img.mode != "RGB":
+        raise ValueError(
+            f"Unsupported image mode {img.mode!r}; upload a true three-channel RGB "
+            "2.5D patch (axial z-1, z, z+1 slices as R, G, B)"
+        )
+    if img.size != (patch_size, patch_size):
+        raise ValueError(
+            f"Expected a {patch_size}x{patch_size} 2.5D patch, got "
+            f"{img.width}x{img.height}; whole CT images are not supported by patch inference"
+        )
+
+    img_rgb = img
 
     if enhance_contrast:
         enhancer = ImageEnhance.Contrast(img_rgb)
         img_rgb  = enhancer.enhance(1.5)
 
-    arr = np.array(img_rgb, dtype=np.float32) / 255.0   # (H, W, 3) in [0, 1]
-    arr = to_three_channel(arr)                           # (3, H, W)
-    arr = resize_patch(arr, patch_size)                   # (3, ps, ps)
+    arr = np.asarray(img_rgb, dtype=np.float32) / 255.0
+    if arr.shape != (patch_size, patch_size, 3):
+        raise ValueError(f"Expected RGB pixels, got array shape {arr.shape}")
+    arr = np.ascontiguousarray(arr.transpose(2, 0, 1), dtype=np.float32)
 
     return arr
 
