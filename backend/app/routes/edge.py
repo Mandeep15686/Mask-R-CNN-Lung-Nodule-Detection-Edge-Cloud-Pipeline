@@ -1,9 +1,11 @@
 """Edge node management and network monitoring routes."""
 import base64
+import hmac
 import io
 import time
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -31,7 +33,7 @@ async def register_node(payload: EdgeNodeRegister, db: Session = Depends(get_db)
         node.ip_address = payload.ip_address
         node.split_layer = payload.split_layer
         node.is_online = True
-        node.last_seen = datetime.utcnow()
+        node.last_seen = datetime.now(timezone.utc)
     else:
         node = EdgeNode(
             node_id=payload.node_id,
@@ -39,7 +41,7 @@ async def register_node(payload: EdgeNodeRegister, db: Session = Depends(get_db)
             ip_address=payload.ip_address,
             split_layer=payload.split_layer,
             is_online=True,
-            last_seen=datetime.utcnow(),
+            last_seen=datetime.now(timezone.utc),
         )
         db.add(node)
     db.commit()
@@ -66,7 +68,7 @@ async def heartbeat(node_id: str, db: Session = Depends(get_db)):
     if not n:
         raise HTTPException(status_code=404, detail="Node not found")
     n.is_online = True
-    n.last_seen = datetime.utcnow()
+    n.last_seen = datetime.now(timezone.utc)
     db.commit()
     return {"status": "ok"}
 
@@ -87,17 +89,45 @@ async def infer_from_features(
     and complete the remaining Mask R-CNN computation (RPN + RoI + Mask head).
     """
     t0 = time.perf_counter()
+    expected_token = os.getenv("EDGE_API_TOKEN", "")
+    supplied_token = request.headers.get("x-edge-token", "")
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Edge feature endpoint is not configured")
+    if not hmac.compare_digest(supplied_token, expected_token):
+        raise HTTPException(status_code=401, detail="Invalid edge node credentials")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > 64 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Feature payload exceeds 64 MiB")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
     body = await request.body()
+    if len(body) > 64 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Feature payload exceeds 64 MiB")
     payload_kb = len(body) / 1024.0
 
     try:
         import torch
-        feature_data = torch.load(io.BytesIO(body), map_location="cpu")
-        features = feature_data["features"]   # dict of FPN feature maps
+        feature_data = torch.load(io.BytesIO(body), map_location="cpu", weights_only=True)
+        if not isinstance(feature_data, dict) or not isinstance(feature_data.get("features"), dict):
+            raise ValueError("Payload must contain a feature tensor mapping")
+        features = feature_data["features"]
+        if not all(isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in features.items()):
+            raise ValueError("Feature mapping must contain only named tensors")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid feature payload: {e}")
 
     engine = request.app.state.inference_engine
+    required_fpn_keys = {"0", "1", "2", "3", "pool"}
+    if set(features) != required_fpn_keys:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "This edge extractor sends a single intermediate feature map, but cloud "
+                "inference currently requires all five FPN feature maps. No prediction was run."
+            ),
+        )
     try:
         nodules = engine.predict_from_features(features, scan_uid)
     except Exception as e:

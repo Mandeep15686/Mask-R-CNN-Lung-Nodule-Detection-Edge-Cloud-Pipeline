@@ -120,7 +120,7 @@ class TestExperiments:
         bad = {**self.EXP_PAYLOAD, "config_id": "bad-zero",
                "loss_weights": {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0, "epsilon": 0.0}}
         r = client.post("/api/experiments/", json=bad)
-        assert r.status_code == 400
+        assert r.status_code == 422
 
     def test_delete_experiment(self, client):
         payload = {**self.EXP_PAYLOAD, "config_id": "test-delete-exp"}

@@ -3,11 +3,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -23,6 +25,16 @@ logger = logging.getLogger(__name__)
 
 # WebSocket connections for live progress streaming
 _ws_connections: dict[int, list[WebSocket]] = {}
+_experiment_log_context = threading.local()
+
+
+class _ExperimentLogFilter(logging.Filter):
+    def __init__(self, experiment_id: int):
+        super().__init__()
+        self.experiment_id = experiment_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(_experiment_log_context, "experiment_id", None) == self.experiment_id
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -106,7 +118,6 @@ async def get_experiment_logs(exp_id: int, db: Session = Depends(get_db)):
     if not exp:
         raise HTTPException(status_code=404, detail="Experiment not found")
     config_id, status = exp.config_id, exp.status
-    db.close()
     log_path = _experiment_run_dir(config_id) / "terminal.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     return {"experiment_id": exp_id, "status": status, "log": log_text}
@@ -130,7 +141,6 @@ async def get_experiment_details(exp_id: int, db: Session = Depends(get_db)):
         for run in runs
     ]
     config_id = exp.config_id
-    db.close()
     log_path = _experiment_run_dir(config_id) / "terminal.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     return json_safe({
@@ -147,6 +157,7 @@ async def get_experiment_details(exp_id: int, db: Session = Depends(get_db)):
 async def start_experiment(
     exp_id: int,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
@@ -156,14 +167,17 @@ async def start_experiment(
         raise HTTPException(status_code=409, detail="Already running")
 
     exp.status = "running"
-    exp.started_at = datetime.utcnow()
+    exp.started_at = datetime.now(timezone.utc)
     db.commit()
 
-    background_tasks.add_task(_run_experiment_bg, exp_id, exp.config_json or {})
+    background_tasks.add_task(
+        _run_experiment_bg, exp_id, exp.config_json or {},
+        request.app.state.inference_engine,
+    )
     return {"message": f"Experiment {exp.config_id} started", "experiment_id": exp_id}
 
 
-async def _run_experiment_bg(exp_id: int, config_json: dict):
+async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=None):
     """Background task: run full training and log each epoch."""
     from ..database import SessionLocal
     event_loop = asyncio.get_running_loop()
@@ -201,6 +215,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
         log_handler.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
         ))
+        log_handler.addFilter(_ExperimentLogFilter(exp_id))
         root_logger = logging.getLogger()
         root_logger.addHandler(log_handler)
 
@@ -236,10 +251,25 @@ async def _run_experiment_bg(exp_id: int, config_json: dict):
                     return result
 
             def train_run():
-                trainer = DBCallbackTrainer(full_cfg, str(run_dir))
-                return trainer.train()
+                previous_id = getattr(_experiment_log_context, "experiment_id", None)
+                _experiment_log_context.experiment_id = exp_id
+                try:
+                    trainer = DBCallbackTrainer(full_cfg, str(run_dir))
+                    return trainer.train()
+                finally:
+                    _experiment_log_context.experiment_id = previous_id
 
             summary = await run_in_threadpool(train_run)
+
+            best_checkpoint = run_dir / "best_model.pth"
+            if inference_engine is not None and best_checkpoint.exists():
+                canonical_checkpoint = PROJECT_ROOT / "experiments" / "best_model.pth"
+                temporary_checkpoint = canonical_checkpoint.with_name(
+                    f"best_model.{exp_id}.tmp"
+                )
+                shutil.copy2(best_checkpoint, temporary_checkpoint)
+                temporary_checkpoint.replace(canonical_checkpoint)
+                inference_engine.load_checkpoint(str(canonical_checkpoint))
 
             _set_experiment_status(exp_id, "done")
             logger.info("Experiment %s completed successfully", experiment_id)
@@ -263,7 +293,7 @@ def _set_experiment_status(exp_id: int, status: str):
         exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
         if exp:
             exp.status = status
-            exp.finished_at = datetime.utcnow()
+            exp.finished_at = datetime.now(timezone.utc)
             db.commit()
     finally:
         db.close()
@@ -396,8 +426,13 @@ async def experiment_ws(exp_id: int, websocket: WebSocket):
             await asyncio.sleep(1)
             await websocket.send_text(json.dumps({"ping": True}))
     except WebSocketDisconnect:
-        if exp_id in _ws_connections:
-            _ws_connections[exp_id].remove(websocket)
+        pass
+    finally:
+        connections = _ws_connections.get(exp_id, [])
+        if websocket in connections:
+            connections.remove(websocket)
+        if not connections:
+            _ws_connections.pop(exp_id, None)
 
 
 # ---------------------------------------------------------------------------

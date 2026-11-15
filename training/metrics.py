@@ -245,15 +245,21 @@ def compute_froc(
 
     # FROC score = average sensitivity at [0.125, 0.25, 0.5, 1, 2, 4, 8] FPs/scan
     froc_points = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
-    fps_arr = np.array(fps_per_scan_list)
-    sens_arr = np.array(sensitivities)
-    froc_sens = []
-    for fp_target in froc_points:
-        idx = np.searchsorted(fps_arr, fp_target)
-        if idx < len(sens_arr):
-            froc_sens.append(sens_arr[idx])
-        else:
-            froc_sens.append(0.0)
+    fps_arr = np.asarray(fps_per_scan_list, dtype=float)
+    sens_arr = np.asarray(sensitivities, dtype=float)
+    sort_idx = np.argsort(fps_arr, kind="stable")
+    fps_arr = fps_arr[sort_idx]
+    sens_arr = sens_arr[sort_idx]
+    # Collapse duplicate FP rates to their best sensitivity, then interpolate
+    # on the increasing FP axis as required by the FROC operating points.
+    unique_fps = np.unique(fps_arr)
+    unique_sens = np.asarray([
+        sens_arr[fps_arr == fp].max() for fp in unique_fps
+    ])
+    froc_sens = np.interp(
+        np.asarray(froc_points), unique_fps, unique_sens,
+        left=float(unique_sens[0]), right=float(unique_sens[-1]),
+    ).tolist()
 
     return {
         "fps_per_scan": fps_per_scan_list,

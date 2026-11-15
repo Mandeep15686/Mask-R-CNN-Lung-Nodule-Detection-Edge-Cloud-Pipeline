@@ -22,17 +22,16 @@ PATCH_SIZE_DEFAULT = 64
 
 def normalise_hu(image_np: np.ndarray) -> np.ndarray:
     """
-    Clip and normalise a greyscale CT image to [0, 1].
-    Assumes pixel values are in Hounsfield Units or a similar [0, 255] range.
+    Normalize scans consistently: fixed lung window for HU volumes, fixed
+    0–255 scaling for ordinary image pixels, and passthrough for [0, 1] data.
     """
-    if image_np.max() > 1.0:
-        # Treat as HU-like — remap from pixel range to [0,1]
-        v_min = float(image_np.min())
-        v_max = float(image_np.max())
-        if v_max - v_min < 1e-6:
-            return np.zeros_like(image_np, dtype=np.float32)
-        return ((image_np.astype(np.float32) - v_min) / (v_max - v_min))
-    return image_np.astype(np.float32)
+    values = np.asarray(image_np, dtype=np.float32)
+    if values.size == 0 or float(values.max()) <= 1.0:
+        return values
+    if float(values.min()) >= 0.0 and float(values.max()) <= 255.0:
+        return values / 255.0
+    clipped = np.clip(values, HU_MIN, HU_MAX)
+    return (clipped - HU_MIN) / (HU_MAX - HU_MIN)
 
 
 def apply_lung_window(image_np: np.ndarray) -> np.ndarray:

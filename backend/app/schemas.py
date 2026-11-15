@@ -2,7 +2,7 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Optional, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -16,10 +16,11 @@ class LossWeights(BaseModel):
     delta: float = Field(0.0, ge=0.0, le=1.0, description="Focal weight")
     epsilon: float = Field(0.0, ge=0.0, le=1.0, description="HD95 weight")
 
-    @field_validator("alpha")
-    @classmethod
-    def at_least_one_active(cls, v, info):
-        return v  # actual cross-field validation below
+    @model_validator(mode="after")
+    def require_active_weight(self):
+        if not self.is_valid():
+            raise ValueError("At least one loss weight must be > 0")
+        return self
 
     def is_valid(self) -> bool:
         return (self.alpha + self.beta + self.gamma + self.delta + self.epsilon) > 0

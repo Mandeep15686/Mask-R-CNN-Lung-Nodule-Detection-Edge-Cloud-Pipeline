@@ -3,7 +3,7 @@ SQLAlchemy models + session factory.
 Uses SQLite by default; swap DATABASE_URL env var for PostgreSQL.
 """
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Generator
 
 from sqlalchemy import (
@@ -16,7 +16,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lung_nodule.db")
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    connect_args={"check_same_thread": False, "timeout": 30} if "sqlite" in DATABASE_URL else {},
     echo=False,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -40,9 +40,9 @@ class Experiment(Base):
     epsilon = Column(Float, default=0.0)                   # HD95 weight
     loss_description = Column(String(256), nullable=True)
     status = Column(String(32), default="pending")         # pending/running/done/failed
-    created_at = Column(DateTime, default=datetime.utcnow)
-    started_at = Column(DateTime, nullable=True)
-    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
     config_json = Column(JSON, nullable=True)
     runs = relationship("TrainingRun", back_populates="experiment", cascade="all, delete-orphan")
 
@@ -71,7 +71,7 @@ class TrainingRun(Base):
     val_asd = Column(Float, nullable=True)
     val_vol_err = Column(Float, nullable=True)
     lr = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     experiment = relationship("Experiment", back_populates="runs")
 
 
@@ -92,7 +92,7 @@ class InferenceResult(Base):
     # Pipeline info
     source = Column(String(32), default="cloud")          # "edge" or "cloud"
     inference_time_ms = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     image_path = Column(String(512), nullable=True)
     mask_path = Column(String(512), nullable=True)
 
@@ -105,13 +105,13 @@ class EdgeNode(Base):
     hostname = Column(String(128))
     ip_address = Column(String(64))
     is_online = Column(Boolean, default=False)
-    last_seen = Column(DateTime, nullable=True)
+    last_seen = Column(DateTime(timezone=True), nullable=True)
     # Metrics
     avg_latency_ms = Column(Float, nullable=True)
     avg_bandwidth_mbps = Column(Float, nullable=True)
     split_layer = Column(String(64), default="layer2")
     compression_ratio = Column(Float, default=1.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class NetworkLog(Base):
@@ -119,7 +119,7 @@ class NetworkLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     node_id = Column(String(64), index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     latency_ms = Column(Float)
     bandwidth_mbps = Column(Float)
     payload_size_kb = Column(Float)

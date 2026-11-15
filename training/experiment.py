@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import itertools
+import random
 from pathlib import Path
 from copy import deepcopy
 from typing import Optional
@@ -117,11 +118,16 @@ def run_bayesian_optimisation(
 
         # Composite objective: 50% Dice + 30% (1 - HD95_norm) + 20% BoundaryF1
         metrics = summary.get("final_metrics", {})
-        dice = metrics.get("val_dice")
-        dice = 0.0 if dice is None else dice
-        hd95 = metrics.get("val_hd95")
+        dice = summary.get("best_dice")
+        dice = metrics.get("val_dice") if dice is None else dice
+        dice = 0.0 if dice is None else float(dice)
+        hd95 = summary.get("best_hd95")
+        if hd95 is None:
+            hd95 = metrics.get("val_hd95")
         hd95 = 999.0 if hd95 is None else min(hd95, 100.0)
-        bdf1 = metrics.get("val_boundary_f1")
+        bdf1 = summary.get("best_boundary_f1")
+        if bdf1 is None:
+            bdf1 = metrics.get("val_boundary_f1")
         bdf1 = 0.0 if bdf1 is None else bdf1
         score = 0.5 * dice + 0.3 * (1.0 - hd95 / 100.0) + 0.2 * bdf1
 
@@ -201,8 +207,11 @@ class ExperimentRunner:
     def run_phase2(self, max_configs: Optional[int] = None):
         logger.info("=== PHASE 2: Grid search (alpha, beta, gamma) ===")
         configs = generate_phase2_configs()
-        if max_configs:
-            configs = configs[:max_configs]
+        if max_configs is not None:
+            if max_configs < 1:
+                raise ValueError("max_configs must be at least 1")
+            if max_configs < len(configs):
+                configs = random.Random(42).sample(configs, k=max_configs)
         logger.info(f"Running {len(configs)} configurations...")
         for i, cfg_override in enumerate(configs):
             logger.info(f"[{i+1}/{len(configs)}] {cfg_override['config_id']}")
@@ -237,7 +246,11 @@ class ExperimentRunner:
                 o_dice = 0.0 if o_dice is None else o_dice
                 o_hd95 = om.get("val_hd95")
                 o_hd95 = 999.0 if o_hd95 is None else o_hd95
-                if o_dice >= dice and o_hd95 <= hd95 and other is not r:
+                if (
+                    o_dice >= dice and o_hd95 <= hd95
+                    and (o_dice > dice or o_hd95 < hd95)
+                    and other is not r
+                ):
                     dominated = True
                     break
             if not dominated:

@@ -15,11 +15,12 @@ import numpy as np
 class BCELoss(nn.Module):
     def __init__(self, pos_weight: float = 1.0):
         super().__init__()
-        pw = torch.tensor([pos_weight])
-        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+        self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return self.loss_fn(pred, target.float())
+        return F.binary_cross_entropy_with_logits(
+            pred, target.float(), pos_weight=self.pos_weight.to(dtype=pred.dtype)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,12 @@ class SoftDiceLoss(nn.Module):
         intersection = (pred_p * target_f).sum(dim=(-2, -1))
         union = pred_p.sum(dim=(-2, -1)) + target_f.sum(dim=(-2, -1))
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - dice.mean()
+        losses = 1.0 - dice
+        empty_targets = target_f.sum(dim=(-2, -1)) == 0
+        # For an empty GT mask, a near-zero predicted foreground probability is
+        # a good match; standard smoothed Dice otherwise calls it nearly total loss.
+        losses = torch.where(empty_targets, pred_p.mean(dim=(-2, -1)), losses)
+        return losses.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -60,14 +66,13 @@ class BoundaryLoss(nn.Module):
             return np.zeros_like(mask, dtype=np.float32)
         dist_inside = distance_transform_edt(mask)
         dist_outside = distance_transform_edt(1 - mask)
-        # Signed: positive inside, negative outside
-        return (dist_inside - dist_outside).astype(np.float32)
+        # Signed convention for boundary loss: negative inside, positive outside.
+        return (dist_outside - dist_inside).astype(np.float32)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # pred: (N, H, W) logits; target: (N, H, W) binary
         pred_p = torch.sigmoid(pred)
         batch_size = target.shape[0]
-        loss = torch.tensor(0.0, device=pred.device, requires_grad=False)
         dist_maps = []
 
         with torch.no_grad():
@@ -79,11 +84,14 @@ class BoundaryLoss(nn.Module):
         dist_tensor = torch.tensor(
             np.stack(dist_maps), dtype=torch.float32, device=pred.device
         )
-        # Normalise distance map to [-1, 1]
+        # Normalize signed distance map to [-1, 1]. Shift by its theoretical
+        # lower bound (a constant) so the loss stays nonnegative without changing
+        # its gradients.
         d_max = dist_tensor.abs().max().clamp(min=1e-6)
         dist_norm = dist_tensor / d_max
-        # Boundary loss: minimize prediction on positive-distance boundary regions
-        loss = (dist_norm * pred_p).mean()
+        boundary_term = (dist_norm * pred_p).mean()
+        lower_bound = torch.minimum(dist_norm, torch.zeros_like(dist_norm)).mean()
+        loss = boundary_term - lower_bound
         return loss
 
 

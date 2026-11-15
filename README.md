@@ -62,10 +62,16 @@ nvidia-smi
 
 ### 2. Clone and configure
 ```bash
-git clone <repo-url> lung-nodule
+git clone https://github.com/Mandeep15686/Mask-R-CNN-Lung-Nodule-Detection-Edge-Cloud-Pipeline.git lung-nodule
 cd lung-nodule
 cp .env.example .env
 ```
+
+Set `EDGE_API_TOKEN` in `.env` to a long random secret before exposing the backend.
+The feature-upload endpoint rejects requests if the token is missing or invalid.
+Set `APP_ENV=production` and provide a trained checkpoint at `MODEL_PATH` for a
+deployment; production startup fails if the checkpoint is missing. Development
+keeps the untrained-model fallback enabled.
 
 ### 3. Launch all services
 ```bash
@@ -181,6 +187,13 @@ loss_dict["total"].backward()
 ## 🌐 CN: Edge–Cloud Pipeline
 
 ### Test the pipeline locally
+
+The current edge extractor sends one intermediate ResNet tensor, while the
+cloud Mask R-CNN continuation requires all five FPN feature levels. The API
+rejects this incompatible payload with HTTP 501 instead of returning a
+misleading prediction. Edge requests therefore fall back to the local detector.
+Use direct cloud inference below until the edge/cloud feature contract is updated.
+
 ```bash
 # Simulate with a test image
 python scripts/simulate_edge.py \
@@ -227,7 +240,7 @@ SPLIT_LAYER=layer2    # Transmits 512ch stride-8 features (~32KB) ← default
 SPLIT_LAYER=layer3    # Transmits 1024ch stride-16 features (~64KB)
 COMPRESSION=none      # Raw float32 features
 COMPRESSION=int8      # INT8 quantisation (~4× compression)
-COMPRESSION=learned   # Auto-encoder bottleneck (~8× compression)
+COMPRESSION=learned   # Requires a trained checkpoint via LEARNED_COMPRESSOR_CHECKPOINT
 ```
 
 ---

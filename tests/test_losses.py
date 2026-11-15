@@ -72,14 +72,13 @@ class TestBCELoss:
         assert logits.grad is not None
         assert not torch.isnan(logits.grad).any()
 
-    def test_pos_weight_increases_loss_on_fp(self):
-        # Pred = 1, GT = 0 (false positive)
-        logits = torch.tensor([[[10.0, 10.0]]])
-        target = torch.tensor([[[0.0, 0.0]]])
+    def test_pos_weight_increases_loss_on_fn(self):
+        # Pred = 0, GT = 1 (false negative)
+        logits = torch.tensor([[[-10.0, -10.0]]])
+        target = torch.tensor([[[1.0, 1.0]]])
         loss_w1 = BCELoss(pos_weight=1.0)(logits, target)
         loss_w5 = BCELoss(pos_weight=5.0)(logits, target)
-        # Higher pos_weight penalises TP more but FP less — expect different values
-        assert loss_w1.item() != loss_w5.item()
+        assert loss_w5.item() > loss_w1.item()
 
 
 # ---------------------------------------------------------------------------

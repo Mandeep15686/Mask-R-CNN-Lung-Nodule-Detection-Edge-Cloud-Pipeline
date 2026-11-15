@@ -11,7 +11,39 @@ from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import roi_align
 import torch.nn.functional as F
 from typing import Optional
+from contextvars import ContextVar
+import torchvision.models.detection.roi_heads as roi_heads_module
+from torchvision.models.detection.roi_heads import project_masks_on_boxes
 from .losses import CompositeMaskLoss
+
+
+_ACTIVE_COMPOSITE_MASK_LOSS = ContextVar("active_composite_mask_loss", default=None)
+_TORCHVISION_MASK_LOSS = roi_heads_module.maskrcnn_loss
+
+
+def _composite_maskrcnn_loss(mask_logits, proposals, gt_masks, gt_labels, matched_idxs):
+    """Use the active model's composite loss with torchvision's proper ROI masks."""
+    loss_fn = _ACTIVE_COMPOSITE_MASK_LOSS.get()
+    if loss_fn is None:
+        return _TORCHVISION_MASK_LOSS(mask_logits, proposals, gt_masks, gt_labels, matched_idxs)
+    labels = [gt_label[idxs] for gt_label, idxs in zip(gt_labels, matched_idxs)]
+    mask_targets = [
+        project_masks_on_boxes(masks, boxes, indices, mask_logits.shape[-1])
+        for masks, boxes, indices in zip(gt_masks, proposals, matched_idxs)
+    ]
+    labels = torch.cat(labels, dim=0)
+    if labels.numel() == 0:
+        return mask_logits.sum() * 0.0
+    positive = torch.where(labels > 0)[0]
+    if positive.numel() == 0:
+        return mask_logits.sum() * 0.0
+    targets = torch.cat(mask_targets, dim=0)[positive]
+    logits = mask_logits[positive, labels[positive]]
+    return loss_fn(logits, targets)["total"]
+
+
+if roi_heads_module.maskrcnn_loss is not _composite_maskrcnn_loss:
+    roi_heads_module.maskrcnn_loss = _composite_maskrcnn_loss
 
 
 # ---------------------------------------------------------------------------
@@ -93,62 +125,6 @@ class LungNoduleMaskRCNN(nn.Module):
         # Our custom composite mask loss
         self.composite_mask_loss = CompositeMaskLoss.from_config(mask_loss_cfg)
 
-        # Monkey-patch: replace the internal mask loss with our custom one
-        self._patch_mask_loss()
-
-    def _patch_mask_loss(self):
-        """Replace torchvision's default BCE mask loss with our composite loss."""
-        composite = self.composite_mask_loss
-
-        def custom_maskrcnn_loss(mask_logits, proposals, gt_masks, gt_labels, mask_matched_idxs):
-            """
-            Custom drop-in for torchvision's maskrcnn_loss.
-            Accepts the same signature as the original.
-            """
-            discretization_size = mask_logits.shape[-1]
-            labels = [gt_label[idxs] for gt_label, idxs in zip(gt_labels, mask_matched_idxs)]
-            mask_targets = []
-            for m, p, i in zip(gt_masks, proposals, mask_matched_idxs):
-                if m.numel() == 0 or p.shape[0] == 0:
-                    mask_targets.append(
-                        torch.zeros(0, discretization_size, discretization_size, device=mask_logits.device)
-                    )
-                    continue
-                # Resize GT masks to prediction size
-                gt_m = m[i].to(dtype=torch.float32, device=mask_logits.device)
-                # gt_m shape: (N, H, W) → need to resize via roi_align
-                gt_m_resized = F.interpolate(
-                    gt_m.unsqueeze(1),
-                    size=(discretization_size, discretization_size),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(1)
-                mask_targets.append(gt_m_resized)
-
-            if len(mask_targets) == 0 or all(mt.numel() == 0 for mt in mask_targets):
-                return mask_logits.sum() * 0
-
-            mask_targets = torch.cat(mask_targets, dim=0)
-            labels_all = torch.cat(labels, dim=0)
-
-            # Only compute loss for positive labels (class 1 = nodule)
-            pos_idx = torch.where(labels_all > 0)[0]
-            if pos_idx.numel() == 0:
-                return mask_logits.sum() * 0
-
-            # Select the mask logit for the GT class
-            pos_logits = mask_logits[pos_idx, labels_all[pos_idx]]  # (N_pos, H, W)
-            pos_targets = mask_targets[pos_idx]                       # (N_pos, H, W)
-
-            loss_dict = composite(pos_logits, pos_targets)
-            return loss_dict["total"]
-
-        # Inject into the roi_heads
-        import types
-        self.model.roi_heads.maskrcnn_loss = types.MethodType(
-            lambda self_roi, *args: custom_maskrcnn_loss(*args),
-            self.model.roi_heads,
-        )
 
     def forward(self, images: list, targets: Optional[list] = None):
         """
@@ -156,6 +132,12 @@ class LungNoduleMaskRCNN(nn.Module):
         Inference: images list[Tensor(C,H,W)]
         Returns losses dict (train) or list of prediction dicts (eval).
         """
+        if self.training and targets is not None:
+            token = _ACTIVE_COMPOSITE_MASK_LOSS.set(self.composite_mask_loss)
+            try:
+                return self.model(images, targets)
+            finally:
+                _ACTIVE_COMPOSITE_MASK_LOSS.reset(token)
         return self.model(images, targets)
 
     def get_loss_description(self) -> str:

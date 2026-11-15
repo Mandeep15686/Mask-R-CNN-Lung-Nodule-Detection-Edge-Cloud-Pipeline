@@ -82,9 +82,13 @@ async def pareto_frontier(db: Session = Depends(get_db)):
         if r.best_dice is None or r.best_hd95 is None:
             continue
         dominated = any(
-            (other.best_dice or 0) >= r.best_dice
-            and (other.best_hd95 or 9999) <= r.best_hd95
-            and other is not r
+            other.best_dice >= r.best_dice
+            and other.best_hd95 <= r.best_hd95
+            and (
+                other.best_dice > r.best_dice
+                or other.best_hd95 < r.best_hd95
+            )
+            and other.id != r.id
             for other in rows
             if other.best_dice is not None and other.best_hd95 is not None
         )

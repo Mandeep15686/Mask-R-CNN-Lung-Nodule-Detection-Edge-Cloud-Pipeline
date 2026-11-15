@@ -5,6 +5,7 @@ Methods: none | int8 | learned (auto-encoder bottleneck)
 import torch
 import torch.nn as nn
 from typing import Literal
+import os
 
 CompressMethod = Literal["none", "int8", "learned"]
 
@@ -26,7 +27,16 @@ class FeatureCompressor:
         self.device = device
         self._autoencoder: nn.Module | None = None
         if method == "learned":
+            checkpoint = os.getenv("LEARNED_COMPRESSOR_CHECKPOINT")
+            if not checkpoint or not os.path.isfile(checkpoint):
+                raise ValueError(
+                    "Learned compression is disabled until a trained checkpoint is set "
+                    "with LEARNED_COMPRESSOR_CHECKPOINT"
+                )
             self._autoencoder = _LearnedBottleneck().to(device)
+            state = torch.load(checkpoint, map_location=device, weights_only=True)
+            self._autoencoder.load_state_dict(state.get("model_state", state), strict=True)
+            self._autoencoder.eval()
 
     def compress(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Compress a dict of feature tensors. Returns compressed tensors."""
@@ -39,7 +49,10 @@ class FeatureCompressor:
                 # Quantise to INT8 (scale + zero-point per tensor)
                 vmin, vmax = v.min().item(), v.max().item()
                 scale = (vmax - vmin) / 255.0 if vmax != vmin else 1.0
-                zero_point = -round(vmin / scale) if scale != 0 else 0
+                zero_point = (
+                    max(-128, min(127, round(-128 - vmin / scale)))
+                    if scale != 0 else 0
+                )
                 v_int8 = torch.quantize_per_tensor(
                     v.cpu().float(), scale=scale, zero_point=zero_point,
                     dtype=torch.qint8

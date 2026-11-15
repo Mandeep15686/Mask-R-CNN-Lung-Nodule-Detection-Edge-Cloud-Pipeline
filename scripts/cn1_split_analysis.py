@@ -167,7 +167,7 @@ def run_split_analysis(
     logger.info(f"Device: {device}")
 
     # Load model
-    ckpt  = torch.load(checkpoint_path, map_location=device)
+    ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
     cfg   = ckpt.get("config", {})
     model = LungNoduleMaskRCNN(num_classes=2, mask_loss_cfg=cfg.get("mask_loss", {}))
     model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)

@@ -117,7 +117,8 @@ class TestHausdorff:
         pred = np.zeros((32, 32), dtype=np.uint8)
         gt   = square_mask()
         hd = hausdorff_distance_95(pred, gt)
-        assert hd == float("inf") or hd > 10.0   # Very high
+        expected = float(np.linalg.norm(np.array([31.0, 31.0])))
+        assert hd == pytest.approx(expected, abs=1e-4)
 
     def test_larger_shift_larger_hd(self):
         base = square_mask(offset=5, inner=8)

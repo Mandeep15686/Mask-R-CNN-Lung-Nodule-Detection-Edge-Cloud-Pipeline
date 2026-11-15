@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 from collections import OrderedDict
 
@@ -65,14 +66,19 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             logger.info(f"Client {client_id}: {len(self.train_loader)} train batches")
 
         def get_parameters(self, config):
-            return [
-                v.cpu().numpy()
-                for v in self.model.state_dict().values()
-            ]
+            state = self.model.state_dict()
+            self._parameter_keys = sorted(state)
+            return [state[k].detach().cpu().numpy() for k in self._parameter_keys]
 
         def set_parameters(self, parameters):
-            params_dict = zip(self.model.state_dict().keys(), parameters)
-            state_dict  = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            state = self.model.state_dict()
+            keys = sorted(state)
+            if len(parameters) != len(keys):
+                raise ValueError(f"Expected {len(keys)} federated tensors, got {len(parameters)}")
+            state_dict = OrderedDict(
+                (k, torch.as_tensor(v, dtype=state[k].dtype, device=state[k].device))
+                for k, v in zip(keys, parameters)
+            )
             self.model.load_state_dict(state_dict, strict=True)
 
         def fit(self, parameters, config):
@@ -129,7 +135,8 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             from .metrics import evaluate_batch
             if all_preds:
                 seg = evaluate_batch(np.stack(all_preds), np.stack(all_targets))
-                loss = 1.0 - seg["dice"]
+                dice = seg.get("dice")
+                loss = 1.0 - (float(dice) if dice is not None and np.isfinite(dice) else 0.0)
                 return float(loss), len(self.val_loader.dataset), seg
             return 1.0, 0, {}
 
@@ -262,7 +269,7 @@ def run_simulation(
         "config":      config,
         "history":     history_log,
         "best_dice":   max((h.get("dice", 0) for h in history_log), default=0),
-        "timestamp":   datetime.utcnow().isoformat(),
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
     with open(os.path.join(output_dir, "fl_summary.json"), "w") as f:
         json.dump(final, f, indent=2)

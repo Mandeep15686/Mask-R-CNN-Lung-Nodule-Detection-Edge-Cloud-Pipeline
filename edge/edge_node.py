@@ -46,6 +46,7 @@ CLOUD_API_URL   = os.getenv("CLOUD_API_URL",  "http://localhost:8000")
 NODE_ID         = os.getenv("NODE_ID",         "edge-node-01")
 HOSTNAME        = os.getenv("HOSTNAME",         "edge-01.hospital.local")
 NODE_IP         = os.getenv("NODE_IP",          "192.168.1.10")
+EDGE_API_TOKEN  = os.getenv("EDGE_API_TOKEN",    "")
 SPLIT_LAYER     = os.getenv("SPLIT_LAYER",      "layer2")       # layer1 | layer2 | layer3
 COMPRESSION     = os.getenv("COMPRESSION",      "int8")         # none | int8 | learned
 PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
@@ -58,6 +59,8 @@ class EdgeNode:
     """Main edge node controller."""
 
     def __init__(self):
+        if COMPRESSION == "learned" and SPLIT_LAYER != "layer2":
+            raise ValueError("Learned compression checkpoint currently supports only layer2 features")
         self.preprocessor  = CTPreprocessor(patch_size=PATCH_SIZE)
         self.extractor     = EdgeFeatureExtractor(split_layer=SPLIT_LAYER, device=DEVICE)
         self.compressor    = FeatureCompressor(method=COMPRESSION, device=DEVICE)
@@ -142,9 +145,12 @@ class EdgeNode:
         t_compress = time.perf_counter()
 
         # Measure sizes
-        raw_size_kb   = patch_tensor.numel() * 4 / 1024          # float32
-        comp_size_kb  = sum(v.numel() * v.element_size() for v in features.values()) / 1024
-        compression_ratio = raw_size_kb / max(comp_size_kb, 0.001)
+        # Measure feature bytes before and after compression, not image bytes.
+        raw_feature_bytes = sum(v.numel() * v.element_size() for v in features.values())
+        compressed_feature_bytes = sum(
+            v.numel() * v.element_size() for v in compressed_payload.values()
+        )
+        compression_ratio = raw_feature_bytes / max(compressed_feature_bytes, 1)
 
         # 4. Measure network latency
         bw_mbps, latency_ms = await self.net_monitor.measure()
@@ -202,17 +208,20 @@ class EdgeNode:
                 f"{CLOUD_API_URL}/api/edge/infer-features",
                 data=payload_bytes,
                 params={"node_id": NODE_ID, "scan_uid": scan_uid, "split_layer": SPLIT_LAYER},
-                headers={"Content-Type": "application/octet-stream"},
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Edge-Token": EDGE_API_TOKEN,
+                },
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
                     text = await resp.text()
                     logger.error(f"Cloud inference failed: HTTP {resp.status}: {text}")
-                    return {}
+                    raise RuntimeError(f"Cloud inference failed with HTTP {resp.status}: {text}")
         except aiohttp.ClientError as e:
             logger.error(f"Network error sending features: {e}")
-            return {}
+            raise RuntimeError(f"Network error sending features: {e}") from e
 
     async def _log_network_event(self, data: dict):
         try:
@@ -239,8 +248,11 @@ class EdgeNode:
         binary = patch_np > 0.6
         labeled, n = ndimage.label(binary)
         nodules = []
+        slices = ndimage.find_objects(labeled)
         for i in range(1, n + 1):
-            region = ndimage.find_objects(labeled == i)[0]
+            region = slices[i - 1]
+            if region is None:
+                continue
             y_sl, x_sl = region
             nodules.append({
                 "box": [x_sl.start, y_sl.start, x_sl.stop, y_sl.stop],

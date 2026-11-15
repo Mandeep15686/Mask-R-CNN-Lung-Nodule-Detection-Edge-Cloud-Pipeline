@@ -182,7 +182,7 @@ class LUNA16Dataset(Dataset):
             f"{min(cap, len(self.negatives))} negatives = {len(self.all_samples)} total"
         )
 
-        # Cache loaded volumes to avoid repeated I/O
+        # Per-process LRU: each DataLoader worker maintains its own cache copy.
         self._volume_cache: dict[str, tuple] = {}
 
     def _load_volume(self, mhd_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -199,7 +199,8 @@ class LUNA16Dataset(Dataset):
     def _random_lung_coord(
         self, volume: np.ndarray, origin: np.ndarray, spacing: np.ndarray
     ) -> np.ndarray:
-        """Sample a random voxel inside the lung mask (thresholded)."""
+        """Sample thresholded interior voxels; this is not an anatomical lung mask."""
+        # This HU-range heuristic is intentionally approximate, not segmentation.
         lung_mask = (volume > 0.1) & (volume < 0.9)
         z_range = np.where(lung_mask.any(axis=(1, 2)))[0]
         if len(z_range) == 0:

@@ -71,3 +71,5 @@ coverage.xml
 
 # Optuna
 optuna.db
+
+output_result.png

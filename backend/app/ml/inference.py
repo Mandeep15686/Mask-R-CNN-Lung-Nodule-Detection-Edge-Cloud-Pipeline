@@ -10,18 +10,34 @@ from typing import Optional
 
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
 
 from ..schemas import NoduleDetection
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.getenv("MODEL_PATH", "./experiments/best_model.pth")
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MODEL_PATH = os.getenv("MODEL_PATH", str(_PROJECT_ROOT / "experiments" / "best_model.pth"))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.3"))
 NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.5"))
 PATCH_SIZE = int(os.getenv("PATCH_SIZE", "64"))
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+_allow_untrained_env = os.getenv("ALLOW_UNTRAINED_MODEL", "").strip().lower()
+ALLOW_UNTRAINED_MODEL = (
+    _allow_untrained_env == "true"
+    if _allow_untrained_env
+    else APP_ENV != "production"
+)
+
+
+def _checkpoint_state_dict(checkpoint):
+    """Extract weights and migrate the pre-buffer BCE key name if present."""
+    state = dict(checkpoint.get("model_state", checkpoint))
+    old_key = "composite_mask_loss.bce.loss_fn.pos_weight"
+    new_key = "composite_mask_loss.bce.pos_weight"
+    if old_key in state and new_key not in state:
+        state[new_key] = state.pop(old_key)
+    return state
 
 # Average CT spacing for diameter estimation
 DEFAULT_SPACING_MM = 0.7
@@ -47,31 +63,45 @@ class InferenceEngine:
             self.model = LungNoduleMaskRCNN(
                 num_classes=2,
                 mask_loss_cfg={"alpha": 0.3, "beta": 0.5, "gamma": 0.5},
+                # Checkpoints contain the complete backbone; inference must not
+                # download unrelated ImageNet weights during API startup.
+                pretrained_backbone=False,
             )
             self.model.to(DEVICE)
 
-            if Path(MODEL_PATH).exists():
-                ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-                state_dict = ckpt.get("model_state", ckpt)
-                self.model.load_state_dict(state_dict, strict=False)
-                logger.info(f"Loaded model weights from {MODEL_PATH}")
-            else:
-                logger.warning(
-                    f"No checkpoint at {MODEL_PATH}. Using uninitialised model (dev mode)."
+            checkpoint_path = Path(MODEL_PATH)
+            if not checkpoint_path.exists():
+                candidates = sorted(
+                    _PROJECT_ROOT.joinpath("experiments").glob("*/best_model.pth"),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
                 )
+                if candidates:
+                    checkpoint_path = candidates[0]
+            if checkpoint_path.exists():
+                ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
+                state_dict = _checkpoint_state_dict(ckpt)
+                self.model.load_state_dict(state_dict, strict=True)
+                logger.info(f"Loaded model weights from {checkpoint_path}")
+            else:
+                message = f"No trained checkpoint found at {MODEL_PATH}"
+                if not ALLOW_UNTRAINED_MODEL:
+                    raise FileNotFoundError(message)
+                logger.warning("%s. Using uninitialised model (development only).", message)
 
             self.model.eval()
 
         except Exception as e:
             logger.exception("Failed to load model; inference will return empty results.")
             self.model = None
+            if not ALLOW_UNTRAINED_MODEL:
+                raise
 
     def _preprocess_image(self, image_bytes: bytes) -> torch.Tensor:
         """Convert PNG/JPEG bytes → (3, H, W) float tensor in [0,1]."""
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_resized = img.resize((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS)
-        t = TF.to_tensor(img_resized)   # (3, H, W) in [0, 1]
-        return t
+        from ..utils.preprocessing import preprocess_uploaded_image
+        array = preprocess_uploaded_image(image_bytes, patch_size=PATCH_SIZE)
+        return torch.from_numpy(array)
 
     def _postprocess(
         self, outputs: list[dict], original_size: Optional[tuple] = None
@@ -135,7 +165,8 @@ class InferenceEngine:
             return []
         # Move features to device
         features_device = {
-            k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+            k: (v.dequantize().to(DEVICE) if v.is_quantized else v.to(DEVICE))
+            if isinstance(v, torch.Tensor) else v
             for k, v in features.items()
         }
         try:
@@ -160,9 +191,9 @@ class InferenceEngine:
         """Hot-reload a new checkpoint."""
         if self.model is None:
             return
-        ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-        state_dict = ckpt.get("model_state", ckpt)
-        self.model.load_state_dict(state_dict, strict=False)
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
+        state_dict = _checkpoint_state_dict(ckpt)
+        self.model.load_state_dict(state_dict, strict=True)
         logger.info(f"Reloaded checkpoint from {checkpoint_path}")
 
 

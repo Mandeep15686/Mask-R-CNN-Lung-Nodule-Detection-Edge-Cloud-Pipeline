@@ -88,7 +88,7 @@ def evaluate_checkpoint(
     logger.info(f"Device: {device}")
 
     # Load checkpoint metadata
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = ckpt.get("config", {})
     mask_loss_cfg = config.get("mask_loss", {"alpha": 1.0})
 
