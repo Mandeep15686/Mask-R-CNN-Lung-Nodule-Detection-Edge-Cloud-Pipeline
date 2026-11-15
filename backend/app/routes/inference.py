@@ -54,6 +54,9 @@ async def predict(
         nodules=[n.model_dump() for n in nodules],
         source=payload.source,
         inference_time_ms=inference_ms,
+        # sensitivity here = fraction of detections with score >= 0.5 (a proxy metric,
+        # not the true sensitivity which requires ground-truth masks)
+        sensitivity=float(np.mean([n.score >= 0.5 for n in nodules])) if nodules else None,
     )
     db.add(result)
     db.commit()
@@ -99,6 +102,7 @@ async def predict_upload(
         nodules=[n.model_dump() for n in nodules],
         source=source,
         inference_time_ms=inference_ms,
+        sensitivity=float(np.mean([n.score >= 0.5 for n in nodules])) if nodules else None,
     )
     db.add(result)
     db.commit()

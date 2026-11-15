@@ -147,13 +147,15 @@ class InferenceResponse(BaseModel):
 class InferenceResultResponse(BaseModel):
     id: int
     scan_uid: str
+    experiment_id: Optional[int] = None
     nodules: list[Any]
-    dice: Optional[float]
-    iou: Optional[float]
-    hd95: Optional[float]
-    sensitivity: Optional[float]
+    dice: Optional[float] = None
+    iou: Optional[float] = None
+    hd95: Optional[float] = None
+    sensitivity: Optional[float] = None
+    boundary_f1: Optional[float] = None
     source: str
-    inference_time_ms: Optional[float]
+    inference_time_ms: Optional[float] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
