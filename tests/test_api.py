@@ -16,18 +16,29 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # App fixture — uses an in-memory SQLite DB for isolation
 # ---------------------------------------------------------------------------
+
 @pytest.fixture(scope="session")
 def client():
     os.environ["DATABASE_URL"] = "sqlite:///./test_lung_nodule.db"
-    os.environ["MODEL_PATH"]   = "/nonexistent/model.pth"   # triggers dev-mode fallback
+    os.environ["MODEL_PATH"] = "/nonexistent/model.pth"
 
     from backend.app.main import app
-    with TestClient(app) as c:
-        yield c
+    from backend.app.database import engine
 
-    # Cleanup test DB
-    if os.path.exists("./test_lung_nodule.db"):
-        os.remove("./test_lung_nodule.db")
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        # Close pooled SQLite connections before deleting the database.
+        engine.dispose()
+
+        import gc
+        gc.collect()
+
+        db_path = "./test_lung_nodule.db"
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
 
 
 @pytest.fixture
