@@ -12,7 +12,18 @@ from fastapi.testclient import TestClient
 from PIL import Image
 import numpy as np
 
+from unittest.mock import patch
 
+
+class TestInferenceEngine:
+    def predict_from_bytes(self, image_bytes, experiment_id=None):
+        return []
+
+    def predict_from_features(self, features, scan_uid):
+        return []
+
+    def load_checkpoint(self, checkpoint_path):
+        return None
 # ---------------------------------------------------------------------------
 # App fixture — uses an in-memory SQLite DB for isolation
 # ---------------------------------------------------------------------------
@@ -28,8 +39,15 @@ def client():
         from backend.app.database import engine
 
         try:
-            with TestClient(app) as c:
-                yield c
+            from backend.app.ml import inference as inference_module
+
+            with patch.object(
+                inference_module,
+                "InferenceEngine",
+                TestInferenceEngine,
+            ):
+                with TestClient(app) as c:
+                    yield c
         finally:
             # Close pooled SQLite connections before the temporary directory
             # removes the test database.
