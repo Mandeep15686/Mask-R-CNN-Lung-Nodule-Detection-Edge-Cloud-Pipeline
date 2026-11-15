@@ -14,7 +14,6 @@ Responsibilities:
 """
 
 import asyncio
-import io
 import json
 import logging
 import os
@@ -53,6 +52,33 @@ PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",   "1"))
 HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC","30"))
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _serialize_feature_payload(features: dict, metadata: dict) -> bytes:
+    """Encode named features as a JSON header followed by little-endian float32 data."""
+    keys = list(features)
+    shapes = []
+    arrays = []
+    for key in keys:
+        value = features[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Feature {key!r} must be a tensor")
+        if value.is_quantized:
+            value = value.dequantize()
+        array = value.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+        if not np.isfinite(array).all():
+            raise ValueError(f"Feature {key!r} contains non-finite values")
+        shapes.append(list(array.shape))
+        arrays.append(array.astype("<f4", copy=False).tobytes(order="C"))
+
+    header = {
+        **metadata,
+        "version": 1,
+        "keys": keys,
+        "shapes": shapes,
+        "dtype": "float32",
+    }
+    return json.dumps(header, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\x00" + b"".join(arrays)
 
 
 class EdgeNode:
@@ -147,28 +173,24 @@ class EdgeNode:
         # Measure sizes
         # Measure feature bytes before and after compression, not image bytes.
         raw_feature_bytes = sum(v.numel() * v.element_size() for v in features.values())
-        compressed_feature_bytes = sum(
-            v.numel() * v.element_size() for v in compressed_payload.values()
-        )
-        compression_ratio = raw_feature_bytes / max(compressed_feature_bytes, 1)
+        # The wire format is float32, including for dequantized INT8 values.
+        wire_feature_bytes = sum(v.numel() * 4 for v in compressed_payload.values())
+        compression_ratio = raw_feature_bytes / max(wire_feature_bytes, 1)
 
         # 4. Measure network latency
         bw_mbps, latency_ms = await self.net_monitor.measure()
 
         # 5. Upload to cloud
-        payload_buf = io.BytesIO()
-        torch.save(
+        payload_bytes = _serialize_feature_payload(
+            compressed_payload,
             {
-                "features": compressed_payload,
                 "scan_uid": scan_uid,
                 "edge_processing_ms": (t_compress - t_start) * 1000,
                 "bandwidth_mbps": bw_mbps,
                 "compression_method": COMPRESSION,
                 "compression_ratio": compression_ratio,
             },
-            payload_buf,
         )
-        payload_bytes = payload_buf.getvalue()
         payload_kb = len(payload_bytes) / 1024
 
         t_upload_start = time.perf_counter()

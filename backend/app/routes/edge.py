@@ -1,7 +1,6 @@
 """Edge node management and network monitoring routes."""
-import base64
 import hmac
-import io
+import json
 import time
 import logging
 import os
@@ -118,12 +117,55 @@ async def infer_from_features(
 
     try:
         import torch
-        feature_data = torch.load(io.BytesIO(body), map_location="cpu", weights_only=True)
-        if not isinstance(feature_data, dict) or not isinstance(feature_data.get("features"), dict):
-            raise ValueError("Payload must contain a feature tensor mapping")
-        features = feature_data["features"]
-        if not all(isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in features.items()):
-            raise ValueError("Feature mapping must contain only named tensors")
+        header, separator, raw = body.partition(b"\x00")
+        if not separator or not header or len(header) > 64 * 1024:
+            raise ValueError("Missing or oversized JSON feature header")
+        feature_data = json.loads(header.decode("utf-8"))
+        if not isinstance(feature_data, dict):
+            raise ValueError("Feature header must be a JSON object")
+        keys = feature_data.get("keys")
+        shapes = feature_data.get("shapes")
+        if (
+            feature_data.get("version") != 1
+            or feature_data.get("dtype") != "float32"
+            or not isinstance(keys, list)
+            or not isinstance(shapes, list)
+            or not keys
+            or len(keys) != len(shapes)
+            or len(keys) > 16
+            or any(not isinstance(key, str) or not key or len(key) > 64 for key in keys)
+            or len(set(keys)) != len(keys)
+        ):
+            raise ValueError("Invalid feature header schema")
+
+        features = {}
+        expected_bytes = 0
+        for key, shape in zip(keys, shapes):
+            if (
+                not isinstance(shape, list)
+                or not shape
+                or len(shape) > 8
+                or any(type(dim) is not int or dim < 1 for dim in shape)
+            ):
+                raise ValueError(f"Invalid shape for feature {key!r}")
+            element_count = 1
+            for dim in shape:
+                if element_count > (64 * 1024 * 1024 // 4) // dim:
+                    raise ValueError("Decoded feature data exceeds 64 MiB")
+                element_count *= dim
+            expected_bytes += element_count * np.dtype("<f4").itemsize
+            if expected_bytes > 64 * 1024 * 1024:
+                raise ValueError("Decoded feature data exceeds 64 MiB")
+            arr = np.frombuffer(raw[: element_count * 4], dtype="<f4")
+            if arr.size != element_count:
+                raise ValueError("Feature data is truncated")
+            arr = arr.copy().reshape(shape)
+            if not np.isfinite(arr).all():
+                raise ValueError(f"Feature {key!r} contains non-finite values")
+            features[key] = torch.from_numpy(arr)
+            raw = raw[element_count * 4 :]
+        if raw:
+            raise ValueError("Feature data contains unexpected trailing bytes")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid feature payload: {e}")
 
