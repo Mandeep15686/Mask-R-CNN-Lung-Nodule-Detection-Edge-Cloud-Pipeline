@@ -2,7 +2,7 @@
 Integration tests for the FastAPI backend.
 Run: pytest tests/test_api.py -v
 """
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import io
@@ -19,25 +19,24 @@ import numpy as np
 
 @pytest.fixture(scope="session")
 def client():
-    os.environ["DATABASE_URL"] = "sqlite:///./test_lung_nodule.db"
-    os.environ["MODEL_PATH"] = "/nonexistent/model.pth"
+    with tempfile.TemporaryDirectory(prefix="lung-nodule-api-tests-") as db_dir:
+        db_path = os.path.join(db_dir, "test_lung_nodule.db")
+        os.environ["DATABASE_URL"] = f"sqlite:///{db_path.replace(os.sep, '/')}"
+        os.environ["MODEL_PATH"] = "/nonexistent/model.pth"
 
-    from backend.app.main import app
-    from backend.app.database import engine
+        from backend.app.main import app
+        from backend.app.database import engine
 
-    try:
-        with TestClient(app) as c:
-            yield c
-    finally:
-        # Close pooled SQLite connections before deleting the database.
-        engine.dispose()
+        try:
+            with TestClient(app) as c:
+                yield c
+        finally:
+            # Close pooled SQLite connections before the temporary directory
+            # removes the test database.
+            engine.dispose()
 
-        import gc
-        gc.collect()
-
-        db_path = "./test_lung_nodule.db"
-        if os.path.exists(db_path):
-            os.remove(db_path)
+            import gc
+            gc.collect()
 
 
 

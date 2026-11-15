@@ -152,28 +152,42 @@ def extract_patch_2_5d(
     patch_size: int = 64,
 ) -> Optional[np.ndarray]:
     """
-    Extract a 2.5D patch: 3 consecutive axial slices (z-1, z, z+1).
-    Returns: (3, patch_size, patch_size) float32 or None if OOB.
+    Extract three axial slices centered on the annotation with zero padding.
+
+    The annotated voxel is always at (patch_size // 2, patch_size // 2) in
+    the central channel. Neighboring Z channels are zero-padded at the volume
+    ends. Return ``None`` only when the annotation center itself is outside
+    the volume.
     """
     cz, cy, cx = int(center_vox[2]), int(center_vox[1]), int(center_vox[0])
     half = patch_size // 2
     Z, Y, X = volume.shape
 
-    if (
-        cz < 1 or cz >= Z - 1
-        or cy < half or cy >= Y - half
-        or cx < half or cx >= X - half
-    ):
+    if patch_size < 1:
+        raise ValueError("patch_size must be at least 1")
+    if not (0 <= cz < Z and 0 <= cy < Y and 0 <= cx < X):
         return None
 
-    slices = []
-    for dz in (-1, 0, 1):
-        s = volume[cz + dz, cy - half: cy + half, cx - half: cx + half]
-        if s.shape != (patch_size, patch_size):
-            return None
-        slices.append(s)
+    # Use a fixed-size destination and copy only the in-volume intersection.
+    # This preserves the requested center index and fills every out-of-volume
+    # pixel (including adjacent Z slices) with normalized zero (-1000 HU).
+    patch = np.zeros((3, patch_size, patch_size), dtype=volume.dtype)
+    y0, x0 = cy - half, cx - half
+    y1, x1 = y0 + patch_size, x0 + patch_size
+    src_y0, src_x0 = max(y0, 0), max(x0, 0)
+    src_y1, src_x1 = min(y1, Y), min(x1, X)
+    dst_y0, dst_x0 = src_y0 - y0, src_x0 - x0
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
 
-    return np.stack(slices, axis=0)  # (3, H, W)
+    for dz in (-1, 0, 1):
+        z = cz + dz
+        if 0 <= z < Z:
+            patch[dz + 1, dst_y0:dst_y1, dst_x0:dst_x1] = volume[
+                z, src_y0:src_y1, src_x0:src_x1
+            ]
+
+    return patch
 
 
 def create_spherical_mask(
