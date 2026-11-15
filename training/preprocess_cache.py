@@ -33,7 +33,7 @@ import argparse
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
-
+import re
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ def _process_volume(args: dict) -> list[dict]:
     out_dir    = Path(args["out_dir"])
 
     try:
-        volume, origin, spacing = load_mhd(mhd_path)
+        volume, origin, spacing, direction = load_mhd(mhd_path)
         volume = clip_and_normalise(volume)
     except Exception as exc:
         logger.error(f"Failed to load {mhd_path}: {exc}")
@@ -81,7 +81,7 @@ def _process_volume(args: dict) -> list[dict]:
 
     # ---- Positive patches ------------------------------------------------
     for ann_idx, ann in enumerate(positives):
-        center_vox = world_to_voxel(ann["coord"], origin, spacing)
+        center_vox = world_to_voxel(ann["coord"], origin, spacing, direction)
         patch = extract_patch_2_5d(volume, center_vox, patch_size)
         if patch is None:
             logger.warning(f"  OOB positive patch skipped: {uid} ann {ann_idx}")
@@ -179,7 +179,10 @@ def build_cache(
             })
 
     # ---- Discover all .mhd files ----------------------------------------
-    all_mhd = sorted(data_root_path.rglob("*.mhd"))
+    all_mhd = sorted(
+        p for p in data_root_path.rglob("*.mhd")
+        if re.fullmatch(r"\d+(?:\.\d+)+", p.stem)
+    )
     if not all_mhd:
         raise FileNotFoundError(f"No .mhd files found under {data_root_path}")
     logger.info(f"Found {len(all_mhd)} CT volumes under {data_root_path}")

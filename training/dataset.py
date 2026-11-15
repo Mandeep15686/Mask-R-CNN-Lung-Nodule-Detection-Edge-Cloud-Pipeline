@@ -34,22 +34,61 @@ logger = logging.getLogger(__name__)
 HU_MIN, HU_MAX = -1000, 400
 
 
-def load_mhd(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_mhd(path: str):
     """
-    Load a .mhd CT volume using SimpleITK.
-    Returns: (volume_HU, origin, spacing)  all in world coordinates.
-    volume_HU shape: (Z, Y, X)
+    Load MetaImage CT volume.
+    Returns volume, origin, spacing, direction.
     """
     itk_img = sitk.ReadImage(str(path))
-    volume = sitk.GetArrayFromImage(itk_img).astype(np.float32)   # (Z, Y, X)
-    origin = np.array(itk_img.GetOrigin())    # (X, Y, Z)
-    spacing = np.array(itk_img.GetSpacing())  # (X, Y, Z)
-    return volume, origin, spacing
+
+    volume = sitk.GetArrayFromImage(itk_img).astype(np.float32)
+
+    origin = np.asarray(itk_img.GetOrigin(), dtype=np.float64)
+    spacing = np.asarray(itk_img.GetSpacing(), dtype=np.float64)
+
+    direction = np.asarray(
+        itk_img.GetDirection(), dtype=np.float64
+    ).reshape(3, 3)
+
+    return volume, origin, spacing, direction
 
 
-def world_to_voxel(coord_world: np.ndarray, origin: np.ndarray, spacing: np.ndarray) -> np.ndarray:
-    """Convert world (mm) coordinate to voxel index."""
-    return np.round((coord_world - origin) / spacing).astype(int)
+def world_to_voxel(
+    coord_world,
+    origin,
+    spacing,
+    direction=None
+):
+    """
+    Convert physical coordinates (X,Y,Z) into voxel indices (X,Y,Z).
+    Correctly accounts for image direction and spacing.
+    """
+    coord_world = np.asarray(coord_world, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64)
+    spacing = np.asarray(spacing, dtype=np.float64)
+
+    if direction is None:
+        direction = np.eye(3, dtype=np.float64)
+    else:
+        direction = np.asarray(direction, dtype=np.float64).reshape(3, 3)
+
+    affine = direction @ np.diag(spacing)
+
+    voxel = np.linalg.solve(affine, coord_world - origin)
+
+    return np.rint(voxel).astype(np.int64)
+
+
+def voxel_to_world(voxel, origin, spacing, direction=None):
+    """Convert voxel indices (X,Y,Z) to physical coordinates (X,Y,Z)."""
+    voxel = np.asarray(voxel, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64)
+    spacing = np.asarray(spacing, dtype=np.float64)
+    if direction is None:
+        direction = np.eye(3, dtype=np.float64)
+    else:
+        direction = np.asarray(direction, dtype=np.float64).reshape(3, 3)
+    return origin + direction @ (voxel * spacing)
 
 
 def clip_and_normalise(volume: np.ndarray) -> np.ndarray:
@@ -148,11 +187,26 @@ class CachedLUNA16Dataset(Dataset):
         # don't encode subset numbers, so we keep all entries when subsets=None.
         # If a 'subset' key was added during pre-processing, filter by it.
         if subsets is not None:
-            subset_set = set(subsets)
-            filtered = [e for e in all_entries if e.get("subset") in subset_set]
-            if filtered:
-                all_entries = filtered
-            # else: manifest has no subset info — use everything (safe fallback)
+            subset_set = {int(s) for s in subsets}
+
+            missing_metadata = [
+                e for e in all_entries if "subset" not in e
+            ]
+
+            if missing_metadata:
+                raise ValueError(
+                    "Manifest contains entries without subset metadata."
+                )
+
+            all_entries = [
+                e for e in all_entries
+                if int(e["subset"]) in subset_set
+            ]
+
+            if not all_entries:
+                raise ValueError(
+                    f"No patches found for subsets {sorted(subset_set)}"
+                )
 
         self.entries = all_entries
         pos = sum(1 for e in self.entries if e["label"] == 1)
@@ -283,19 +337,25 @@ class LUNA16Dataset(Dataset):
         # Use CachedLUNA16Dataset to avoid this limitation entirely.
         self._volume_cache: dict[str, tuple] = {}
 
-    def _load_volume(self, mhd_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _load_volume(
+        self, mhd_path: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if mhd_path not in self._volume_cache:
             # Import here so SimpleITK is only needed when this slow path is used
-            vol, origin, spacing = load_mhd(mhd_path)
+            vol, origin, spacing, direction = load_mhd(mhd_path)
             vol = clip_and_normalise(vol)
             if len(self._volume_cache) >= 20:
                 oldest_key = next(iter(self._volume_cache))
                 del self._volume_cache[oldest_key]
-            self._volume_cache[mhd_path] = (vol, origin, spacing)
+            self._volume_cache[mhd_path] = (vol, origin, spacing, direction)
         return self._volume_cache[mhd_path]
 
     def _random_lung_coord(
-        self, volume: np.ndarray, origin: np.ndarray, spacing: np.ndarray
+        self,
+        volume: np.ndarray,
+        origin: np.ndarray,
+        spacing: np.ndarray,
+        direction: np.ndarray,
     ) -> np.ndarray:
         """
         Sample a random voxel from the volume interior.
@@ -319,21 +379,21 @@ class LUNA16Dataset(Dataset):
             cx = random.randint(half, volume.shape[2] - half - 1)
 
         vox = np.array([cx, cy, cz], dtype=float)
-        return vox * spacing + origin
+        return voxel_to_world(vox, origin, spacing, direction)
 
     def __len__(self) -> int:
         return len(self.all_samples)
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.all_samples[idx]
-        volume, origin, spacing = self._load_volume(sample["mhd_path"])
+        volume, origin, spacing, direction = self._load_volume(sample["mhd_path"])
 
         if sample["label"] == 1:
             coord_world = sample["coord_world"]
         else:
-            coord_world = self._random_lung_coord(volume, origin, spacing)
+            coord_world = self._random_lung_coord(volume, origin, spacing, direction)
 
-        center_vox = world_to_voxel(coord_world, origin, spacing)
+        center_vox = world_to_voxel(coord_world, origin, spacing, direction)
         patch = extract_patch_2_5d(volume, center_vox, self.patch_size)
 
         if patch is None:
