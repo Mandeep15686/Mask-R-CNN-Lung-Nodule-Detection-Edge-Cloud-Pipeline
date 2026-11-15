@@ -16,6 +16,8 @@ services:
       - ./training:/app/training
     environment:
       - DATABASE_URL=sqlite:////data/lung_nodule.db
+      - DATA_ROOT=/data/luna16
+      - LUNA16_CACHE_DIR=/data/patches_cache_v3_smoke
       - MODEL_PATH=${MODEL_PATH:-/app/experiments/best_model.pth}
       - EXPERIMENTS_DIR=${EXPERIMENTS_DIR:-/app/experiments}
       - EDGE_API_TOKEN=${EDGE_API_TOKEN:-}

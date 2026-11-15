@@ -313,6 +313,20 @@ class CachedLUNA16Dataset(Dataset):
         self.scan_uids = {entry["uid"] for entry in self.entries}
         pos = sum(1 for e in self.entries if e["label"] == 1)
         neg = len(self.entries) - pos
+        self.cache_summary = {
+            "total_patches": len(self.entries),
+            "positive_patches": pos,
+            "negative_patches": neg,
+            "patch_dimensions": [3, self.patch_size, self.patch_size],
+            "channel_count": 3,
+            "available_subsets": sorted({int(e["subset"]) for e in self.entries if "subset" in e}),
+            "scan_uid_count": len(self.scan_uids),
+            "spacing_mm": (
+                list(self.preprocessing_spacing_mm)
+                if self.preprocessing_spacing_mm is not None
+                else None
+            ),
+        }
         logger.info(
             f"CachedLUNA16Dataset: {pos} positives + {neg} negatives "
             f"= {len(self.entries)} total  (cache: {self.cache_dir})"
@@ -737,6 +751,17 @@ def build_dataloaders(
     if cache_dir is not None:
         cache_path = Path(cache_dir).expanduser().resolve()
         logger.info(f"Using pre-extracted patch cache at {cache_path} (fast path)")
+        from .preprocess_cache import validate_cache_manifest
+
+        cache_entries = validate_cache_manifest(
+            cache_path,
+            expected_patch_size=patch_size,
+            expected_subsets=set(train_subsets) | set(val_subset) | set(test_subsets),
+            expected_uid_subsets={
+                subset: subset_uids[subset]
+                for subset in set(train_subsets) | set(val_subset) | set(test_subsets)
+            },
+        )
         train_ds = CachedLUNA16Dataset(
             cache_path, subsets=train_subsets, augment=True,
             expected_patch_size=patch_size,
@@ -756,6 +781,32 @@ def build_dataloaders(
             raise ValueError("Training cache scan UIDs do not match requested raw subsets")
         if val_ds.scan_uids != subset_groups["validation"]:
             raise ValueError("Validation cache scan UIDs do not match the requested raw subset")
+        cache_summary = {
+            "total_patches": len(cache_entries),
+            "positive_patches": sum(int(entry["label"]) == 1 for entry in cache_entries),
+            "negative_patches": sum(int(entry["label"]) == 0 for entry in cache_entries),
+            "patch_dimensions": [3, patch_size, patch_size],
+            "channel_count": 3,
+            "available_subsets": sorted({int(entry["subset"]) for entry in cache_entries}),
+            "scan_uid_count": len({entry["uid"] for entry in cache_entries}),
+            "spacing_mm": train_ds.cache_summary["spacing_mm"],
+        }
+        logger.info("Patch cache validation succeeded: %s", cache_summary)
+        logger.info(
+            "Cached split loaded: train subsets=%s patches=%d (+%d/- %d) scans=%d; "
+            "validation subset=%s patches=%d (+%d/- %d) scans=%d; test subset=%s",
+            train_subsets,
+            train_ds.cache_summary["total_patches"],
+            train_ds.cache_summary["positive_patches"],
+            train_ds.cache_summary["negative_patches"],
+            train_ds.cache_summary["scan_uid_count"],
+            val_subset[0],
+            val_ds.cache_summary["total_patches"],
+            val_ds.cache_summary["positive_patches"],
+            val_ds.cache_summary["negative_patches"],
+            val_ds.cache_summary["scan_uid_count"],
+            test_subsets,
+        )
     else:
         logger.warning(
             "No cache_dir supplied — loading raw CT volumes at runtime. "

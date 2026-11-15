@@ -1,7 +1,7 @@
 """Pydantic v2 schemas for all API endpoints."""
 from __future__ import annotations
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -34,7 +34,9 @@ class ExperimentCreate(BaseModel):
     batch_size: int = Field(4, ge=1, le=32)
     fold: int = Field(0, ge=0, le=9)
     lr: float = Field(0.005, gt=0)
-    data_root: str = Field("./data/luna16")
+    data_root: Optional[str] = Field(None, max_length=1024)
+    cache_mode: Literal["cached", "raw"] = "cached"
+    patch_size: int = Field(64, ge=8, le=512)
     train_subsets: Optional[list[int]] = None
     validation_subset: Optional[int] = Field(None, ge=0, le=9)
     test_subset: Optional[int] = Field(None, ge=0, le=9)

@@ -31,10 +31,13 @@ def _fake_process(job):
     entries = []
     for label, suffix in ((1, "pos"), (0, "neg")):
         filename = f"{uid}_{suffix}_0.npz"
+        mask = np.zeros((job["patch_size"], job["patch_size"]), dtype=np.uint8)
+        if label == 1:
+            mask[job["patch_size"] // 2, job["patch_size"] // 2] = 1
         np.savez_compressed(
             out / filename,
             image=np.zeros((3, job["patch_size"], job["patch_size"]), dtype=np.float32),
-            mask=np.zeros((job["patch_size"], job["patch_size"]), dtype=np.uint8),
+            mask=mask,
             label=np.int8(label), diameter=np.float32(4 if label else 0),
         )
         entries.append({

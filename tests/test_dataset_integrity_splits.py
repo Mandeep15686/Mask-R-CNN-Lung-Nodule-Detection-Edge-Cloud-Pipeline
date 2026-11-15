@@ -26,10 +26,13 @@ def _raw_root(tmp_path, subset_ids=(0, 1, 2)):
 def _cache(root, entries):
     root.mkdir(parents=True, exist_ok=True)
     for entry in entries:
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        if int(entry["label"]) == 1:
+            mask[4, 4] = 1
         np.savez_compressed(
             root / entry["file"],
             image=np.zeros((3, 8, 8), dtype=np.float32),
-            mask=np.zeros((8, 8), dtype=np.uint8),
+            mask=mask,
             label=np.int8(entry["label"]),
             diameter=np.float32(entry.get("diameter_mm", 0)),
         )
@@ -129,9 +132,10 @@ def test_explicit_train_validation_test_uid_separation(tmp_path):
     raw = _raw_root(tmp_path)
     cache = tmp_path / "cache"
     entries = [
-        {"file": f"{subset}.npz", "uid": f"1.2.3.{subset + 1}",
-         "subset": subset, "label": 1}
+        {"file": f"{subset}-{label}.npz", "uid": f"1.2.3.{subset + 1}",
+         "subset": subset, "label": label}
         for subset in range(3)
+        for label in (0, 1)
     ]
     _cache(cache, entries)
 

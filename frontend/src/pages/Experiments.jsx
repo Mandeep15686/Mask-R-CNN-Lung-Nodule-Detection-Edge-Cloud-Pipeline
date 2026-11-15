@@ -10,22 +10,56 @@ import { StatusBadge } from "./Dashboard.jsx";
 // Create Experiment Form
 // ---------------------------------------------------------------------------
 function CreateForm({ onCreated }) {
+  const [runtime, setRuntime] = useState(null);
+  const [loadingInfo, setLoadingInfo] = useState(true);
   const [form, setForm] = useState({
     config_id: "", phase: 1,
     alpha: 0.3, beta: 0.5, gamma: 0.5, delta: 0.0, epsilon: 0.0,
-    epochs: 30, batch_size: 4, fold: 0, lr: 0.005,
-    data_root: "./data/luna16",
+    epochs: 30, batch_size: 4, lr: 0.005,
+    data_root: "", cache_dir: "", cache_selection: "default",
+    train_subsets: "", validation_subset: "", test_subset: "",
   });
   const [loading, setLoading] = useState(false);
   const [err, setErr]         = useState(null);
+
+  useEffect(() => {
+    let active = true;
+    api.getInfo()
+      .then((info) => {
+        if (!active) return;
+        setRuntime(info);
+        setForm((current) => ({
+          ...current,
+          train_subsets: current.train_subsets || (info.default_split?.train_subsets ?? []).join(", "),
+          validation_subset: current.validation_subset || String(info.default_split?.validation_subset ?? ""),
+        }));
+      })
+      .catch((error) => { if (active) setErr(`Could not load backend dataset configuration: ${error.message}`); })
+      .finally(() => { if (active) setLoadingInfo(false); });
+    return () => { active = false; };
+  }, []);
 
   const field = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const num   = (k) => (e) => setForm((f) => ({ ...f, [k]: parseFloat(e.target.value) || 0 }));
 
   const submit = async () => {
     if (!form.config_id.trim()) return setErr("Config ID is required");
+    if (!runtime) return setErr("Backend dataset configuration is not available yet.");
+    const trainSubsets = form.train_subsets
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map(Number)
+      .filter(Number.isInteger);
+    if (!trainSubsets.length || form.validation_subset === "") {
+      return setErr("Choose training and validation subsets before creating the experiment.");
+    }
+    if (form.cache_selection === "custom" && !form.cache_dir.trim()) {
+      return setErr("Enter a backend-side cache directory or select the default cache.");
+    }
     setLoading(true); setErr(null);
     try {
+      const cacheMode = form.cache_selection === "raw" ? "raw" : "cached";
       await api.createExperiment({
         config_id: form.config_id,
         phase: Number(form.phase),
@@ -33,9 +67,17 @@ function CreateForm({ onCreated }) {
                         delta: form.delta, epsilon: form.epsilon },
         epochs: Number(form.epochs),
         batch_size: Number(form.batch_size),
-        fold: Number(form.fold),
+        fold: Number(form.validation_subset),
         lr: Number(form.lr),
-        data_root: form.data_root,
+        cache_mode: cacheMode,
+        patch_size: runtime.patch_size || 64,
+        train_subsets: trainSubsets,
+        validation_subset: Number(form.validation_subset),
+        test_subset: form.test_subset === "" ? null : Number(form.test_subset),
+        ...(form.data_root.trim() ? { data_root: form.data_root.trim() } : {}),
+        ...(form.cache_selection === "custom" && form.cache_dir.trim()
+          ? { cache_dir: form.cache_dir.trim() }
+          : {}),
       });
       onCreated();
       setForm((f) => ({ ...f, config_id: "" }));
@@ -50,10 +92,74 @@ function CreateForm({ onCreated }) {
     { k: "delta",   label: "δ Focal",    color: "text-red-400" },
     { k: "epsilon", label: "ε HD95",     color: "text-purple-400" },
   ];
+  const defaultCacheStatus = loadingInfo
+    ? "Checking backend…"
+    : runtime?.cache_valid
+      ? "Validated"
+      : runtime?.cache_exists
+        ? "Invalid"
+        : runtime?.default_cache_dir
+          ? "Missing"
+          : "Not configured";
+  const cacheStatus = form.cache_selection === "raw"
+    ? "Raw-volume mode (explicit)"
+    : form.cache_selection === "custom"
+      ? (form.cache_dir.trim() ? "Validated on create" : "Custom path required")
+      : defaultCacheStatus;
+  const statusColor = form.cache_selection === "default" && runtime?.cache_valid
+    ? "text-green-300"
+    : "text-amber-300";
+  const activeCachePath = form.cache_selection === "raw"
+    ? "Raw CT volumes — no patch cache"
+    : form.cache_selection === "custom"
+      ? (form.cache_dir.trim() || "Enter a backend-side cache path below")
+      : (runtime?.default_cache_dir || "Loading backend cache path…");
 
   return (
     <div className="card space-y-5">
       <h2 className="text-sm font-bold text-white">New Experiment</h2>
+
+      <section className="rounded-xl border border-cyan-500/20 bg-slate-950/55 p-4 space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-white">Active dataset cache</div>
+            <div className="mt-1 break-all font-mono text-xs text-cyan-200">{activeCachePath}</div>
+          </div>
+          <span className={`rounded-full border border-slate-700 px-3 py-1 text-xs font-semibold ${statusColor}`}>
+            {cacheStatus}
+          </span>
+        </div>
+        {form.cache_selection === "default" && runtime?.cache_summary && (
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-300">
+            <span>{runtime.cache_summary.total_patches} patches</span>
+            <span>{runtime.cache_summary.positive_patches} positive</span>
+            <span>{runtime.cache_summary.negative_patches} negative</span>
+            <span>{runtime.cache_summary.scan_uid_count} scans</span>
+            <span>shape {runtime.cache_summary.patch_dimensions?.join("×")}</span>
+            <span>spacing {runtime.cache_summary.spacing_mm?.join("×") || "not recorded"} mm</span>
+          </div>
+        )}
+        {runtime?.cache_error && <p className="text-xs text-amber-300">{runtime.cache_error}</p>}
+        <div>
+          <label className="label">Dataset mode</label>
+          <select className="input mt-1" value={form.cache_selection} onChange={field("cache_selection")}>
+            <option value="default">Default validated patch cache</option>
+            <option value="custom">Custom server-side patch cache</option>
+            <option value="raw">Raw-volume mode (explicit; slower)</option>
+          </select>
+        </div>
+        {form.cache_selection === "custom" && (
+          <div>
+            <label className="label">Custom cache directory on the backend machine</label>
+            <input className="input mt-1 w-full font-mono" value={form.cache_dir}
+                   onChange={field("cache_dir")} placeholder={runtime?.default_cache_dir || "/data/patches_cache_v3_smoke"} />
+            <p className="mt-1 text-xs text-slate-500">This path is resolved and validated by the backend when you create the experiment.</p>
+          </div>
+        )}
+        {form.cache_selection === "raw" && (
+          <p className="text-xs text-amber-300">Raw CT loading is explicitly selected. This experiment will not use a patch cache.</p>
+        )}
+      </section>
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
         <div className="col-span-2 md:col-span-1">
@@ -68,9 +174,12 @@ function CreateForm({ onCreated }) {
           </select>
         </div>
         <div>
-          <label className="label">Fold (0–9)</label>
-          <input className="input" type="number" min={0} max={9}
-                 value={form.fold} onChange={num("fold")} />
+          <label className="label">Validation subset</label>
+          <select className="input" value={form.validation_subset} onChange={field("validation_subset")}>
+            {(runtime?.available_subset_ids ?? []).map((subset) => (
+              <option key={subset} value={subset}>subset{subset}</option>
+            ))}
+          </select>
         </div>
       </div>
 
@@ -108,8 +217,29 @@ function CreateForm({ onCreated }) {
       </div>
 
       <div>
-        <label className="label">Data Root</label>
-        <input className="input font-mono" value={form.data_root} onChange={field("data_root")} />
+        <label className="label">Training subsets (comma-separated)</label>
+        <input className="input font-mono" value={form.train_subsets} onChange={field("train_subsets")}
+               placeholder="1" />
+        <div className="mt-1 text-xs text-slate-500">Available subsets: {(runtime?.available_subset_ids ?? []).join(", ") || "checking…"}</div>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        <div>
+          <label className="label">Independent test subset (optional)</label>
+          <select className="input" value={form.test_subset} onChange={field("test_subset")}>
+            <option value="">Unavailable / not selected</option>
+            {(runtime?.available_subset_ids ?? []).map((subset) => (
+              <option key={subset} value={subset}>subset{subset}</option>
+            ))}
+          </select>
+          <div className="mt-1 text-xs text-slate-500">No independent test subset is configured by default.</div>
+        </div>
+        <div>
+          <label className="label">Custom data root (optional)</label>
+          <input className="input w-full font-mono" value={form.data_root} onChange={field("data_root")}
+                 placeholder={runtime?.default_data_root || "data/luna16"} />
+          <div className="mt-1 text-xs text-slate-500">Default backend path: {runtime?.default_data_root || "loading…"}</div>
+        </div>
       </div>
 
       {err && (
@@ -118,7 +248,7 @@ function CreateForm({ onCreated }) {
         </div>
       )}
 
-      <button className="btn-primary flex items-center gap-2 w-fit" onClick={submit} disabled={loading}>
+      <button className="btn-primary flex items-center gap-2 w-fit" onClick={submit} disabled={loading || loadingInfo}>
         {loading ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
         Create Experiment
       </button>
@@ -238,6 +368,16 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                 ["Phase", details?.phase], ["Validation fold", config.fold],
                 ["Epochs", config.epochs], ["Batch size", config.batch_size],
                 ["Learning rate", config.lr], ["Data root", config.data_root],
+                ["Loading mode", config.cache_mode === "cached" ? "Cached NPZ (fast path)" : "Raw CT volumes"],
+                ["Cache directory", config.cache_dir], ["Patch size", config.patch_size],
+                ["Training subsets", config.train_subsets?.join(", ")],
+                ["Validation subset", config.validation_subset],
+                ["Test subset", config.test_subset ?? "Unavailable / not selected"],
+                ["Cache patches", config.cache_summary?.total_patches],
+                ["Cache spacing", config.cache_summary?.spacing_mm?.join(" × ")],
+                ["Training scans", config.data_split?.train_scan_uids?.length],
+                ["Validation scans", config.data_split?.validation_scan_uids?.length],
+                ["Test scans", config.data_split?.test_scan_uids?.length ?? 0],
                 ["Artifact folder", config.source_folder],
                 ["Created", details?.created_at], ["Started", details?.started_at],
                 ["Finished", details?.finished_at],
@@ -248,6 +388,28 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                 </div>
               ))}
             </div>
+            {config.data_split && (
+              <details className="mt-3 rounded-lg border border-slate-800 bg-slate-950/55 p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-cyan-200">
+                  Resolved scan-level split (train {config.data_split.train_scan_uids?.length ?? 0}, validation {config.data_split.validation_scan_uids?.length ?? 0}, test {config.data_split.test_scan_uids?.length ?? 0})
+                </summary>
+                <div className="mt-3 grid md:grid-cols-3 gap-3 text-[10px] text-slate-400">
+                  {[
+                    ["Training UIDs", config.data_split.train_scan_uids],
+                    ["Validation UIDs", config.data_split.validation_scan_uids],
+                    ["Test UIDs", config.data_split.test_scan_uids],
+                  ].map(([label, uids]) => (
+                    <div key={label} className="max-h-48 overflow-auto rounded bg-black/30 p-2">
+                      <div className="mb-1 font-semibold text-slate-300">{label}</div>
+                      {(uids ?? []).length ? uids.join("\n") : "No independent test scans configured"}
+                    </div>
+                  ))}
+                </div>
+                {!config.data_split.independent_test_available && (
+                  <p className="mt-2 text-[10px] text-amber-300">No independent test set is available for this experiment.</p>
+                )}
+              </details>
+            )}
             <div className="flex flex-wrap gap-2 mt-3">
               {weights.map((key) => (
                 <span key={key} className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-300">

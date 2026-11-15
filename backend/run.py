@@ -56,11 +56,19 @@ def check_environment():
             f"Set MODEL_PATH to a valid trained checkpoint."
         )
 
-    data_root = os.getenv("DATA_ROOT", "./data/luna16")
-    if not os.path.exists(data_root):
+    from backend.app.data_config import resolve_cache_dir, resolve_data_root
+
+    data_root = resolve_data_root()
+    if not data_root.is_dir():
         warnings.append(
             f"LUNA16 data not found at {data_root}. "
             f"Run 'make data' for synthetic data or 'make data-real' for instructions."
+        )
+    cache_dir = resolve_cache_dir()
+    if not (cache_dir / "manifest.json").is_file():
+        warnings.append(
+            f"LUNA16 patch cache manifest not found at {cache_dir / 'manifest.json'}. "
+            "Cached website experiments will be rejected until a valid cache is configured."
         )
 
     for w in warnings:

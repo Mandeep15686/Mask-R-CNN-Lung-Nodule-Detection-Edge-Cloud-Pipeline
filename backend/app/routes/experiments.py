@@ -14,6 +14,13 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from ..database import get_db, Experiment, TrainingRun
+from ..data_config import (
+    available_subset_uids,
+    resolve_cache_dir,
+    resolve_data_root,
+    resolve_subset_split,
+    validate_cached_split,
+)
 from ..json_utils import json_safe
 from ..schemas import (
     ExperimentCreate, ExperimentResponse,
@@ -67,6 +74,90 @@ def _experiment_artifact_dir(exp: Experiment) -> Path:
     return artifact_dir
 
 
+def _prepare_training_configuration(
+    config: dict,
+    *,
+    require_resolved_cache: bool = False,
+) -> dict:
+    """Resolve and validate the exact data paths and split used by Trainer."""
+    prepared = dict(config)
+    mode = prepared.get("cache_mode")
+    if mode is None:
+        # Existing database rows created before cache_mode was introduced keep
+        # their explicit cache setting or their prior raw-volume behavior.
+        mode = "cached" if prepared.get("cache_dir") else "raw"
+    if mode not in {"cached", "raw"}:
+        raise ValueError(f"Unsupported cache_mode: {mode!r}")
+
+    data_root = resolve_data_root(prepared.get("data_root"))
+    subset_uids = available_subset_uids(data_root)
+    split = resolve_subset_split(
+        subset_uids,
+        train_subsets=prepared.get("train_subsets"),
+        validation_subset=prepared.get("validation_subset"),
+        test_subset=prepared.get("test_subset"),
+        fold=int(prepared.get("fold", 0)),
+    )
+    previous_split = prepared.get("data_split")
+    if isinstance(previous_split, dict):
+        for key in ("train_scan_uids", "validation_scan_uids", "test_scan_uids"):
+            if key in previous_split and set(previous_split[key]) != set(split[key]):
+                raise ValueError(
+                    f"Raw dataset scan membership changed since experiment creation ({key})"
+                )
+
+    cache_dir = None
+    cache_summary = None
+    if mode == "cached":
+        if require_resolved_cache and not prepared.get("cache_dir"):
+            raise ValueError("This experiment requires cached training but has no persisted cache_dir")
+        cache_dir = resolve_cache_dir(prepared.get("cache_dir"))
+        cache_summary = validate_cached_split(
+            data_root,
+            cache_dir,
+            int(prepared.get("patch_size", 64)),
+            split,
+        )
+        logger.info(
+            "Validated patch cache at %s: patches=%d (+%d/- %d), shape=%s, "
+            "subsets=%s, scan_uids=%d, spacing_mm=%s",
+            cache_dir,
+            cache_summary["total_patches"],
+            cache_summary["positive_patches"],
+            cache_summary["negative_patches"],
+            cache_summary["patch_dimensions"],
+            cache_summary["available_subsets"],
+            cache_summary["scan_uid_count"],
+            cache_summary["spacing_mm"],
+        )
+    else:
+        if prepared.get("cache_dir"):
+            raise ValueError("cache_dir cannot be set when cache_mode is 'raw'")
+        if not (data_root / "annotations.csv").is_file():
+            raise FileNotFoundError(f"Raw-volume mode requires {data_root / 'annotations.csv'}")
+
+    prepared.update({
+        "data_root": str(data_root),
+        "cache_mode": mode,
+        "cache_dir": str(cache_dir) if cache_dir is not None else None,
+        "patch_size": int(prepared.get("patch_size", 64)),
+        "train_subsets": split["train_subsets"],
+        "validation_subset": split["validation_subset"],
+        "test_subset": split["test_subset"],
+        "fold": split["validation_subset"],
+        "data_split": split,
+        "cache_summary": cache_summary,
+    })
+    return prepared
+
+
+def _write_cache_validation_failure(config_id: str, message: str) -> None:
+    run_dir = _experiment_run_dir(config_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / "terminal.log").open("a", encoding="utf-8") as log:
+        log.write(f"Cache/data validation failed before training: {message}\n")
+
+
 # ---------------------------------------------------------------------------
 # POST /api/experiments
 # ---------------------------------------------------------------------------
@@ -77,6 +168,23 @@ async def create_experiment(
 ):
     if not payload.loss_weights.is_valid():
         raise HTTPException(status_code=400, detail="At least one loss weight must be > 0")
+
+    try:
+        experiment_config = _prepare_training_configuration({
+            "data_root": payload.data_root,
+            "cache_dir": payload.cache_dir,
+            "cache_mode": payload.cache_mode,
+            "patch_size": payload.patch_size,
+            "fold": payload.fold,
+            "train_subsets": payload.train_subsets,
+            "validation_subset": payload.validation_subset,
+            "test_subset": payload.test_subset,
+            "epochs": payload.epochs,
+            "batch_size": payload.batch_size,
+            "lr": payload.lr,
+        })
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Check duplicate
     existing = db.query(Experiment).filter(Experiment.config_id == payload.config_id).first()
@@ -94,17 +202,7 @@ async def create_experiment(
         epsilon=lw.epsilon,
         loss_description=_describe_loss(lw),
         status="pending",
-        config_json={
-            "epochs": payload.epochs,
-            "batch_size": payload.batch_size,
-            "fold": payload.fold,
-            "lr": payload.lr,
-            "data_root": payload.data_root,
-            "cache_dir": payload.cache_dir or os.getenv("LUNA16_CACHE_DIR"),
-            "train_subsets": payload.train_subsets,
-            "validation_subset": payload.validation_subset,
-            "test_subset": payload.test_subset,
-        },
+        config_json=experiment_config,
     )
     db.add(exp)
     db.commit()
@@ -193,12 +291,25 @@ async def start_experiment(
     if exp.status == "running":
         raise HTTPException(status_code=409, detail="Already running")
 
+    try:
+        prepared_config = _prepare_training_configuration(
+            exp.config_json or {},
+            require_resolved_cache=True,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        exp.status = "failed"
+        exp.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        _write_cache_validation_failure(exp.config_id, str(exc))
+        raise HTTPException(status_code=422, detail=f"Experiment data validation failed: {exc}") from exc
+
+    exp.config_json = prepared_config
     exp.status = "running"
     exp.started_at = datetime.now(timezone.utc)
     db.commit()
 
     background_tasks.add_task(
-        _run_experiment_bg, exp_id, exp.config_json or {},
+        _run_experiment_bg, exp_id, prepared_config,
         request.app.state.inference_engine,
     )
     return {"message": f"Experiment {exp.config_id} started", "experiment_id": exp_id}
@@ -217,20 +328,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
 
         experiment_id = exp.config_id
         experiment_config = exp.config_json or config_json or {}
-        fold = experiment_config.get("fold", 0)
-        # Build full config
-        full_cfg = {
-            **experiment_config,
-            "cache_dir": experiment_config.get("cache_dir") or os.getenv("LUNA16_CACHE_DIR"),
-            "config_id": experiment_id,
-            "mask_loss": {
-                "alpha": exp.alpha,
-                "beta": exp.beta,
-                "gamma": exp.gamma,
-                "delta": exp.delta,
-                "epsilon": exp.epsilon,
-            },
-        }
+        fold = experiment_config.get("validation_subset", experiment_config.get("fold", 0))
 
         # Do not hold a pooled DB connection during model initialization or
         # training. Epoch/status writes below each use short-lived sessions.
@@ -248,6 +346,20 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
         root_logger.addHandler(log_handler)
 
         try:
+            # Revalidate at execution time as the cache may have changed after
+            # creation or even after the start endpoint checked it.
+            full_cfg = _prepare_training_configuration(
+                experiment_config,
+                require_resolved_cache=True,
+            )
+            full_cfg["config_id"] = experiment_id
+            full_cfg["mask_loss"] = {
+                "alpha": exp.alpha,
+                "beta": exp.beta,
+                "gamma": exp.gamma,
+                "delta": exp.delta,
+                "epsilon": exp.epsilon,
+            }
             import sys
             sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
             from training.trainer import Trainer

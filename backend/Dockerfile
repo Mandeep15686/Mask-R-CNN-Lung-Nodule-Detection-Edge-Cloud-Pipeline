@@ -28,6 +28,8 @@ WORKDIR /app/backend
 
 ENV PYTHONPATH=/app
 ENV DATABASE_URL=sqlite:////data/lung_nodule.db
+ENV DATA_ROOT=/data/luna16
+ENV LUNA16_CACHE_DIR=/data/patches_cache_v3_smoke
 ENV MODEL_PATH=/app/experiments/best_model.pth
 ENV EXPERIMENTS_DIR=/app/experiments
 ENV SCORE_THRESHOLD=0.05

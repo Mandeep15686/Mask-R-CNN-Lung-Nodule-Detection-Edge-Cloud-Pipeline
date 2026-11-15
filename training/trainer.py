@@ -86,8 +86,13 @@ class Trainer:
         self.data_split = self.train_loader.dataset.split_info
         self.config["data_split"] = self.data_split
         if self.config.get("cache_dir"):
+            self.config["cache_mode"] = "cached"
             self.config["cache_dir"] = str(
                 self.train_loader.dataset.cache_dir.resolve()
+            )
+            self.config.setdefault(
+                "cache_summary",
+                self.train_loader.dataset.cache_summary,
             )
             self.config["cache_spacing_mm"] = (
                 list(self.train_loader.dataset.preprocessing_spacing_mm)

@@ -73,6 +73,15 @@ Set `APP_ENV=production` and provide a trained checkpoint at `MODEL_PATH` for a
 deployment; production startup fails if the checkpoint is missing. Development
 keeps the untrained-model fallback enabled.
 
+Website-created training experiments use the backend-side patch cache
+`data/patches_cache_v3_smoke` by default. For Docker, place the raw dataset at
+`data/luna16` and the existing cache (including `manifest.json` and its NPZ
+files) at `data/patches_cache_v3_smoke`. Compose mounts the host `data/` folder
+at `/data` and configures the backend to use `/data/luna16` and
+`/data/patches_cache_v3_smoke`. The cache is validated when an experiment is
+created and again before training starts; an invalid cache is reported instead
+of falling back to raw-volume training.
+
 ### 3. Launch all services
 ```bash
 docker compose up --build
@@ -118,6 +127,21 @@ npm run dev    # Vite dev server at http://localhost:3000
 cd backend
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+On Windows PowerShell, from the repository root, the equivalent defaults are
+resolved relative to the project even when the backend starts in `backend/`:
+
+```powershell
+$env:DATA_ROOT = "D:\lung-nodule\data\luna16"
+$env:LUNA16_CACHE_DIR = "D:\lung-nodule\data\patches_cache_v3_smoke"
+cd backend
+..\venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The website reports the backend's resolved cache path and validation summary at
+`GET /api/info`. Leave the New Experiment form on **Default validated patch
+cache** to use the default, or enter a backend-visible path for a custom cache.
+The raw-volume mode is an explicit slower choice.
 
 ### Run the edge node
 ```bash

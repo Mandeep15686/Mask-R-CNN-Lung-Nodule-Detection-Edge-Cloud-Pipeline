@@ -2,7 +2,7 @@
 Integration tests for the FastAPI backend.
 Run: pytest tests/test_api.py -v
 """
-import sys, os, tempfile
+import sys, os, tempfile, json
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import io
@@ -51,6 +51,42 @@ def client():
         db_path = os.path.join(db_dir, "test_lung_nodule.db")
         os.environ["DATABASE_URL"] = f"sqlite:///{db_path.replace(os.sep, '/')}"
         os.environ["MODEL_PATH"] = "/nonexistent/model.pth"
+        raw_root = os.path.join(db_dir, "raw")
+        cache_dir = os.path.join(db_dir, "patch-cache")
+        os.makedirs(cache_dir)
+        cache_entries = []
+        for subset in (0, 1):
+            uid = f"1.2.840.{subset + 1}.7"
+            subset_dir = os.path.join(raw_root, f"subset{subset}")
+            os.makedirs(subset_dir)
+            with open(os.path.join(subset_dir, f"{uid}.mhd"), "w", encoding="utf-8") as f:
+                f.write("synthetic header")
+            for label in (0, 1):
+                filename = f"subset{subset}-{label}.npz"
+                mask = np.zeros((64, 64), dtype=np.uint8)
+                if label:
+                    mask[32, 32] = 1
+                np.savez_compressed(
+                    os.path.join(cache_dir, filename),
+                    image=np.zeros((3, 64, 64), dtype=np.float32),
+                    mask=mask,
+                    label=np.int8(label),
+                    diameter=np.float32(4 if label else 0),
+                )
+                cache_entries.append({
+                    "file": filename,
+                    "uid": uid,
+                    "subset": subset,
+                    "label": label,
+                    "patch_size": 64,
+                    "spacing_mm": [1.0, 1.0, 1.0],
+                })
+        with open(os.path.join(raw_root, "annotations.csv"), "w", encoding="utf-8") as f:
+            f.write("seriesuid,coordX,coordY,coordZ,diameter_mm\n")
+        with open(os.path.join(cache_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(cache_entries, f)
+        os.environ["DATA_ROOT"] = raw_root
+        os.environ["LUNA16_CACHE_DIR"] = cache_dir
 
         from backend.app.main import app
         from backend.app.database import engine
@@ -123,7 +159,6 @@ class TestExperiments:
         "batch_size":   2,
         "fold":         0,
         "lr":           0.005,
-        "data_root":    "./data/luna16",
     }
 
     def test_create_experiment(self, client):

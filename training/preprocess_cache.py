@@ -58,8 +58,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 def validate_cache_manifest(
     cache_dir: str | Path,
     expected_uids: Optional[set[str]] = None,
+    expected_patch_size: Optional[int] = None,
+    expected_subsets: Optional[set[int]] = None,
+    expected_uid_subsets: Optional[dict[int, set[str]]] = None,
+    require_both_labels: bool = False,
 ) -> list[dict]:
-    """Validate manifest structure, subset labels, and every referenced patch."""
+    """Validate manifest metadata and the contents of every referenced NPZ."""
     cache_path = Path(cache_dir)
     manifest_path = cache_path / "manifest.json"
     try:
@@ -72,6 +76,10 @@ def validate_cache_manifest(
 
     seen_files: set[str] = set()
     manifest_uids: set[str] = set()
+    manifest_uid_subsets: dict[int, set[str]] = {}
+    patch_sizes: set[int] = set()
+    subset_labels: dict[int, set[int]] = {}
+    spacing_values: set[tuple[float, float, float]] = set()
     missing_files: list[str] = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -96,6 +104,23 @@ def validate_cache_manifest(
             raise ValueError(f"Duplicate patch file in manifest: {filename}")
         seen_files.add(filename)
         manifest_uids.add(uid)
+        subset_id = int(subset)
+        subset_labels.setdefault(subset_id, set()).add(int(label))
+        manifest_uid_subsets.setdefault(subset_id, set()).add(uid)
+        patch_size = entry.get("patch_size")
+        if patch_size is not None:
+            if type(patch_size) is not int or patch_size <= 0:
+                raise ValueError(f"Manifest entry {index} has invalid patch_size")
+            patch_sizes.add(patch_size)
+        spacing = entry.get("spacing_mm")
+        if spacing is not None:
+            try:
+                spacing_tuple = tuple(float(value) for value in spacing)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Manifest entry {index} has invalid spacing_mm") from exc
+            if len(spacing_tuple) != 3 or not all(np.isfinite(value) and value > 0 for value in spacing_tuple):
+                raise ValueError(f"Manifest entry {index} has invalid spacing_mm")
+            spacing_values.add(spacing_tuple)
         if not (cache_path / filename).is_file():
             missing_files.append(filename)
 
@@ -104,6 +129,69 @@ def validate_cache_manifest(
         raise FileNotFoundError(
             f"Cache manifest references {len(missing_files)} missing NPZ file(s): {preview}"
         )
+    if len(patch_sizes) > 1:
+        raise ValueError(f"Cache manifest mixes patch sizes: {sorted(patch_sizes)}")
+    if expected_patch_size is not None and patch_sizes and patch_sizes != {expected_patch_size}:
+        raise ValueError(
+            f"Cache manifest patch size {sorted(patch_sizes)} does not match "
+            f"requested patch size {expected_patch_size}"
+        )
+    if len(spacing_values) > 1:
+        raise ValueError(f"Cache manifest mixes physical spacing values: {sorted(spacing_values)}")
+
+    discovered_patch_size = next(iter(patch_sizes), expected_patch_size)
+    for index, entry in enumerate(entries):
+        patch_path = cache_path / entry["file"]
+        try:
+            with np.load(patch_path, allow_pickle=False) as patch:
+                if not {"image", "mask", "label", "diameter"}.issubset(patch.files):
+                    raise ValueError("NPZ must contain image, mask, label, and diameter arrays")
+                image = patch["image"]
+                mask = patch["mask"]
+                patch_label = np.asarray(patch["label"])
+                diameter = np.asarray(patch["diameter"])
+                if image.ndim != 3 or image.shape[0] != 3 or image.shape[1] != image.shape[2]:
+                    raise ValueError(f"image must have shape (3, H, H), got {image.shape}")
+                if discovered_patch_size is None:
+                    discovered_patch_size = int(image.shape[1])
+                if image.shape != (3, discovered_patch_size, discovered_patch_size):
+                    raise ValueError(f"image shape {image.shape} does not match patch size {discovered_patch_size}")
+                if expected_patch_size is not None and image.shape[1:] != (expected_patch_size, expected_patch_size):
+                    raise ValueError(
+                        f"Patch {entry['file']} has dimensions {image.shape[1:]}, "
+                        f"expected {(expected_patch_size, expected_patch_size)}"
+                    )
+                if mask.shape != image.shape[1:]:
+                    raise ValueError(f"mask shape {mask.shape} is not aligned with image {image.shape}")
+                if not np.issubdtype(image.dtype, np.number) or not np.isfinite(image).all():
+                    raise ValueError("image values must be finite numbers")
+                if image.size and (float(image.min()) < -1e-6 or float(image.max()) > 1.0 + 1e-6):
+                    raise ValueError("image values must be normalized to [0, 1]")
+                if not np.issubdtype(mask.dtype, np.number) or not np.isfinite(mask).all():
+                    raise ValueError("mask values must be finite numbers")
+                if not np.isin(mask, (0, 1)).all():
+                    raise ValueError("mask values must be binary 0/1")
+                if patch_label.size != 1 or int(patch_label.item()) not in (0, 1):
+                    raise ValueError("NPZ label must be a scalar 0 or 1")
+                if int(patch_label.item()) != int(entry["label"]):
+                    raise ValueError("NPZ label does not match manifest label")
+                if (
+                    diameter.size != 1
+                    or not np.issubdtype(diameter.dtype, np.number)
+                    or not np.isfinite(diameter).all()
+                    or float(diameter.item()) < 0
+                ):
+                    raise ValueError("NPZ diameter must be a finite non-negative scalar")
+                if int(entry["label"]) == 1 and not bool(mask.any()):
+                    raise ValueError("positive patch has an empty mask")
+                if int(entry["label"]) == 0 and bool(mask.any()):
+                    raise ValueError("negative patch has a non-empty mask")
+                entry_patch_size = entry.get("patch_size")
+                if entry_patch_size is not None and int(entry_patch_size) != int(image.shape[1]):
+                    raise ValueError("NPZ dimensions do not match manifest patch_size")
+        except (OSError, KeyError, ValueError, EOFError) as exc:
+            raise ValueError(f"Invalid cached patch at manifest entry {index} ({patch_path}): {exc}") from exc
+
     if expected_uids is not None:
         missing_uids = sorted(set(expected_uids) - manifest_uids)
         if missing_uids:
@@ -111,6 +199,29 @@ def validate_cache_manifest(
                 f"Cache manifest omits {len(missing_uids)} expected scan(s): "
                 f"{', '.join(missing_uids[:5])}"
             )
+    if expected_subsets is not None:
+        missing_subsets = sorted(set(expected_subsets) - set(manifest_uid_subsets))
+        if missing_subsets:
+            raise ValueError(f"Cache has no patches for requested subsets {missing_subsets}")
+        label_check_subsets = expected_subsets if require_both_labels else ()
+        for subset_id in label_check_subsets:
+            labels = subset_labels.get(subset_id, set())
+            if labels != {0, 1}:
+                missing = sorted({0, 1} - labels)
+                raise ValueError(
+                    f"Cache subset{subset_id} is missing "
+                    f"{'positive' if missing == [1] else 'negative' if missing == [0] else 'positive and negative'} patches"
+                )
+    if expected_uid_subsets is not None:
+        for subset_id, expected_subset_uids in expected_uid_subsets.items():
+            actual_subset_uids = manifest_uid_subsets.get(int(subset_id), set())
+            if actual_subset_uids != set(expected_subset_uids):
+                missing = sorted(set(expected_subset_uids) - actual_subset_uids)
+                unexpected = sorted(actual_subset_uids - set(expected_subset_uids))
+                raise ValueError(
+                    f"Cache scan UIDs do not match raw subset{subset_id}: "
+                    f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+                )
     if not any(int(entry["label"]) == 1 for entry in entries):
         raise ValueError("Cache manifest has no positive patches")
     if not any(int(entry["label"]) == 0 for entry in entries):

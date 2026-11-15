@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .database import create_tables
+from .data_config import runtime_data_info
 from .routes import inference, experiments, results, edge
 
 logging.basicConfig(
@@ -81,4 +82,5 @@ async def info():
         "dataset": "LUNA16",
         "task": "Lung Nodule Detection + Segmentation",
         "loss_functions": ["BCE", "Dice", "Boundary", "Focal", "HD95"],
+        **runtime_data_info(),
     }
