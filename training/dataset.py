@@ -33,14 +33,37 @@ logger = logging.getLogger(__name__)
 
 # LUNA16 Hounsfield Unit windows for lung parenchyma
 HU_MIN, HU_MAX = -1000, 400
+TARGET_SPACING_MM = (1.0, 1.0, 1.0)
 
 
-def load_mhd(path: str):
+def load_mhd(path: str, target_spacing_mm=TARGET_SPACING_MM):
     """
-    Load MetaImage CT volume.
-    Returns volume, origin, spacing, direction.
+    Load MetaImage CT volume resampled to the target physical voxel spacing.
+    The default is the documented 1 mm isotropic grid.
     """
     itk_img = sitk.ReadImage(str(path))
+
+    target_spacing_mm = tuple(float(v) for v in target_spacing_mm)
+    if len(target_spacing_mm) != 3 or any(v <= 0 for v in target_spacing_mm):
+        raise ValueError("target_spacing_mm must contain three positive values")
+
+    original_spacing = np.asarray(itk_img.GetSpacing(), dtype=np.float64)
+    if not np.allclose(original_spacing, target_spacing_mm):
+        original_size = np.asarray(itk_img.GetSize(), dtype=np.float64)
+        target_size = np.maximum(
+            np.rint(original_size * original_spacing / target_spacing_mm).astype(int),
+            1,
+        )
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetSize([int(v) for v in target_size])
+        resampler.SetOutputSpacing(target_spacing_mm)
+        resampler.SetOutputOrigin(itk_img.GetOrigin())
+        resampler.SetOutputDirection(itk_img.GetDirection())
+        resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(float(HU_MIN))
+        resampler.SetOutputPixelType(sitk.sitkFloat32)
+        itk_img = resampler.Execute(itk_img)
 
     volume = sitk.GetArrayFromImage(itk_img).astype(np.float32)
 
@@ -194,6 +217,7 @@ class CachedLUNA16Dataset(Dataset):
         cache_dir: str,
         subsets: Optional[list[int]] = None,
         augment: bool = True,
+        expected_patch_size: Optional[int] = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.augment   = augment
@@ -207,6 +231,8 @@ class CachedLUNA16Dataset(Dataset):
 
         with open(manifest_path) as f:
             all_entries: list[dict] = json.load(f)
+        if not isinstance(all_entries, list) or not all_entries:
+            raise ValueError(f"Cache manifest must be a non-empty list: {manifest_path}")
 
         # Optionally filter by subset.  The manifest stores UIDs; LUNA16 UIDs
         # don't encode subset numbers, so we keep all entries when subsets=None.
@@ -234,6 +260,43 @@ class CachedLUNA16Dataset(Dataset):
                 )
 
         self.entries = all_entries
+        missing_files = [
+            entry.get("file", "<missing file field>")
+            for entry in self.entries
+            if not isinstance(entry, dict)
+            or not isinstance(entry.get("file"), str)
+            or not (self.cache_dir / entry["file"]).is_file()
+        ]
+        if missing_files:
+            raise FileNotFoundError(
+                f"Cached subset references missing NPZ file(s): {missing_files[:5]}"
+            )
+        manifest_patch_sizes = {
+            int(entry["patch_size"])
+            for entry in self.entries
+            if entry.get("patch_size") is not None
+        }
+        if len(manifest_patch_sizes) > 1:
+            raise ValueError("Cache manifest mixes patch sizes")
+        self.patch_size = next(iter(manifest_patch_sizes), None)
+        if self.patch_size is None:
+            with np.load(self.cache_dir / self.entries[0]["file"]) as data:
+                self.patch_size = int(data["image"].shape[-1])
+        spacing_values = {
+            tuple(float(v) for v in entry["spacing_mm"])
+            for entry in self.entries
+            if entry.get("spacing_mm") is not None
+        }
+        if len(spacing_values) > 1:
+            raise ValueError("Cache manifest mixes physical spacing values")
+        self.preprocessing_spacing_mm = (
+            next(iter(spacing_values)) if spacing_values else None
+        )
+        if expected_patch_size is not None and self.patch_size != expected_patch_size:
+            raise ValueError(
+                f"Cache patch size is {self.patch_size}, requested {expected_patch_size}"
+            )
+        self.scan_uids = {entry["uid"] for entry in self.entries}
         pos = sum(1 for e in self.entries if e["label"] == 1)
         neg = len(self.entries) - pos
         logger.info(
@@ -291,10 +354,12 @@ class LUNA16Dataset(Dataset):
         negative_ratio: float = 1.0,
         augment: bool = True,
         use_candidates: bool = False,
+        target_spacing_mm: tuple[float, float, float] = TARGET_SPACING_MM,
     ):
         self.data_root = Path(data_root)
         self.patch_size = patch_size
         self.augment = augment
+        self.target_spacing_mm = tuple(float(v) for v in target_spacing_mm)
 
         # Parse annotations
         self.annotations: dict[str, list[dict]] = {}
@@ -364,13 +429,16 @@ class LUNA16Dataset(Dataset):
         # NOTE: this cache is NOT shared across DataLoader workers.
         # Use CachedLUNA16Dataset to avoid this limitation entirely.
         self._volume_cache: dict[str, tuple] = {}
+        self._sampled_negative_centers: dict[str, set[tuple[int, int, int]]] = {}
 
     def _load_volume(
         self, mhd_path: str
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if mhd_path not in self._volume_cache:
             # Import here so SimpleITK is only needed when this slow path is used
-            vol, origin, spacing, direction = load_mhd(mhd_path)
+            vol, origin, spacing, direction = load_mhd(
+                mhd_path, self.target_spacing_mm
+            )
             vol = clip_and_normalise(vol)
             if len(self._volume_cache) >= 20:
                 oldest_key = next(iter(self._volume_cache))
@@ -385,15 +453,21 @@ class LUNA16Dataset(Dataset):
         spacing: np.ndarray,
         direction: np.ndarray,
         positive_annotations: list[dict],
+        scan_uid: str,
     ) -> np.ndarray:
         """
-        Sample a random voxel from the volume interior.
-        NOTE: this is NOT a true lung mask — it avoids background air voxels
-        (normalised HU < 0.036 ≈ below -950 HU) and volume edges only.
-        For a proper lung mask, run a lung segmentation algorithm first.
+        Rejection-sample a crop-safe non-air (z,y,x) voxel outside nodules.
+        The HU threshold is not equivalent to a true lung segmentation mask.
         """
-        # Avoid pure air (background) voxels and patches near annotated nodules.
-        interior = np.where(volume[1:-1] > 0.036)   # skip first/last slice
+        # Draw Z/Y/X together from crop-safe non-air voxels; random X/Y values
+        # are never grafted onto another Z slice.
+        z_size, y_size, x_size = volume.shape
+        half = self.patch_size // 2
+        if z_size < 3 or y_size < self.patch_size or x_size < self.patch_size:
+            raise RuntimeError(
+                f"Volume shape {volume.shape} is too small for a {self.patch_size}px patch"
+            )
+        seen = self._sampled_negative_centers.setdefault(scan_uid, set())
         positive_regions = [
             (
                 world_to_voxel(ann["coord"], origin, spacing, direction),
@@ -401,29 +475,36 @@ class LUNA16Dataset(Dataset):
             )
             for ann in positive_annotations
         ]
-        half = self.patch_size // 2
-        for _ in range(128):
-            if interior[0].size == 0:
-                cz = volume.shape[0] // 2
-                cy = random.randint(half, volume.shape[1] - half - 1)
-                cx = random.randint(half, volume.shape[2] - half - 1)
-            else:
-                # Pick a non-air voxel, then jitter in XY.
-                pick = random.randint(0, interior[0].size - 1)
-                cz = int(interior[0][pick]) + 1
-                cy = random.randint(half, volume.shape[1] - half - 1)
-                cx = random.randint(half, volume.shape[2] - half - 1)
-
-            vox = np.array([cx, cy, cz], dtype=np.float64)
-            if any(
-                patch_overlaps_nodule(vox, center, diameter, spacing, self.patch_size)
-                for center, diameter in positive_regions
-            ):
-                continue
-            return voxel_to_world(vox, origin, spacing, direction)
+        # Inspect one 2D slice at a time so sampling a full CT does not create
+        # a volume-sized coordinate array. Every candidate is a real crop-safe
+        # non-air (z,y,x) voxel, sampled in randomized order.
+        z_order = np.random.permutation(np.arange(1, z_size - 1))
+        for cz_value in z_order:
+            cz = int(cz_value)
+            valid_xy = np.argwhere(
+                volume[cz, half:y_size - half, half:x_size - half] > 0.036
+            )
+            for candidate_index in np.random.permutation(len(valid_xy)):
+                cy0, cx0 = valid_xy[candidate_index]
+                cy = int(cy0) + half
+                cx = int(cx0) + half
+                center_key = (cx, cy, cz)
+                if center_key in seen:
+                    continue
+                vox = np.array([cx, cy, cz], dtype=np.int64)
+                if any(
+                    patch_overlaps_nodule(
+                        vox, center, diameter, spacing, self.patch_size
+                    )
+                    for center, diameter in positive_regions
+                ):
+                    continue
+                seen.add(center_key)
+                return voxel_to_world(vox, origin, spacing, direction)
 
         raise RuntimeError(
-            "Unable to sample an annotation-safe negative patch after 128 attempts"
+            f"Unable to find a unique crop-safe, non-air, annotation-safe negative "
+            f"center for scan {scan_uid}; exhausted all valid crop-safe voxels"
         )
 
     def __len__(self) -> int:
@@ -442,6 +523,7 @@ class LUNA16Dataset(Dataset):
                 spacing,
                 direction,
                 self.annotations.get(sample["uid"], []),
+                sample["uid"],
             )
 
         center_vox = world_to_voxel(coord_world, origin, spacing, direction)
@@ -507,10 +589,15 @@ def build_dataloaders(
     num_workers: int = 2,
     patch_size: int = 64,
     cache_dir: Optional[str | Path] = None,
+    train_subsets: Optional[list[int]] = None,
+    validation_subset: Optional[int] = None,
+    test_subset: Optional[int] = None,
+    target_spacing_mm: tuple[float, float, float] = TARGET_SPACING_MM,
 ) -> tuple[DataLoader, DataLoader]:
     """
-    Build train/val DataLoaders using the LUNA16 subsets available on disk.
-    The requested fold is used for validation; all other subsets are training.
+    Build train/validation DataLoaders. Explicit scan-disjoint subset groups
+    may be provided; otherwise ``fold`` selects validation and all other
+    available subsets are used for training (legacy behavior).
 
     Args:
         data_root  : path to raw LUNA16 data (used when cache_dir is None)
@@ -521,6 +608,8 @@ def build_dataloaders(
         cache_dir  : path to pre-extracted patch cache from ``preprocess_cache.py``.
                      **Strongly recommended** — eliminates SSD I/O bottleneck.
                      When supplied, raw LUNA16 volumes are never read during training.
+        train_subsets, validation_subset, test_subset: explicit disjoint subsets.
+        target_spacing_mm: physical voxel spacing for raw-volume resampling.
     """
     root_arg = Path(data_root).expanduser()
     if root_arg.is_absolute():
@@ -533,18 +622,21 @@ def build_dataloaders(
     # same relative config work when launched from either the repo root or
     # backend/.
     data_root_path = None
-    all_subsets = []
+    subset_uids: dict[int, set[str]] = {}
     for candidate in root_candidates:
         candidate = candidate.resolve()
-        subsets = sorted(
-            int(path.name.removeprefix("subset"))
+        found: dict[int, set[str]] = {
+            int(path.name.removeprefix("subset")): {
+                mhd.stem for mhd in path.glob("*.mhd")
+                if re.fullmatch(r"\d+(?:\.\d+)+", mhd.stem)
+            }
             for path in candidate.glob("subset*")
             if path.is_dir() and path.name.removeprefix("subset").isdigit()
-        )
-        if len(subsets) > len(all_subsets):
+        }
+        if sum(map(len, found.values())) > sum(map(len, subset_uids.values())):
             data_root_path = candidate
-            all_subsets = subsets
-        if len(subsets) >= 2:
+            subset_uids = found
+        if len(found) >= 2:
             break
 
     if data_root_path is None:
@@ -554,19 +646,71 @@ def build_dataloaders(
             f"Checked: {checked}"
         )
 
+    all_subsets = sorted(subset_uids)
     if len(all_subsets) < 2:
         raise ValueError(
             f"At least 2 LUNA16 subsets are required under {data_root_path}. "
             f"Found: {all_subsets}"
         )
-    if fold not in all_subsets:
-        raise ValueError(
-            f"Validation fold {fold} is unavailable under {data_root_path}. "
-            f"Available subsets: {all_subsets}"
-        )
 
-    val_subset = [fold]
-    train_subsets = [subset for subset in all_subsets if subset != fold]
+    explicit_split = any(
+        value is not None for value in (train_subsets, validation_subset, test_subset)
+    )
+    if explicit_split:
+        if train_subsets is None or validation_subset is None or not train_subsets:
+            raise ValueError(
+                "Explicit splits require non-empty train_subsets and validation_subset"
+            )
+        train_subsets = [int(s) for s in train_subsets]
+        val_subset = [int(validation_subset)]
+        test_subsets = [int(test_subset)] if test_subset is not None else []
+    else:
+        if fold not in all_subsets:
+            raise ValueError(
+                f"Validation fold {fold} is unavailable under {data_root_path}. "
+                f"Available subsets: {all_subsets}"
+            )
+        val_subset = [int(fold)]
+        train_subsets = [subset for subset in all_subsets if subset != fold]
+        test_subsets = []
+
+    groups = {
+        "train": train_subsets,
+        "validation": val_subset,
+        "test": test_subsets,
+    }
+    for group_name, group_subsets in groups.items():
+        if len(group_subsets) != len(set(group_subsets)):
+            raise ValueError(f"Duplicate subset in {group_name}_subsets: {group_subsets}")
+        missing = sorted(set(group_subsets) - set(all_subsets))
+        if missing:
+            raise ValueError(
+                f"Requested {group_name} subset(s) {missing} are unavailable under "
+                f"{data_root_path}; available subsets: {all_subsets}"
+            )
+    if not train_subsets:
+        raise ValueError("At least one training subset is required")
+
+    subset_groups = {
+        name: set().union(*(subset_uids[s] for s in values)) if values else set()
+        for name, values in groups.items()
+    }
+    for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+        overlap = subset_groups[left] & subset_groups[right]
+        if overlap:
+            raise ValueError(
+                f"Scan UID leakage between {left} and {right}: {sorted(overlap)[:5]}"
+            )
+
+    split_info = {
+        "train_subsets": list(train_subsets),
+        "validation_subset": val_subset[0],
+        "test_subset": test_subsets[0] if test_subsets else None,
+        "train_scan_uids": sorted(subset_groups["train"]),
+        "validation_scan_uids": sorted(subset_groups["validation"]),
+        "test_scan_uids": sorted(subset_groups["test"]),
+        "independent_test_available": bool(test_subsets),
+    }
 
     logger.info(
         f"Using LUNA16 data at {data_root_path} | Available subsets: "
@@ -579,20 +723,46 @@ def build_dataloaders(
     if cache_dir is not None:
         cache_path = Path(cache_dir).expanduser().resolve()
         logger.info(f"Using pre-extracted patch cache at {cache_path} (fast path)")
-        train_ds = CachedLUNA16Dataset(cache_path, subsets=train_subsets, augment=True)
-        val_ds   = CachedLUNA16Dataset(cache_path, subsets=val_subset,    augment=False)
+        train_ds = CachedLUNA16Dataset(
+            cache_path, subsets=train_subsets, augment=True,
+            expected_patch_size=patch_size,
+        )
+        val_ds = CachedLUNA16Dataset(
+            cache_path, subsets=val_subset, augment=False,
+            expected_patch_size=patch_size,
+        )
+        if test_subsets:
+            test_ds = CachedLUNA16Dataset(
+                cache_path, subsets=test_subsets, augment=False,
+                expected_patch_size=patch_size,
+            )
+            if test_ds.scan_uids != subset_groups["test"]:
+                raise ValueError("Test cache scan UIDs do not match the requested raw subset")
+        if train_ds.scan_uids != subset_groups["train"]:
+            raise ValueError("Training cache scan UIDs do not match requested raw subsets")
+        if val_ds.scan_uids != subset_groups["validation"]:
+            raise ValueError("Validation cache scan UIDs do not match the requested raw subset")
     else:
         logger.warning(
             "No cache_dir supplied — loading raw CT volumes at runtime. "
             "SSD will run at 100%%. Run preprocess_cache.py once to fix this."
         )
         train_ds = LUNA16Dataset(
-            data_root_path, train_subsets, patch_size=patch_size, augment=True
+            data_root_path, train_subsets, patch_size=patch_size, augment=True,
+            target_spacing_mm=target_spacing_mm,
         )
         val_ds = LUNA16Dataset(
-            data_root_path, val_subset, patch_size=patch_size, augment=False
+            data_root_path, val_subset, patch_size=patch_size, augment=False,
+            target_spacing_mm=target_spacing_mm,
         )
+        if test_subsets:
+            test_ds = LUNA16Dataset(
+                data_root_path, test_subsets, patch_size=patch_size, augment=False,
+                target_spacing_mm=target_spacing_mm,
+            )
 
+    train_ds.split_info = split_info
+    val_ds.split_info = split_info
     if not len(train_ds) or not len(val_ds):
         raise ValueError(
             f"Dataset is empty: training={len(train_ds)} from {train_subsets}, "
@@ -601,7 +771,9 @@ def build_dataloaders(
         )
 
     import platform
-    safe_workers = 0 if platform.system() == "Windows" else num_workers
+    # Raw-volume sampling uses an in-memory per-scan set to prevent repeated
+    # negative centers. Keep it in one process; cached loading can be parallel.
+    safe_workers = 0 if platform.system() == "Windows" or cache_dir is None else num_workers
 
     train_loader = DataLoader(
         train_ds,

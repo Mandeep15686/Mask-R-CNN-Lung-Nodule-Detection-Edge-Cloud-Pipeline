@@ -150,6 +150,12 @@ python scripts/run_experiments.py --phase 1 \
   --out ./experiments --epochs 30
 ```
 
+Newly generated raw scans are resampled to **1.0 × 1.0 × 1.0 mm** before
+patch extraction. Build a new cache directory for this preprocessing version;
+keep previous caches as backups. Use `--rebuild` only when intentionally
+replacing a cache (the old directory is retained with a `.backup-<timestamp>`
+suffix).
+
 ### Phase 2 — Grid search (α, β, γ)
 ```bash
 python scripts/run_experiments.py --phase 2 \
@@ -158,6 +164,10 @@ python scripts/run_experiments.py --phase 2 \
 ```
 When `--max-configs` is set, Phase 2 selects a reproducible random sample
 from the full grid using seed 42 instead of taking the first grid entries.
+For an explicit split, supply training subsets and a validation subset. Add
+`--test-subset` only when a separate test subset is actually available; the
+loader rejects overlapping scan UIDs and missing subset IDs. The local
+two-subset setup cannot support an independent test set.
 
 ### Phase 3 — Bayesian optimisation (Optuna)
 ```bash
@@ -172,15 +182,17 @@ Choose an evaluation fold explicitly and keep it independent of training and
 model selection. For example, use `--fold 9` only when `subset9` is present and
 has not been used during development. With only `subset0` and `subset1`, there
 is no independent test subset if one fold is used for training and the other
-for validation. The evaluator's sampled-patch FROC proxy is not official
-scan-level LUNA16 FROC.
+for validation. Use `--cache-dir` to evaluate the same fixed patches used by
+training. The evaluator does not calculate official candidate-matched,
+scan-level LUNA16 FROC. False-positive measures are labeled as sampled-patch
+proxies.
 
 Segmentation masks are generated spherical/elliptical approximations from
 nodule centers and diameters, not expert-drawn contours. Report segmentation
-metrics as agreement with generated masks. CT volumes are not currently
-resampled to a common physical spacing, so adjacent-slice thickness and the
-physical sizes represented by pixel anchors vary across scans; investigate
-resampling before final research comparisons.
+metrics as agreement with generated masks. Raw and newly generated cache
+paths resample CT volumes to a 1 mm isotropic grid. Previously generated
+caches retain their original spacing characteristics and should not be mixed
+with newly generated caches in a comparison.
 
 ### Via the UI
 1. Open **http://localhost:3000/experiments**

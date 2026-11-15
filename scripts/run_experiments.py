@@ -29,6 +29,12 @@ def main():
     parser.add_argument("--epochs",      type=int,   default=30)
     parser.add_argument("--batch-size",  type=int,   default=4)
     parser.add_argument("--fold",        type=int,   default=0)
+    parser.add_argument("--train-subsets", type=int, nargs="+", default=None,
+                        help="Explicit training subset IDs")
+    parser.add_argument("--validation-subset", type=int, default=None,
+                        help="Explicit validation subset ID")
+    parser.add_argument("--test-subset", type=int, default=None,
+                        help="Reserved independent test subset ID; excluded from training")
     parser.add_argument("--lr",          type=float, default=0.005)
     parser.add_argument("--max-configs", type=int,   default=None,         help="Phase 2: max configs to run")
     parser.add_argument("--n-trials",    type=int,   default=100,          help="Phase 3: Optuna trials")
@@ -42,6 +48,9 @@ def main():
         "epochs":     args.epochs,
         "batch_size": args.batch_size,
         "fold":       args.fold,
+        "train_subsets": args.train_subsets,
+        "validation_subset": args.validation_subset,
+        "test_subset": args.test_subset,
         "lr":         args.lr,
     }
 

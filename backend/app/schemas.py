@@ -35,11 +35,39 @@ class ExperimentCreate(BaseModel):
     fold: int = Field(0, ge=0, le=9)
     lr: float = Field(0.005, gt=0)
     data_root: str = Field("./data/luna16")
+    train_subsets: Optional[list[int]] = None
+    validation_subset: Optional[int] = Field(None, ge=0, le=9)
+    test_subset: Optional[int] = Field(None, ge=0, le=9)
     cache_dir: Optional[str] = Field(
         None,
         max_length=1024,
         description="Pre-extracted LUNA16 patch cache directory",
     )
+
+    @model_validator(mode="after")
+    def validate_subset_split(self):
+        explicit = any(
+            value is not None
+            for value in (self.train_subsets, self.validation_subset, self.test_subset)
+        )
+        if not explicit:
+            return self
+        if not self.train_subsets or self.validation_subset is None:
+            raise ValueError(
+                "Explicit splits require non-empty train_subsets and validation_subset"
+            )
+        values = list(self.train_subsets)
+        if any(subset < 0 or subset > 9 for subset in values):
+            raise ValueError("train_subsets values must be between 0 and 9")
+        if len(values) != len(set(values)):
+            raise ValueError("train_subsets cannot contain duplicate subset IDs")
+        groups = [set(values), {self.validation_subset}]
+        if self.test_subset is not None:
+            groups.append({self.test_subset})
+        for index, group in enumerate(groups):
+            if any(group & other for other in groups[index + 1:]):
+                raise ValueError("Training, validation, and test subsets must be disjoint")
+        return self
 
 
 class ExperimentResponse(BaseModel):

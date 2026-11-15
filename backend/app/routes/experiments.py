@@ -78,6 +78,9 @@ async def create_experiment(
             "lr": payload.lr,
             "data_root": payload.data_root,
             "cache_dir": payload.cache_dir or os.getenv("LUNA16_CACHE_DIR"),
+            "train_subsets": payload.train_subsets,
+            "validation_subset": payload.validation_subset,
+            "test_subset": payload.test_subset,
         },
     )
     db.add(exp)
@@ -257,6 +260,21 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
                 _experiment_log_context.experiment_id = exp_id
                 try:
                     trainer = DBCallbackTrainer(full_cfg, str(run_dir))
+                    # Persist the resolved UID lists (not just subset numbers)
+                    # before training and checkpoint creation.
+                    from ..database import SessionLocal as SplitSessionLocal
+                    split_db = SplitSessionLocal()
+                    try:
+                        split_exp = split_db.query(Experiment).filter(
+                            Experiment.id == exp_id
+                        ).first()
+                        if split_exp:
+                            split_config = dict(split_exp.config_json or {})
+                            split_config["data_split"] = trainer.data_split
+                            split_exp.config_json = split_config
+                            split_db.commit()
+                    finally:
+                        split_db.close()
                     return trainer.train()
                 finally:
                     _experiment_log_context.experiment_id = previous_id

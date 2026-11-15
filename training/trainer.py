@@ -45,10 +45,6 @@ class Trainer:
         )
         logger.info(f"Device: {self.device}")
 
-        # Save config
-        with open(self.run_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
-
         # Build model
         self.model = build_model(config).to(self.device)
         logger.info(f"Loss: {self.model.get_loss_description()}")
@@ -80,7 +76,26 @@ class Trainer:
             num_workers=config.get("num_workers", 2),
             patch_size=config.get("patch_size", 64),
             cache_dir=config.get("cache_dir"),   # None → slow raw-volume path
+            train_subsets=config.get("train_subsets"),
+            validation_subset=config.get("validation_subset"),
+            test_subset=config.get("test_subset"),
+            target_spacing_mm=tuple(
+                config.get("target_spacing_mm", (1.0, 1.0, 1.0))
+            ),
         )
+        self.data_split = self.train_loader.dataset.split_info
+        self.config["data_split"] = self.data_split
+        if self.config.get("cache_dir"):
+            self.config["cache_dir"] = str(
+                self.train_loader.dataset.cache_dir.resolve()
+            )
+            self.config["cache_spacing_mm"] = (
+                list(self.train_loader.dataset.preprocessing_spacing_mm)
+                if self.train_loader.dataset.preprocessing_spacing_mm is not None
+                else None
+            )
+        with open(self.run_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(self.config, f, indent=2)
 
         self.history: list[dict] = []
         self.best_dice = float("-inf")
@@ -303,8 +318,8 @@ class Trainer:
                 f"Epoch {epoch}/{self.epochs} | "
                 f"train_loss={train_metrics.get('total_loss', 0):.4f} | "
                 f"val_dice={_fmt_metric(val_metrics.get('val_dice'))} | "
-                f"neg_patch_fp_rate={_fmt_metric(val_metrics.get('val_negative_patch_false_positive_rate'))} | "
-                f"fp_detections_per_scan={_fmt_metric(val_metrics.get('val_false_positives_per_scan'))} | "
+                f"sampled_neg_patch_fp_rate={_fmt_metric(val_metrics.get('val_sampled_negative_patch_false_positive_rate'))} | "
+                f"sampled_patch_fp_per_scan_proxy={_fmt_metric(val_metrics.get('val_sampled_patch_false_detections_per_scan_proxy'))} | "
                 f"val_hd95={_fmt_metric(val_metrics.get('val_hd95'), '.2f')} | "
                 f"val_boundary_f1={_fmt_metric(val_metrics.get('val_boundary_f1'))}"
             )
@@ -326,6 +341,7 @@ class Trainer:
                 "zeta": self.config.get("mask_loss", {}).get("zeta", 0),
             },
             "final_metrics": self.history[-1] if self.history else {},
+            "data_split": self.data_split,
         }
 
         with open(self.run_dir / "summary.json", "w") as f:

@@ -35,6 +35,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [EVAL] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def load_checkpoint_state_dict(model, checkpoint: dict) -> None:
+    """Load a checkpoint without hiding architecture or key mismatches."""
+    state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint does not contain a model state dictionary")
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint architecture/state keys do not match the reconstructed model. "
+            f"Strict load failed: {exc}"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Nodule subtype classifier (by size)
 # ---------------------------------------------------------------------------
@@ -65,6 +79,7 @@ def evaluate_checkpoint(
     patch_size: int = 64,
     score_threshold: float = 0.3,
     device_str: str = "auto",
+    cache_dir: str | None = None,
 ) -> dict:
     """
     Load a Mask R-CNN checkpoint and run full evaluation on the given fold.
@@ -76,9 +91,10 @@ def evaluate_checkpoint(
     from training.model import LungNoduleMaskRCNN
     from training.dataset import LUNA16Dataset
     from training.metrics import (
-        evaluate_batch, compute_froc, dice_score,
+        evaluate_batch, dice_score,
         iou_score, hausdorff_distance_95, boundary_f1, volume_error_percent,
     )
+    from training.dataset import CachedLUNA16Dataset
     from torch.utils.data import DataLoader
 
     # Device
@@ -99,55 +115,116 @@ def evaluate_checkpoint(
             f"Evaluation subset {fold} is unavailable under {data_path}. "
             f"Available subsets: {available_folds}"
         )
-    logger.warning(
-        "FROC is computed over sampled patches from the selected subset; "
-        "this is a proxy and is not official scan-level LUNA16 FROC."
-    )
-
     # Load checkpoint metadata
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = ckpt.get("config", {})
     mask_loss_cfg = config.get("mask_loss", {"alpha": 1.0})
-    training_fold = config.get("fold")
-    if training_fold is None:
-        evaluation_data_role = "unknown_training_split"
+    data_split = config.get("data_split", {})
+    reserved_test_subset = config.get("test_subset", data_split.get("test_subset"))
+    if reserved_test_subset is not None:
+        if fold != int(reserved_test_subset):
+            raise ValueError(
+                f"Checkpoint reserves subset {reserved_test_subset} for independent "
+                f"testing; refusing evaluation on subset {fold}."
+            )
+        evaluation_data_role = "reserved_test_subset"
+    elif data_split:
+        evaluation_data_role = "no_independent_test_subset_configured"
         logger.warning(
-            "Checkpoint has no training fold metadata; independence of this "
-            "evaluation subset cannot be established."
-        )
-    elif fold == int(training_fold):
-        evaluation_data_role = "validation_fold_used_during_training"
-        logger.warning(
-            "Selected subset is the checkpoint's validation fold and may have "
-            "been used for model selection; it is not an independent test set."
+            "Checkpoint has no reserved test subset. This evaluation is not an "
+            "independent test result."
         )
     else:
-        evaluation_data_role = "subset_in_training_data"
-        logger.warning(
-            "Selected subset was included in training because training uses all "
-            "subsets except its validation fold; this is not an independent test set."
-        )
+        training_fold = config.get("fold")
+        if training_fold is None:
+            evaluation_data_role = "unknown_training_split"
+            logger.warning(
+                "Checkpoint has no training split metadata; independence of this "
+                "evaluation subset cannot be established."
+            )
+        elif fold == int(training_fold):
+            evaluation_data_role = "validation_fold_used_during_training"
+            logger.warning(
+                "Selected subset is the checkpoint's validation fold and may have "
+                "been used for model selection; it is not an independent test set."
+            )
+        else:
+            evaluation_data_role = "subset_in_training_data"
+            logger.warning(
+                "Selected subset was included in training because training uses all "
+                "subsets except its validation fold; this is not an independent test set."
+            )
 
-    # Build model
-    model = LungNoduleMaskRCNN(num_classes=2, mask_loss_cfg=mask_loss_cfg)
-    model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
+    # Reconstruct architecture values from the checkpoint. Never download
+    # pretrained weights during evaluation; the trained state replaces them.
+    model_config = dict(config)
+    model_config["pretrained_backbone"] = False
+    model_config["mask_loss"] = mask_loss_cfg
+    model = LungNoduleMaskRCNN.from_config(model_config)
+    load_checkpoint_state_dict(model, ckpt)
     model.to(device)
     model.eval()
-    logger.info(f"Loaded: {checkpoint_path}")
+    logger.info("Loaded checkpoint with strict state-dictionary matching: %s", checkpoint_path)
 
-    # Dataset
-    test_ds = LUNA16Dataset(
-        data_root=data_root,
-        subsets=[fold],
-        patch_size=patch_size,
-        augment=False,
-    )
-    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2)
-    logger.info(f"Test samples: {len(test_ds)}")
+    # Dataset. Supplying a cache is strict: a missing fold or patch-size
+    # mismatch raises and never falls back to raw-volume extraction.
+    checkpoint_cache = config.get("cache_dir")
+    if checkpoint_cache:
+        if cache_dir is None:
+            raise ValueError(
+                "This checkpoint was trained from a patch cache. Pass the same "
+                "cache using --cache-dir for consistent evaluation."
+            )
+        if Path(cache_dir).expanduser().resolve() != Path(checkpoint_cache).expanduser().resolve():
+            raise ValueError(
+                "Evaluation cache differs from the cache recorded in the checkpoint: "
+                f"{checkpoint_cache}"
+            )
+    elif cache_dir is not None:
+        logger.warning(
+            "Checkpoint was trained without a fixed patch cache; cached evaluation "
+            "patches may not match its dynamic raw-volume training distribution."
+        )
+    if cache_dir is not None:
+        test_ds = CachedLUNA16Dataset(
+            cache_dir, subsets=[fold], augment=False,
+            expected_patch_size=patch_size,
+        )
+        if not test_ds.scan_uids:
+            raise ValueError(f"No cached scans exist for evaluation subset {fold}")
+        trained_spacing = config.get("cache_spacing_mm")
+        eval_spacing = test_ds.preprocessing_spacing_mm
+        if trained_spacing is not None and eval_spacing is not None:
+            if not np.allclose(trained_spacing, eval_spacing):
+                raise ValueError(
+                    f"Evaluation cache spacing {eval_spacing} differs from checkpoint "
+                    f"training spacing {trained_spacing}"
+                )
+        elif trained_spacing is None or eval_spacing is None:
+            logger.warning(
+                "Cache spacing metadata is absent; physical-spacing equivalence "
+                "between training and evaluation cannot be verified."
+            )
+        logger.info("Evaluating cached patches from %s", cache_dir)
+    else:
+        logger.warning(
+            "No --cache-dir supplied; using raw-volume patches for this evaluation."
+        )
+        test_ds = LUNA16Dataset(
+            data_root=data_root,
+            subsets=[fold],
+            patch_size=patch_size,
+            augment=False,
+            target_spacing_mm=tuple(config.get("target_spacing_mm", (1.0, 1.0, 1.0))),
+        )
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    logger.info("Test samples: %d", len(test_ds))
+
+    if not len(test_ds):
+        raise ValueError(f"No samples found for evaluation subset {fold}")
 
     all_preds, all_targets, all_labels, all_diameters = [], [], [], []
     all_uids, false_positive_detections = [], []
-    all_scores, detection_labels = [], []
     inference_times = []
     subtype_metrics: dict[str, list] = {"small_solid": [], "solid": [], "large": []}
 
@@ -167,24 +244,16 @@ def evaluate_checkpoint(
                 pred_mask = np.zeros((h, w), dtype=np.float32)
 
                 scores_i = out.get("scores", torch.zeros(0)).cpu().numpy()
-                boxes_i  = out.get("boxes",  torch.zeros(0, 4)).cpu().numpy()
-                masks_i  = out.get("masks",  torch.zeros(0, 1, h, w)).cpu().numpy()
+                masks_i  = out.get("masks", torch.zeros(0, 1, h, w)).cpu().numpy()
                 false_positive_detections.append(
-                    int(np.any(masks_i > 0.5, axis=(1, 2, 3)).sum())
-                    if len(masks_i) else 0
+                    int(np.any(masks_i > 0.5, axis=(1, 2, 3)).sum()) if len(masks_i) else 0
                 )
 
                 if len(scores_i) > 0:
                     best_idx = int(np.argmax(scores_i))
                     pred_mask = masks_i[best_idx, 0]
-                    all_scores.append(float(scores_i[best_idx]))
-                else:
-                    all_scores.append(0.0)
 
-                # Detection label: 1 if GT has nodule and predicted score > threshold
                 is_nodule_gt = int(labels[i].item())
-                detection_labels.append(is_nodule_gt)
-
                 gt_mask = masks[i].numpy()
                 all_preds.append(pred_mask)
                 all_targets.append(gt_mask)
@@ -192,7 +261,6 @@ def evaluate_checkpoint(
                 all_labels.append(is_nodule_gt)
                 all_diameters.append(float(diams[i].item()))
 
-                # Per-subtype
                 if is_nodule_gt == 1:
                     diam = float(diams[i].item())
                     sub  = classify_nodule_subtype(diam)
@@ -205,7 +273,6 @@ def evaluate_checkpoint(
                         "vol_err":     volume_error_percent(pred_bin, gt_mask),
                     })
 
-    # Aggregate segmentation metrics
     preds_arr   = np.stack(all_preds)
     targets_arr = np.stack(all_targets)
     seg_metrics = evaluate_batch(
@@ -216,11 +283,6 @@ def evaluate_checkpoint(
         false_positive_detections=false_positive_detections,
     )
 
-    # FROC
-    n_scans = len({sample["uid"] for sample in test_ds.all_samples})
-    froc = compute_froc(all_scores, detection_labels, n_scans=n_scans)
-
-    # Per-subtype aggregation
     subtype_summary = {}
     for sub, records in subtype_metrics.items():
         if records:
@@ -240,13 +302,10 @@ def evaluate_checkpoint(
         "evaluation_data_role": evaluation_data_role,
         "n_samples":            len(test_ds),
         "avg_inference_ms":     float(np.mean(inference_times)) if inference_times else 0.0,
+        "evaluation_protocol": "sampled_patch_metrics_no_official_froc",
         **seg_metrics,
-        "patch_sample_froc_score": froc["froc_score"],
-        "patch_sample_froc_per_point": froc["froc_per_point"],
-        "froc_protocol": "sampled_patch_proxy_not_official_scan_level_luna16",
         "subtype_metrics":      subtype_summary,
     }
-
 
 # ---------------------------------------------------------------------------
 # Multi-checkpoint comparison
@@ -266,8 +325,7 @@ def compare_checkpoints(
             results.append(result)
             logger.info(
                 f"  Dice={result['dice']:.4f}  IoU={result['iou']:.4f}  "
-                f"HD95={result['hd95']:.2f}  BF1={result['boundary_f1']:.4f}  "
-                f"patch-FROC proxy={result['patch_sample_froc_score']:.4f}"
+                f"HD95={result['hd95']:.2f}  BF1={result['boundary_f1']:.4f}"
             )
         except Exception as e:
             logger.error(f"  FAILED: {e}")
@@ -287,7 +345,9 @@ def compare_checkpoints(
             "config_id", "checkpoint", "fold", "n_samples",
             "dice", "iou", "sensitivity", "specificity",
             "hd95", "boundary_f1", "asd", "vol_err",
-            "patch_sample_froc_score", "avg_inference_ms",
+            "sampled_negative_patch_false_positive_rate",
+            "sampled_patch_false_detections_per_scan_proxy",
+            "avg_inference_ms",
         ]
         with open(out / "evaluation_results.csv", "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=flat_keys, extrasaction="ignore")
@@ -298,7 +358,7 @@ def compare_checkpoints(
 
     # Print summary table
     print(f"\n{'='*90}")
-    print(f"{'Config ID':<30} {'Dice':>6} {'IoU':>6} {'HD95':>7} {'BF1':>6} {'pFROC':>6} {'ms/img':>7}")
+    print(f"{'Config ID':<30} {'Dice':>6} {'IoU':>6} {'HD95':>7} {'BF1':>6} {'ms/img':>7}")
     print(f"{'-'*90}")
     for r in results:
         print(
@@ -307,7 +367,6 @@ def compare_checkpoints(
             f"{r.get('iou',0):>6.4f} "
             f"{r.get('hd95',999):>7.2f} "
             f"{r.get('boundary_f1',0):>6.4f} "
-            f"{r.get('patch_sample_froc_score',0):>6.4f} "
             f"{r.get('avg_inference_ms',0):>7.1f}"
         )
     print(f"{'='*90}")
@@ -346,6 +405,8 @@ def main():
     parser.add_argument("--out",          default="./eval_results")
     parser.add_argument("--batch-size",   type=int,   default=4)
     parser.add_argument("--patch-size",   type=int,   default=64)
+    parser.add_argument("--cache-dir",    type=str,  default=None,
+                        help="Pre-extracted patch cache (missing subset or metadata is an error)")
     parser.add_argument("--threshold",    type=float, default=0.3)
     parser.add_argument("--device",       default="auto")
     args = parser.parse_args()
@@ -379,6 +440,7 @@ def main():
         patch_size=args.patch_size,
         score_threshold=args.threshold,
         device_str=args.device,
+        cache_dir=args.cache_dir,
     )
 
 

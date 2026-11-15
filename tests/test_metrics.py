@@ -195,6 +195,20 @@ class TestEvaluateBatch:
         assert result["dice"] == pytest.approx(1.0, abs=0.05)
         assert result["iou"]  == pytest.approx(1.0, abs=0.05)
 
+    def test_negative_patch_false_positive_metrics_are_labeled_as_proxies(self):
+        targets = np.zeros((2, 8, 8), dtype=np.uint8)
+        preds = np.zeros((2, 8, 8), dtype=np.float32)
+        preds[0, 2:4, 2:4] = 1.0
+        result = evaluate_batch(
+            preds,
+            targets,
+            scan_uids=["scan-a", "scan-a"],
+            false_positive_detections=[2, 0],
+        )
+        assert result["sampled_negative_patch_false_positive_rate"] == pytest.approx(0.5)
+        assert result["sampled_patch_false_detections_per_scan_proxy"] == pytest.approx(2.0)
+        assert "false_positives_per_scan" not in result
+
 
 # ---------------------------------------------------------------------------
 # FROC

@@ -157,7 +157,11 @@ class LungNoduleMaskRCNN(nn.Module):
             trainable_backbone_layers=cfg.get("trainable_backbone_layers", 3),
             min_size=cfg.get("min_size", 64),
             max_size=cfg.get("max_size", 256),
+            box_score_thresh=cfg.get("box_score_thresh", 0.05),
+            box_nms_thresh=cfg.get("box_nms_thresh", 0.5),
+            box_detections_per_img=cfg.get("box_detections_per_img", 100),
             mask_roi_pool_output_size=cfg.get("mask_roi_pool_output_size", 14),
+            hidden_dim=cfg.get("hidden_dim", 256),
         )
 
 

@@ -199,7 +199,7 @@ def evaluate_batch(
         "dice": [], "positive_dice": [], "iou": [],
         "sensitivity": [], "specificity": [],
         "hd95": [], "boundary_f1": [], "asd": [], "vol_err": [],
-        "negative_patch_false_positive_rate": [],
+        "sampled_negative_patch_false_positive_rate": [],
     }
     false_positives_by_scan: dict[str, int] = {}
 
@@ -226,7 +226,7 @@ def evaluate_batch(
                 if false_positive_detections is not None
                 else int(np.any(p))
             )
-            metrics["negative_patch_false_positive_rate"].append(
+            metrics["sampled_negative_patch_false_positive_rate"].append(
                 float(detection_count > 0)
             )
             if uid is not None:
@@ -235,11 +235,11 @@ def evaluate_batch(
                 )
 
     result = {key: _safe_mean(values) for key, values in metrics.items()}
-    result["false_positives_per_scan"] = (
+    result["sampled_patch_false_detections_per_scan_proxy"] = (
         float(sum(false_positives_by_scan.values()) / len(set(scan_uids)))
         if scan_uids is not None
         and scan_uids
-        and metrics["negative_patch_false_positive_rate"]
+        and metrics["sampled_negative_patch_false_positive_rate"]
         else None
     )
     return result

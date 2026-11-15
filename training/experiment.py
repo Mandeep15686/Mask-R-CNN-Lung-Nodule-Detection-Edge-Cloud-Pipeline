@@ -32,6 +32,10 @@ BASE_CONFIG = {
     "warmup_epochs": 5,
     "epochs": 30,
     "fold": 0,
+    "train_subsets": None,
+    "validation_subset": None,
+    "test_subset": None,
+    "target_spacing_mm": (1.0, 1.0, 1.0),
     "num_workers": 2,
     "data_root": "./data/luna16",
     # Set this to the output of preprocess_cache.py to eliminate SSD bottleneck:

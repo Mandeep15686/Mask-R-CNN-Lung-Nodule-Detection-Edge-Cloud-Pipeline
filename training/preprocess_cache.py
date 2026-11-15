@@ -34,6 +34,8 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 import re
+import tempfile
+from datetime import datetime, timezone
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -46,12 +48,74 @@ from .dataset import (
     extract_patch_2_5d,
     create_spherical_mask,
     patch_overlaps_nodule,
-    HU_MIN,
-    HU_MAX,
+    TARGET_SPACING_MM,
 )
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def validate_cache_manifest(
+    cache_dir: str | Path,
+    expected_uids: Optional[set[str]] = None,
+) -> list[dict]:
+    """Validate manifest structure, subset labels, and every referenced patch."""
+    cache_path = Path(cache_dir)
+    manifest_path = cache_path / "manifest.json"
+    try:
+        with manifest_path.open(encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read valid cache manifest {manifest_path}: {exc}") from exc
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"Cache manifest must be a non-empty JSON list: {manifest_path}")
+
+    seen_files: set[str] = set()
+    manifest_uids: set[str] = set()
+    missing_files: list[str] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Manifest entry {index} must be an object")
+        filename = entry.get("file")
+        uid = entry.get("uid")
+        label = entry.get("label")
+        subset = entry.get("subset")
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".npz")
+            or not isinstance(uid, str)
+            or not uid
+            or type(label) is not int and not isinstance(label, np.integer)
+            or int(label) not in (0, 1)
+            or type(subset) is not int and not isinstance(subset, np.integer)
+            or int(subset) < 0
+        ):
+            raise ValueError(f"Manifest entry {index} has invalid or missing fields")
+        if filename in seen_files:
+            raise ValueError(f"Duplicate patch file in manifest: {filename}")
+        seen_files.add(filename)
+        manifest_uids.add(uid)
+        if not (cache_path / filename).is_file():
+            missing_files.append(filename)
+
+    if missing_files:
+        preview = ", ".join(missing_files[:5])
+        raise FileNotFoundError(
+            f"Cache manifest references {len(missing_files)} missing NPZ file(s): {preview}"
+        )
+    if expected_uids is not None:
+        missing_uids = sorted(set(expected_uids) - manifest_uids)
+        if missing_uids:
+            raise ValueError(
+                f"Cache manifest omits {len(missing_uids)} expected scan(s): "
+                f"{', '.join(missing_uids[:5])}"
+            )
+    if not any(int(entry["label"]) == 1 for entry in entries):
+        raise ValueError("Cache manifest has no positive patches")
+    if not any(int(entry["label"]) == 0 for entry in entries):
+        raise ValueError("Cache manifest has no negative patches")
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +135,14 @@ def _process_volume(args: dict) -> list[dict]:
     neg_count  = args["neg_count"]
     patch_size = args["patch_size"]
     subset     = args["subset"]
+    target_spacing_mm = args.get("target_spacing_mm", TARGET_SPACING_MM)
     out_dir    = Path(args["out_dir"])
 
     try:
-        volume, origin, spacing, direction = load_mhd(mhd_path)
+        volume, origin, spacing, direction = load_mhd(mhd_path, target_spacing_mm)
         volume = clip_and_normalise(volume)
     except Exception as exc:
-        logger.error(f"Failed to load {mhd_path}: {exc}")
-        return []
+        raise RuntimeError(f"Failed to load {mhd_path}: {exc}") from exc
 
     entries = []
     positive_centers = [
@@ -102,8 +166,15 @@ def _process_volume(args: dict) -> list[dict]:
             label=np.int8(1),
             diameter=np.float32(ann["diameter_mm"]),
         )
-        entries.append({"file": fname, "uid": uid, "subset": subset, "label": 1,
-                        "diameter_mm": float(ann["diameter_mm"])})
+        entries.append({
+            "file": fname,
+            "uid": uid,
+            "subset": subset,
+            "label": 1,
+            "diameter_mm": float(ann["diameter_mm"]),
+            "patch_size": patch_size,
+            "spacing_mm": list(target_spacing_mm),
+        })
 
     # ---- Negative patches ------------------------------------------------
     Z, Y, X = volume.shape
@@ -126,8 +197,15 @@ def _process_volume(args: dict) -> list[dict]:
             label=np.int8(0),
             diameter=np.float32(0.0),
         )
-        entries.append({"file": fname, "uid": uid, "subset": subset,
-                        "label": 0, "diameter_mm": 0.0})
+        entries.append({
+            "file": fname,
+            "uid": uid,
+            "subset": subset,
+            "label": 0,
+            "diameter_mm": 0.0,
+            "patch_size": patch_size,
+            "spacing_mm": list(target_spacing_mm),
+        })
         saved_neg += 1
 
     # Prefer LUNA16's labeled class-0 candidates, while still excluding any
@@ -194,6 +272,29 @@ def _process_volume(args: dict) -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 
+def _process_jobs(jobs: list[dict], workers: int) -> tuple[list[dict], list[str]]:
+    entries: list[dict] = []
+    failures: list[str] = []
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_volume, job): job["uid"] for job in jobs}
+            for future in as_completed(futures):
+                uid = futures[future]
+                try:
+                    entries.extend(future.result())
+                except Exception as exc:
+                    failures.append(f"{uid}: {exc}")
+                if len(entries) and len(failures) == 0 and len(entries) % 500 == 0:
+                    logger.info("Generated %d patches so far", len(entries))
+    else:
+        for job in jobs:
+            try:
+                entries.extend(_process_volume(job))
+            except Exception as exc:
+                failures.append(f"{job['uid']}: {exc}")
+                break
+    return entries, failures
+
 def build_cache(
     data_root:  str,
     out_dir:    str,
@@ -201,6 +302,8 @@ def build_cache(
     neg_ratio:  float = 1.0,
     workers:    int   = 4,
     seed:       int   = 42,
+    rebuild:    bool  = False,
+    target_spacing_mm: tuple[float, float, float] = TARGET_SPACING_MM,
 ) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -210,9 +313,11 @@ def build_cache(
     out_path.mkdir(parents=True, exist_ok=True)
 
     manifest_path = out_path / "manifest.json"
-    if manifest_path.exists():
-        logger.info(f"Cache already exists at {out_path}. Delete manifest.json to rebuild.")
-        return
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    target_spacing_mm = tuple(float(v) for v in target_spacing_mm)
+    if len(target_spacing_mm) != 3 or any(v <= 0 for v in target_spacing_mm):
+        raise ValueError("target_spacing_mm must contain three positive values")
 
     # ---- Parse annotations.csv ------------------------------------------
     annotations: dict[str, list[dict]] = {}
@@ -280,40 +385,121 @@ def build_cache(
             "neg_count":  neg_count,
             "patch_size": patch_size,
             "subset":     int(subset_match.group(1)),
-            "out_dir":    str(out_path),
+            "target_spacing_mm": target_spacing_mm,
         })
 
     logger.info(f"Processing {len(jobs)} volumes with {workers} worker(s)…")
 
-    # ---- Run in parallel -------------------------------------------------
-    all_entries: list[dict] = []
-    done = 0
-
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_volume, job): job["uid"] for job in jobs}
-            for fut in as_completed(futures):
-                try:
-                    all_entries.extend(fut.result())
-                except Exception as exc:
-                    logger.error(f"Worker failed for {futures[fut]}: {exc}")
-                done += 1
-                if done % 10 == 0:
-                    logger.info(f"  Progress: {done}/{len(jobs)} volumes done")
-    else:
+    expected_uids = {job["uid"] for job in jobs}
+    expected_positive_count = sum(len(job["positives"]) for job in jobs)
+    expected_negative_count = sum(job["neg_count"] for job in jobs)
+    if manifest_path.exists() and not rebuild:
+        try:
+            existing = validate_cache_manifest(
+                manifest_path.parent, expected_uids=expected_uids
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise RuntimeError(
+                f"Existing cache is incomplete or invalid: {exc}. "
+                "Run again with --rebuild to replace it."
+            ) from exc
+        existing_uids = {entry["uid"] for entry in existing}
+        extra_uids = sorted(existing_uids - expected_uids)
+        if extra_uids:
+            raise RuntimeError(
+                f"Existing cache contains {len(extra_uids)} unexpected scans "
+                f"({', '.join(extra_uids[:5])}); pass --rebuild to replace it."
+            )
+        existing_positive = sum(int(entry["label"]) == 1 for entry in existing)
+        existing_negative = sum(int(entry["label"]) == 0 for entry in existing)
+        existing_patch_sizes = {
+            int(entry["patch_size"])
+            for entry in existing
+            if entry.get("patch_size") is not None
+        }
+        existing_spacings = {
+            tuple(float(v) for v in entry["spacing_mm"])
+            for entry in existing
+            if entry.get("spacing_mm") is not None
+        }
+        if (
+            existing_positive != expected_positive_count
+            or existing_negative != expected_negative_count
+            or existing_patch_sizes != {patch_size}
+            or existing_spacings != {target_spacing_mm}
+        ):
+            raise RuntimeError(
+                "Existing cache does not match requested patch counts/size/spacing; "
+                "pass --rebuild to replace it."
+            )
+        logger.info(
+            "Valid cache already exists at %s (%d patches); leaving it unchanged.",
+            out_path, len(existing),
+        )
+        return
+    if not manifest_path.exists() and not rebuild and any(out_path.glob("*.npz")):
+        raise RuntimeError(
+            f"NPZ files exist without a manifest in {out_path}; this looks like a "
+            "partial cache. Run again with --rebuild to replace it."
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{out_path.name}-build-", dir=out_path.parent) as stage:
         for job in jobs:
-            all_entries.extend(_process_volume(job))
-            done += 1
-            if done % 10 == 0:
-                logger.info(f"  Progress: {done}/{len(jobs)} volumes done")
+            job["out_dir"] = stage
+        all_entries, failures = _process_jobs(jobs, workers)
+        if failures:
+            raise RuntimeError(
+                "Cache generation failed; no manifest was written: "
+                + "; ".join(failures[:5])
+            )
 
-    # ---- Write manifest --------------------------------------------------
-    random.shuffle(all_entries)
-    with open(manifest_path, "w") as f:
-        json.dump(all_entries, f, indent=2)
+        pos_count = sum(int(e["label"]) == 1 for e in all_entries)
+        neg_count = sum(int(e["label"]) == 0 for e in all_entries)
+        if pos_count != expected_positive_count or neg_count != expected_negative_count:
+            raise RuntimeError(
+                "Patch generation was incomplete; no manifest was written. "
+                f"Expected {expected_positive_count} positive and "
+                f"{expected_negative_count} negative patches, got "
+                f"{pos_count} positive and {neg_count} negative."
+            )
 
-    pos_count = sum(1 for e in all_entries if e["label"] == 1)
-    neg_count = sum(1 for e in all_entries if e["label"] == 0)
+        random.shuffle(all_entries)
+        stage_path = Path(stage)
+        stage_manifest = stage_path / "manifest.json"
+        with stage_manifest.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(all_entries, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        validate_cache_manifest(stage_path, expected_uids=expected_uids)
+
+        # Publish the complete directory atomically. When rebuilding, keep
+        # the replaced cache as a timestamped backup rather than deleting it.
+        backup_path = None
+        if out_path.exists():
+            if not rebuild and any(out_path.iterdir()):
+                raise RuntimeError(
+                    f"Output directory {out_path} is not empty; pass --rebuild "
+                    "to replace it."
+                )
+            if rebuild:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                backup_path = out_path.with_name(f"{out_path.name}.backup-{stamp}")
+                suffix = 1
+                while backup_path.exists():
+                    backup_path = out_path.with_name(
+                        f"{out_path.name}.backup-{stamp}-{suffix}"
+                    )
+                    suffix += 1
+                os.replace(out_path, backup_path)
+            else:
+                out_path.rmdir()
+        try:
+            os.replace(stage_path, out_path)
+        except Exception:
+            if backup_path is not None and backup_path.exists() and not out_path.exists():
+                os.replace(backup_path, out_path)
+            raise
+
     logger.info(
         f"\nCache built successfully at {out_path}\n"
         f"  Total patches : {len(all_entries)}\n"
@@ -337,6 +523,13 @@ if __name__ == "__main__":
     parser.add_argument("--neg_ratio",  type=float, default=1.0,        help="Negatives per positive")
     parser.add_argument("--workers",    type=int,   default=4,          help="Parallel workers")
     parser.add_argument("--seed",       type=int,   default=42,         help="Random seed")
+    parser.add_argument("--rebuild",    action="store_true",           help="Rebuild an existing or partial cache")
+    parser.add_argument(
+        "--target-spacing-mm", type=float, nargs=3,
+        default=TARGET_SPACING_MM,
+        metavar=("X", "Y", "Z"),
+        help="Resample CTs to this physical spacing in mm (default: 1 1 1)",
+    )
     args = parser.parse_args()
 
     build_cache(
@@ -346,4 +539,6 @@ if __name__ == "__main__":
         neg_ratio  = args.neg_ratio,
         workers    = args.workers,
         seed       = args.seed,
+        rebuild    = args.rebuild,
+        target_spacing_mm=tuple(args.target_spacing_mm),
     )
