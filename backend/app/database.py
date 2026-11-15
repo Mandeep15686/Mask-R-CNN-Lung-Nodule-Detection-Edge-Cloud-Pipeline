@@ -70,6 +70,7 @@ class TrainingRun(Base):
     val_specificity = Column(Float, nullable=True)
     val_asd = Column(Float, nullable=True)
     val_vol_err = Column(Float, nullable=True)
+    val_total_loss = Column(Float, nullable=True)
     lr = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     experiment = relationship("Experiment", back_populates="runs")
@@ -135,6 +136,13 @@ class NetworkLog(Base):
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    # Additive SQLite migration for validation loss; preserves existing runs.
+    if "sqlite" in DATABASE_URL:
+        from sqlalchemy import inspect, text
+        columns = {column["name"] for column in inspect(engine).get_columns("training_runs")}
+        if "val_total_loss" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE training_runs ADD COLUMN val_total_loss FLOAT"))
 
 
 def get_db() -> Generator[Session, None, None]:

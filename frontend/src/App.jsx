@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
 import {
-  LayoutDashboard, FlaskConical, BarChart3,
+  LayoutDashboard, FlaskConical, BarChart3, Database,
   Scan, Network, Menu, X, Activity,
 } from "lucide-react";
 import Dashboard     from "./pages/Dashboard.jsx";
@@ -9,6 +9,7 @@ import Experiments   from "./pages/Experiments.jsx";
 import Leaderboard   from "./pages/Leaderboard.jsx";
 import InferencePage from "./pages/InferencePage.jsx";
 import EdgeNetwork   from "./pages/EdgeNetwork.jsx";
+import DatasetModel  from "./pages/DatasetModel.jsx";
 import clsx from "clsx";
 
 const NAV = [
@@ -17,6 +18,7 @@ const NAV = [
   { to: "/leaderboard",  label: "Leaderboard",  icon: BarChart3       },
   { to: "/inference",    label: "Inference",    icon: Scan            },
   { to: "/edge",         label: "Edge Network", icon: Network         },
+  { to: "/dataset-model",label: "Dataset & Models", icon: Database    },
 ];
 
 function Sidebar({ open, setOpen }) {
@@ -123,6 +125,7 @@ export default function App() {
             <Route path="/leaderboard" element={<Leaderboard />}   />
             <Route path="/inference"   element={<InferencePage />} />
             <Route path="/edge"        element={<EdgeNetwork />}   />
+            <Route path="/dataset-model" element={<DatasetModel />} />
           </Routes>
         </main>
       </div>

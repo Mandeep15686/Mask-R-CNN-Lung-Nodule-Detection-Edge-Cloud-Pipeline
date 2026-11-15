@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
-import { api } from "../services/api.js";
+import { api, openTrainingWS } from "../services/api.js";
 import { Plus, Play, Trash2, ChevronDown, ChevronRight, Loader2, AlertCircle, Terminal } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend,
@@ -266,6 +266,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
   const [logs, setLogs] = useState("");
   const [loading, setLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const [streamState, setStreamState] = useState("idle");
   const logRef = useRef(null);
   const displayStatus = details?.status ?? exp.status;
 
@@ -273,8 +274,11 @@ function ExperimentRow({ exp, onDelete, onStart }) {
     if (!expanded) return undefined;
     let active = true;
     let inFlight = false;
+    let fallbackTimer = null;
+    let startupTimer = null;
+    let socket = null;
     const refresh = async () => {
-      if (inFlight) return;
+      if (inFlight || !active) return;
       inFlight = true;
       try {
         const snapshot = await api.getExperimentDetails(exp.id);
@@ -290,12 +294,36 @@ function ExperimentRow({ exp, onDelete, onStart }) {
         if (active) setLoading(false);
       }
     };
+    const enableFallback = () => {
+      if (!active || fallbackTimer) return;
+      setStreamState("polling");
+      fallbackTimer = window.setInterval(refresh, 5000);
+      void refresh();
+    };
     setLoading(true);
-    refresh();
-    const timer = displayStatus === "running" ? setInterval(refresh, 5000) : null;
+    void refresh();
+    if (displayStatus === "running") {
+      setStreamState("connecting");
+      socket = openTrainingWS(exp.id, (message) => {
+        if (!message?.ping && active) {
+          setStreamState("connected");
+          void refresh();
+        }
+      }, () => enableFallback(), () => {
+        if (startupTimer) window.clearTimeout(startupTimer);
+        setStreamState("connected");
+      });
+      startupTimer = window.setTimeout(() => {
+        if (socket?.readyState !== WebSocket.OPEN) enableFallback();
+      }, 2500);
+    } else {
+      setStreamState("idle");
+    }
     return () => {
       active = false;
-      if (timer) clearInterval(timer);
+      if (startupTimer) window.clearTimeout(startupTimer);
+      if (fallbackTimer) window.clearInterval(fallbackTimer);
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
     };
   }, [expanded, exp.id, displayStatus]);
 
@@ -360,6 +388,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
         <div className="mt-5 space-y-5 border-t border-slate-800 pt-5">
           {loading && <div className="text-xs text-slate-400 flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading run details...</div>}
           {detailError && <div className="text-sm text-red-400">{detailError}</div>}
+          {displayStatus === "running" && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-cyan-500/15 bg-cyan-500/5 px-3 py-2 text-[11px]"><span className="text-cyan-100">Live experiment monitor</span><span className={streamState === "connected" ? "text-emerald-300" : streamState === "polling" ? "text-amber-200" : "text-slate-400"}>{streamState === "connected" ? "WebSocket connected" : streamState === "polling" ? "WebSocket unavailable · polling every 5 seconds" : "Connecting to progress stream…"}</span><span className="text-slate-400">Epoch {runs.at(-1)?.epoch ?? 0}/{config.epochs ?? "—"} · loss {shown(runs.at(-1)?.train_total_loss)} · Dice {shown(runs.at(-1)?.val_dice)} · HD95 {shown(runs.at(-1)?.val_hd95, 2)} mm · LR {shown(runs.at(-1)?.lr, 6)}</span></div>}
 
           <section>
             <h3 className="text-sm font-semibold text-white mb-3">Run configuration</h3>
@@ -442,13 +471,13 @@ function ExperimentRow({ exp, onDelete, onStart }) {
               <div className="overflow-x-auto rounded border border-slate-800">
                 <table className="min-w-[1450px] w-full text-xs">
                   <thead className="bg-slate-900 text-slate-400">
-                    <tr>{["Epoch", "LR", "Train total", "BCE", "Dice loss", "Boundary", "Focal", "HD loss", "Val Dice", "IoU", "HD95", "Boundary F1", "Sensitivity", "Specificity", "ASD", "Volume error %"].map((h) => <th key={h} className="p-2 text-right first:text-left">{h}</th>)}</tr>
+                    <tr>{["Epoch", "LR", "Train total", "Validation loss", "BCE", "Dice loss", "Boundary", "Focal", "HD loss", "Val Dice", "IoU", "HD95", "Boundary F1", "Sensitivity", "Specificity", "ASD", "Volume error %"].map((h) => <th key={h} className="p-2 text-right first:text-left">{h}</th>)}</tr>
                   </thead>
                   <tbody>
                     {runs.map((run) => (
                       <tr key={run.id} className="border-t border-slate-800/70 text-slate-300">
                         <td className="p-2">{run.epoch}</td>
-                        {[run.lr, run.train_total_loss, run.train_bce_loss, run.train_dice_loss,
+                        {[run.lr, run.train_total_loss, run.val_total_loss, run.train_bce_loss, run.train_dice_loss,
                           run.train_boundary_loss, run.train_focal_loss, run.train_hd_loss,
                           run.val_dice, run.val_iou, run.val_hd95, run.val_boundary_f1,
                           run.val_sensitivity, run.val_specificity, run.val_asd, run.val_vol_err]
@@ -485,14 +514,19 @@ export default function Experiments() {
   const [loading, setLoading]         = useState(true);
   const [showForm, setShowForm]       = useState(false);
   const [filterStatus, setFilter]     = useState("");
+  const [loadError, setLoadError]     = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api.listExperiments(filterStatus ? { status: filterStatus } : {});
       setExperiments(data);
-    } catch {}
-    setLoading(false);
+      setLoadError("");
+    } catch (error) {
+      setLoadError(error.message || "Could not load experiments");
+    } finally {
+      setLoading(false);
+    }
   }, [filterStatus]);
 
   useEffect(() => { load(); }, [load]);
@@ -527,6 +561,8 @@ export default function Experiments() {
 
       {/* Create form */}
       {showForm && <CreateForm onCreated={() => { load(); setShowForm(false); }} />}
+
+      {loadError && <div className="card border-rose-500/20 text-sm text-rose-200" role="alert">{loadError}</div>}
 
       {/* List */}
       {loading ? (

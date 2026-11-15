@@ -477,6 +477,7 @@ def _log_epoch_to_db(exp_id: int, fold: int, epoch: int, train_m: dict, val_m: d
             val_specificity=val_m.get("val_specificity"),
             val_asd=val_m.get("val_asd"),
             val_vol_err=val_m.get("val_vol_err"),
+            val_total_loss=val_m.get("val_total"),
         )
         db.add(run)
         db.commit()

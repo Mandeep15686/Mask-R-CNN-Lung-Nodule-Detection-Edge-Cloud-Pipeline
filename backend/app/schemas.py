@@ -114,6 +114,7 @@ class TrainingRunResponse(BaseModel):
     val_specificity: Optional[float]
     val_asd: Optional[float]
     val_vol_err: Optional[float]
+    val_total_loss: Optional[float] = None
     lr: Optional[float]
     created_at: datetime
 
@@ -213,6 +214,7 @@ class NetworkLogResponse(BaseModel):
     payload_size_kb: float
     inference_time_ms: float
     split_layer: str
+    compression_method: str
     compression_ratio: float
 
     model_config = {"from_attributes": True}
@@ -232,3 +234,41 @@ class ExperimentSummaryResponse(BaseModel):
     final_boundary_f1: Optional[float]
     total_epochs: int
     status: str
+
+
+class DashboardHealthResponse(BaseModel):
+    overall: Literal["healthy", "degraded", "unavailable", "unknown"]
+    updated_at: datetime
+    architecture: str
+    device: Optional[str] = None
+    gpu_name: Optional[str] = None
+    statuses: dict[str, dict[str, Any]]
+
+
+class DashboardSummaryResponse(BaseModel):
+    experiment_counts: dict[str, int]
+    inference_requests: int
+    active_edge_nodes: int
+    recorded_network_requests: int
+    best_experiment: Optional[dict[str, Any]] = None
+    recent_experiments: list[dict[str, Any]]
+
+
+class DashboardActivityEvent(BaseModel):
+    timestamp: datetime
+    event: str
+    detail: str
+    source: str
+    entity_id: Optional[str] = None
+
+
+class SystemMetricsResponse(BaseModel):
+    cpu_percent: Optional[float] = None
+    ram_used_bytes: Optional[int] = None
+    ram_total_bytes: Optional[int] = None
+    gpu_name: Optional[str] = None
+    gpu_memory_used_bytes: Optional[int] = None
+    gpu_memory_total_bytes: Optional[int] = None
+    gpu_utilization_percent: Optional[float] = None
+    gpu_temperature_c: Optional[float] = None
+    updated_at: datetime

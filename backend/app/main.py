@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .database import create_tables
 from .data_config import runtime_data_info
-from .routes import inference, experiments, results, edge
+from .routes import inference, experiments, results, edge, dashboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +60,7 @@ app.include_router(inference.router,   prefix="/api/inference",   tags=["Inferen
 app.include_router(experiments.router, prefix="/api/experiments", tags=["Experiments"])
 app.include_router(results.router,     prefix="/api/results",     tags=["Results"])
 app.include_router(edge.router,        prefix="/api/edge",        tags=["Edge"])
+app.include_router(dashboard.router,   prefix="/api/dashboard",   tags=["Dashboard"])
 
 
 @app.get("/health")

@@ -1,4 +1,5 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../services/api.js";
 import { Upload, Loader2, AlertCircle, Eye, CheckCircle, XCircle, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 
@@ -115,6 +116,7 @@ function NoduleCanvas({ imageUrl, nodules, inferenceRan, zoom }) {
 // Main Inference Page
 // ---------------------------------------------------------------------------
 export default function InferencePage() {
+  const [searchParams] = useSearchParams();
   const [file, setFile]         = useState(null);
   const [imageUrl, setUrl]      = useState(null);
   const [scanUid, setScanUid]   = useState("");
@@ -135,6 +137,15 @@ export default function InferencePage() {
       setModelStatus({ model_loaded: false, model_loading_error: e.message });
     });
   }, []);
+
+  useEffect(() => {
+    const requestedExperiment = searchParams.get("experiment_id");
+    if (requestedExperiment) setExpId(requestedExperiment);
+  }, [searchParams]);
+
+  useEffect(() => () => {
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+  }, [imageUrl]);
 
   const chooseFile = useCallback(async (f) => {
     if (!f) return;
@@ -200,6 +211,7 @@ export default function InferencePage() {
         <p className="text-sm text-slate-400">
           Upload an exported 64×64 RGB 2.5D patch. R, G and B must contain axial z−1, z and z+1 slices in that order. This page does not accept full CT scans or a single grayscale slice.
         </p>
+        <p className="mt-1 text-[11px] text-amber-200/80">Research output only. A model prediction is not a medical diagnosis.</p>
       </div>
 
       <div className="grid lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)] gap-6">
@@ -218,6 +230,7 @@ export default function InferencePage() {
               {file ? file.name : "Drop a 64×64 RGB 2.5D PNG/JPEG here\nor click to browse"}
             </div>
             {file && <div className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB</div>}
+            {file && <div className="badge badge-green">File and 64×64 dimensions accepted · backend validates true RGB mode</div>}
             <input ref={fileRef} type="file" accept="image/png,image/jpeg" className="hidden" onChange={onFileChange} />
           </div>
 
@@ -421,7 +434,7 @@ export default function InferencePage() {
           <table className="w-full text-xs">
             <thead>
               <tr className="border-b border-slate-800">
-                {["ID","Scan UID","Nodules","Avg Score","Source","Time (ms)","At"].map(h => (
+                {["ID","Input / scan UID","Model version","Detections","Mean confidence","Source","Duration","Timestamp","Status"].map(h => (
                   <th key={h} className="text-left py-2 px-3 text-slate-400 uppercase tracking-wider">{h}</th>
                 ))}
               </tr>
@@ -436,6 +449,7 @@ export default function InferencePage() {
                   <tr key={r.id} className="border-b border-slate-800/50 hover:bg-slate-800/30">
                     <td className="py-2 px-3 text-slate-400">#{r.id}</td>
                     <td className="py-2 px-3 font-mono text-cyan-400">{r.scan_uid}</td>
+                    <td className="py-2 px-3 text-purple-200">{experiments.find((experiment) => experiment.id === r.experiment_id)?.config_id || "Default checkpoint"}</td>
                     <td className="py-2 px-3">{nodules.length}</td>
                     <td className="py-2 px-3 text-green-400">
                       {avg != null ? `${(avg * 100).toFixed(1)}%` : "—"}
@@ -443,13 +457,14 @@ export default function InferencePage() {
                     <td className="py-2 px-3">
                       <span className={`badge ${r.source === "edge" ? "badge-purple" : "badge-cyan"}`}>{r.source}</span>
                     </td>
-                    <td className="py-2 px-3 text-slate-400">{r.inference_time_ms?.toFixed(1) ?? "—"}</td>
-                    <td className="py-2 px-3 text-slate-500">{new Date(r.created_at).toLocaleTimeString()}</td>
+                    <td className="py-2 px-3 text-slate-400">{r.inference_time_ms?.toFixed(1) ?? "—"} ms</td>
+                    <td className="py-2 px-3 text-slate-500">{new Date(r.created_at).toLocaleString()}</td>
+                    <td className="py-2 px-3"><span className="badge badge-green">Succeeded</span></td>
                   </tr>
                 );
               })}
               {history.length === 0 && (
-                <tr><td colSpan={7} className="py-6 text-center text-slate-500">No inference history yet</td></tr>
+                <tr><td colSpan={9} className="py-6 text-center text-slate-500">No inference history yet</td></tr>
               )}
             </tbody>
           </table>

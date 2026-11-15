@@ -21,6 +21,11 @@ export const api = {
   // Dashboard stats
   getStats: ()                    => http.get("/results/stats"),
   getInfo:  ()                    => http.get("/info"),
+  getDashboardHealth:   ()         => http.get("/dashboard/health"),
+  getDashboardSummary:  ()         => http.get("/dashboard/summary"),
+  getDashboardActivity: (params={})=> http.get("/dashboard/activity", { params }),
+  getDatasetStatus:     ()         => http.get("/dashboard/dataset"),
+  getSystemMetrics:     ()         => http.get("/dashboard/system-metrics"),
 
   // Experiments CRUD
   listExperiments: (params = {})  => http.get("/experiments/", { params }),
@@ -35,8 +40,8 @@ export const api = {
   getLearningCurve:(id)           => http.get(`/results/experiment/${id}/learning-curve`),
 
   // Leaderboard
-  getLeaderboard:  ()             => http.get("/results/leaderboard"),
-  getPareto:       ()             => http.get("/results/pareto"),
+  getLeaderboard:  (params = {})  => http.get("/results/leaderboard", { params }),
+  getPareto:       (params = {})  => http.get("/results/pareto", { params }),
 
   // Inference
   getInferenceStatus:()           => http.get("/inference/status"),
@@ -54,13 +59,14 @@ export const api = {
 };
 
 // WebSocket helper for live training progress
-export function openTrainingWS(experimentId, onMessage, onClose) {
+export function openTrainingWS(experimentId, onMessage, onClose, onOpen) {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const host  = window.location.host;
   const ws    = new WebSocket(`${proto}://${host}/api/experiments/${experimentId}/ws`);
   ws.onmessage = (e) => {
-    try { onMessage(JSON.parse(e.data)); } catch {}
+    try { onMessage(JSON.parse(e.data)); } catch { /* Ignore malformed progress frames. */ }
   };
+  ws.onopen = onOpen;
   ws.onclose   = onClose;
   ws.onerror   = (e) => console.error("WS error", e);
   return ws;
