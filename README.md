@@ -146,21 +146,41 @@ mkdir -p data/luna16
 ### Phase 1 — Single-loss ablations (6 experiments)
 ```bash
 python scripts/run_experiments.py --phase 1 \
-  --data ./data/luna16 --out ./experiments --epochs 30
+  --data ./data/luna16 --cache-dir ./data/patches_cache_v2 \
+  --out ./experiments --epochs 30
 ```
 
 ### Phase 2 — Grid search (α, β, γ)
 ```bash
 python scripts/run_experiments.py --phase 2 \
-  --data ./data/luna16 --out ./experiments \
-  --epochs 30 --max-configs 40
+  --data ./data/luna16 --cache-dir ./data/patches_cache_v2 \
+  --out ./experiments --epochs 30 --max-configs 20
 ```
+When `--max-configs` is set, Phase 2 selects a reproducible random sample
+from the full grid using seed 42 instead of taking the first grid entries.
 
 ### Phase 3 — Bayesian optimisation (Optuna)
 ```bash
 python scripts/run_experiments.py --phase 3 \
-  --data ./data/luna16 --out ./experiments --n-trials 100
+  --data ./data/luna16 --cache-dir ./data/patches_cache_v2 \
+  --out ./experiments --n-trials 100
 ```
+
+### Evaluation and research limitations
+
+Choose an evaluation fold explicitly and keep it independent of training and
+model selection. For example, use `--fold 9` only when `subset9` is present and
+has not been used during development. With only `subset0` and `subset1`, there
+is no independent test subset if one fold is used for training and the other
+for validation. The evaluator's sampled-patch FROC proxy is not official
+scan-level LUNA16 FROC.
+
+Segmentation masks are generated spherical/elliptical approximations from
+nodule centers and diameters, not expert-drawn contours. Report segmentation
+metrics as agreement with generated masks. CT volumes are not currently
+resampled to a common physical spacing, so adjacent-slice thickness and the
+physical sizes represented by pixel anchors vary across scans; investigate
+resampling before final research comparisons.
 
 ### Via the UI
 1. Open **http://localhost:3000/experiments**

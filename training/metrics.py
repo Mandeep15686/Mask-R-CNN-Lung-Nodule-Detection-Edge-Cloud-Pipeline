@@ -176,36 +176,73 @@ def evaluate_batch(
     preds: np.ndarray,
     targets: np.ndarray,
     threshold: float = 0.5,
+    scan_uids: list[str] | None = None,
+    false_positive_detections: list[int] | None = None,
 ) -> dict[str, float | None]:
     """
     Evaluate a batch of predictions.
     preds:   (N, H, W) sigmoid probabilities [0,1]
     targets: (N, H, W) binary masks
+    scan_uids: optional scan UID per patch, for scan-normalized false positives
+    false_positive_detections: optional count of predicted instances per patch
     """
+    if scan_uids is not None and len(scan_uids) != len(preds):
+        raise ValueError("scan_uids must contain one UID per prediction")
+    if (
+        false_positive_detections is not None
+        and len(false_positive_detections) != len(preds)
+    ):
+        raise ValueError("false_positive_detections must contain one count per prediction")
+
     pred_bin = (preds > threshold).astype(np.uint8)
     metrics: dict[str, list] = {
-        "dice": [], "iou": [], "sensitivity": [], "specificity": [],
+        "dice": [], "positive_dice": [], "iou": [],
+        "sensitivity": [], "specificity": [],
         "hd95": [], "boundary_f1": [], "asd": [], "vol_err": [],
+        "negative_patch_false_positive_rate": [],
     }
+    false_positives_by_scan: dict[str, int] = {}
 
     for i in range(len(preds)):
         p, t = pred_bin[i], targets[i]
         has_gt = bool(np.any(t))
-        # Specificity is defined over negatives and positives, so keep all
-        # samples. Foreground overlap/sensitivity/surface metrics are averaged
-        # over GT-positive samples only; empty-empty cases otherwise inflate
-        # Dice and boundary scores or deflate distance scores.
+        # Keep foreground overlap metrics on positive patches and separately
+        # report false-positive behavior on negative patches.
         metrics["specificity"].append(specificity(p, t))
         if has_gt:
-            metrics["dice"].append(dice_score(p, t))
+            positive_dice = dice_score(p, t)
+            metrics["dice"].append(positive_dice)
+            metrics["positive_dice"].append(positive_dice)
             metrics["iou"].append(iou_score(p, t))
             metrics["sensitivity"].append(sensitivity(p, t))
             metrics["hd95"].append(hausdorff_distance_95(p, t))
             metrics["boundary_f1"].append(boundary_f1(p, t))
             metrics["asd"].append(average_surface_distance(p, t))
             metrics["vol_err"].append(volume_error_percent(p, t))
+        else:
+            uid = scan_uids[i] if scan_uids is not None else None
+            detection_count = (
+                int(false_positive_detections[i])
+                if false_positive_detections is not None
+                else int(np.any(p))
+            )
+            metrics["negative_patch_false_positive_rate"].append(
+                float(detection_count > 0)
+            )
+            if uid is not None:
+                false_positives_by_scan[uid] = (
+                    false_positives_by_scan.get(uid, 0) + detection_count
+                )
 
-    return {key: _safe_mean(values) for key, values in metrics.items()}
+    result = {key: _safe_mean(values) for key, values in metrics.items()}
+    result["false_positives_per_scan"] = (
+        float(sum(false_positives_by_scan.values()) / len(set(scan_uids)))
+        if scan_uids is not None
+        and scan_uids
+        and metrics["negative_patch_false_positive_rate"]
+        else None
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

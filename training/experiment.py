@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import itertools
+import random
 from pathlib import Path
 from copy import deepcopy
 from typing import Optional
@@ -204,8 +205,11 @@ class ExperimentRunner:
     def run_phase2(self, max_configs: Optional[int] = None):
         logger.info("=== PHASE 2: Grid search (alpha, beta, gamma) ===")
         configs = generate_phase2_configs()
-        if max_configs:
-            configs = configs[:max_configs]
+        if max_configs is not None:
+            if max_configs < 1:
+                raise ValueError("max_configs must be at least 1")
+            if max_configs < len(configs):
+                configs = random.Random(42).sample(configs, k=max_configs)
         logger.info(f"Running {len(configs)} configurations...")
         for i, cfg_override in enumerate(configs):
             logger.info(f"[{i+1}/{len(configs)}] {cfg_override['config_id']}")

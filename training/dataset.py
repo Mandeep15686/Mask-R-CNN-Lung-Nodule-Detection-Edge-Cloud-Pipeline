@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -89,6 +90,30 @@ def voxel_to_world(voxel, origin, spacing, direction=None):
     else:
         direction = np.asarray(direction, dtype=np.float64).reshape(3, 3)
     return origin + direction @ (voxel * spacing)
+
+
+def patch_overlaps_nodule(
+    patch_center_vox,
+    nodule_center_vox,
+    diameter_mm: float,
+    spacing,
+    patch_size: int,
+    safety_margin_mm: float = 2.0,
+) -> bool:
+    """Return whether a 2.5D patch intersects an annotated nodule buffer."""
+    patch_center_vox = np.asarray(patch_center_vox, dtype=np.float64)
+    nodule_center_vox = np.asarray(nodule_center_vox, dtype=np.float64)
+    spacing = np.asarray(spacing, dtype=np.float64)
+
+    half = patch_size / 2.0
+    xy_extent = max(half - 0.5, 0.0)
+    voxel_gaps = np.array([
+        max(abs(nodule_center_vox[0] - patch_center_vox[0]) - xy_extent, 0.0),
+        max(abs(nodule_center_vox[1] - patch_center_vox[1]) - xy_extent, 0.0),
+        max(abs(nodule_center_vox[2] - patch_center_vox[2]) - 1.0, 0.0),
+    ])
+    distance_mm = float(np.linalg.norm(voxel_gaps * spacing))
+    return distance_mm <= (float(diameter_mm) / 2.0 + safety_margin_mm)
 
 
 def clip_and_normalise(volume: np.ndarray) -> np.ndarray:
@@ -300,6 +325,9 @@ class LUNA16Dataset(Dataset):
                 logger.warning(f"Subset directory not found: {subset_dir}")
                 continue
             for mhd_file in sorted(subset_dir.glob("*.mhd")):
+                if not re.fullmatch(r"\d+(?:\.\d+)+", mhd_file.stem):
+                    logger.warning("Skipping non-standard LUNA16 scan filename: %s", mhd_file)
+                    continue
                 uid = mhd_file.stem
                 positives_for_uid = self.annotations.get(uid, [])
                 for ann in positives_for_uid:
@@ -356,6 +384,7 @@ class LUNA16Dataset(Dataset):
         origin: np.ndarray,
         spacing: np.ndarray,
         direction: np.ndarray,
+        positive_annotations: list[dict],
     ) -> np.ndarray:
         """
         Sample a random voxel from the volume interior.
@@ -363,23 +392,39 @@ class LUNA16Dataset(Dataset):
         (normalised HU < 0.036 ≈ below -950 HU) and volume edges only.
         For a proper lung mask, run a lung segmentation algorithm first.
         """
-        # Avoid pure air (background) voxels
+        # Avoid pure air (background) voxels and patches near annotated nodules.
         interior = np.where(volume[1:-1] > 0.036)   # skip first/last slice
-        if interior[0].size == 0:
-            cz = volume.shape[0] // 2
-            half = self.patch_size // 2
-            cy = random.randint(half, volume.shape[1] - half - 1)
-            cx = random.randint(half, volume.shape[2] - half - 1)
-        else:
-            # Pick a random interior voxel, then jitter in XY
-            pick = random.randint(0, interior[0].size - 1)
-            cz = int(interior[0][pick]) + 1   # +1 because we skipped first slice
-            half = self.patch_size // 2
-            cy = random.randint(half, volume.shape[1] - half - 1)
-            cx = random.randint(half, volume.shape[2] - half - 1)
+        positive_regions = [
+            (
+                world_to_voxel(ann["coord"], origin, spacing, direction),
+                ann["diameter_mm"],
+            )
+            for ann in positive_annotations
+        ]
+        half = self.patch_size // 2
+        for _ in range(128):
+            if interior[0].size == 0:
+                cz = volume.shape[0] // 2
+                cy = random.randint(half, volume.shape[1] - half - 1)
+                cx = random.randint(half, volume.shape[2] - half - 1)
+            else:
+                # Pick a non-air voxel, then jitter in XY.
+                pick = random.randint(0, interior[0].size - 1)
+                cz = int(interior[0][pick]) + 1
+                cy = random.randint(half, volume.shape[1] - half - 1)
+                cx = random.randint(half, volume.shape[2] - half - 1)
 
-        vox = np.array([cx, cy, cz], dtype=float)
-        return voxel_to_world(vox, origin, spacing, direction)
+            vox = np.array([cx, cy, cz], dtype=np.float64)
+            if any(
+                patch_overlaps_nodule(vox, center, diameter, spacing, self.patch_size)
+                for center, diameter in positive_regions
+            ):
+                continue
+            return voxel_to_world(vox, origin, spacing, direction)
+
+        raise RuntimeError(
+            "Unable to sample an annotation-safe negative patch after 128 attempts"
+        )
 
     def __len__(self) -> int:
         return len(self.all_samples)
@@ -391,7 +436,13 @@ class LUNA16Dataset(Dataset):
         if sample["label"] == 1:
             coord_world = sample["coord_world"]
         else:
-            coord_world = self._random_lung_coord(volume, origin, spacing, direction)
+            coord_world = self._random_lung_coord(
+                volume,
+                origin,
+                spacing,
+                direction,
+                self.annotations.get(sample["uid"], []),
+            )
 
         center_vox = world_to_voxel(coord_world, origin, spacing, direction)
         patch = extract_patch_2_5d(volume, center_vox, self.patch_size)

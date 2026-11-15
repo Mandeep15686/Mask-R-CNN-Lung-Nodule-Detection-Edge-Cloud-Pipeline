@@ -77,6 +77,7 @@ async def create_experiment(
             "fold": payload.fold,
             "lr": payload.lr,
             "data_root": payload.data_root,
+            "cache_dir": payload.cache_dir or os.getenv("LUNA16_CACHE_DIR"),
         },
     )
     db.add(exp)
@@ -194,6 +195,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
         # Build full config
         full_cfg = {
             **experiment_config,
+            "cache_dir": experiment_config.get("cache_dir") or os.getenv("LUNA16_CACHE_DIR"),
             "config_id": experiment_id,
             "mask_loss": {
                 "alpha": exp.alpha,

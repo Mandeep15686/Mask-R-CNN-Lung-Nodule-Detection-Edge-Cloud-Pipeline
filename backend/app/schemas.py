@@ -35,6 +35,11 @@ class ExperimentCreate(BaseModel):
     fold: int = Field(0, ge=0, le=9)
     lr: float = Field(0.005, gt=0)
     data_root: str = Field("./data/luna16")
+    cache_dir: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description="Pre-extracted LUNA16 patch cache directory",
+    )
 
 
 class ExperimentResponse(BaseModel):

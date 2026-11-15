@@ -19,6 +19,7 @@ Usage:
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -67,7 +68,7 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             from pathlib import Path as _Path
             from .dataset import LUNA16Dataset
 
-            _root = _Path(data_root)
+            _root = _Path(data_root).expanduser().resolve()
             _all_subsets = sorted(
                 int(p.name.removeprefix("subset"))
                 for p in _root.glob("subset*")
@@ -77,19 +78,58 @@ def _flower_client(client_id: int, data_root: str, config: dict):
                 raise ValueError(f"No LUNA16 subsets found under {data_root}")
 
             client_subset = _all_subsets[client_id % len(_all_subsets)]
+            subset_dir = _root / f"subset{client_subset}"
+            scan_uids = sorted(
+                path.stem
+                for path in subset_dir.glob("*.mhd")
+                if re.fullmatch(r"\d+(?:\.\d+)+", path.stem)
+            )
+            if len(scan_uids) < 2:
+                raise ValueError(
+                    f"Federated client {client_id} subset{client_subset} needs at "
+                    f"least two standard CT scans for scan-level train/validation "
+                    f"separation; found {len(scan_uids)}"
+                )
+            val_fraction = float(config.get("validation_fraction", 0.2))
+            if not 0.0 < val_fraction < 1.0:
+                raise ValueError("validation_fraction must be between 0 and 1")
+            rng = np.random.default_rng(int(config.get("split_seed", 42)) + client_id)
+            shuffled_uids = [
+                str(uid)
+                for uid in np.asarray(scan_uids)[rng.permutation(len(scan_uids))]
+            ]
+            val_count = min(max(1, round(len(scan_uids) * val_fraction)), len(scan_uids) - 1)
+            val_uids = set(shuffled_uids[:val_count])
+            train_uids = set(shuffled_uids[val_count:])
 
+            train_ds = LUNA16Dataset(
+                data_root, [client_subset],
+                patch_size=config.get("patch_size", 64), augment=True,
+            )
+            val_ds = LUNA16Dataset(
+                data_root, [client_subset],
+                patch_size=config.get("patch_size", 64), augment=False,
+            )
+            train_ds.all_samples = [s for s in train_ds.all_samples if s["uid"] in train_uids]
+            val_ds.all_samples = [s for s in val_ds.all_samples if s["uid"] in val_uids]
+            if not train_ds.all_samples or not val_ds.all_samples:
+                raise ValueError(
+                    f"Client {client_id} subset{client_subset} produced an empty "
+                    "scan-level train or validation split"
+                )
             self.train_loader = torch.utils.data.DataLoader(
-                LUNA16Dataset(data_root, [client_subset],
-                            patch_size=config.get("patch_size", 64), augment=True),
+                train_ds,
                 batch_size=config.get("batch_size", 4), shuffle=True, num_workers=0,
             )
             self.val_loader = torch.utils.data.DataLoader(
-                LUNA16Dataset(data_root, [client_subset],
-                            patch_size=config.get("patch_size", 64), augment=False),
+                val_ds,
                 batch_size=config.get("batch_size", 4), shuffle=False, num_workers=0,
             )
-            logger.info("Client %d → subset%d", client_id, client_subset)
-            logger.info(f"Client {client_id}: {len(self.train_loader)} train batches")
+            logger.info(
+                "Client %d → subset%d | scans train=%d, validation=%d",
+                client_id, client_subset, len(train_uids), len(val_uids),
+            )
+            logger.info("Client %d: %d train batches", client_id, len(self.train_loader))
 
         def get_parameters(self, config):
             state = self.model.state_dict()
@@ -154,7 +194,7 @@ def _flower_client(client_id: int, data_root: str, config: dict):
         def evaluate(self, parameters, config):
             self.set_parameters(parameters)
             self.model.eval()
-            all_preds, all_targets = [], []
+            all_preds, all_targets, all_uids, fp_detections = [], [], [], []
 
             with torch.no_grad():
                 for batch in self.val_loader:
@@ -167,12 +207,27 @@ def _flower_client(client_id: int, data_root: str, config: dict):
                         if len(out.get("masks", [])) > 0 and len(out["scores"]) > 0:
                             best = int(out["scores"].argmax())
                             pred = out["masks"][best, 0].cpu().numpy()
+                        fp_detections.append(
+                            int(
+                                (out["masks"][:, 0] > 0.5)
+                                .flatten(start_dim=1)
+                                .any(dim=1)
+                                .sum()
+                                .item()
+                            ) if len(out.get("masks", [])) else 0
+                        )
                         all_preds.append(pred)
                         all_targets.append(masks[i].numpy())
+                        all_uids.append(str(batch["uid"][i]))
 
             from .metrics import evaluate_batch
             if all_preds:
-                seg = evaluate_batch(np.stack(all_preds), np.stack(all_targets))
+                seg = evaluate_batch(
+                    np.stack(all_preds),
+                    np.stack(all_targets),
+                    scan_uids=all_uids,
+                    false_positive_detections=fp_detections,
+                )
                 dice = seg.get("dice")
                 loss = 1.0 - (float(dice) if dice is not None and np.isfinite(dice) else 0.0)
                 return float(loss), len(self.val_loader.dataset), seg

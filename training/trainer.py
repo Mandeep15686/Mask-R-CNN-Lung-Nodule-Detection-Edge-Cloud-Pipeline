@@ -170,6 +170,8 @@ class Trainer:
         self.model.eval()
         all_preds: list[np.ndarray] = []
         all_targets: list[np.ndarray] = []
+        all_uids: list[str] = []
+        false_positive_detections: list[int] = []
         loss_tracker = MetricTracker()
 
         # Use our standalone mask loss for validation loss computation
@@ -186,7 +188,15 @@ class Trainer:
             for i, out in enumerate(outputs):
                 h, w = masks[i].shape
                 pred_mask = np.zeros((h, w), dtype=np.float32)
+                predicted_instances = 0
                 if len(out.get("masks", [])) > 0:
+                    predicted_instances = int(
+                        (out["masks"][:, 0] > 0.5)
+                        .flatten(start_dim=1)
+                        .any(dim=1)
+                        .sum()
+                        .item()
+                    )
                     # Take the highest-scoring mask
                     scores = out["scores"].cpu().numpy()
                     if len(scores) > 0:
@@ -197,6 +207,8 @@ class Trainer:
 
                 all_preds.append(pred_mask)
                 all_targets.append(masks[i].numpy())
+                all_uids.append(str(batch["uid"][i]))
+                false_positive_detections.append(predicted_instances)
 
                 # Compute standalone validation loss
                 if labels[i].item() == 1 and masks[i].sum() > 0:
@@ -214,7 +226,12 @@ class Trainer:
         targets_arr = np.stack(all_targets)
         # Both CLI and API training use the same finite-safe metric aggregation.
         # None means a metric is not defined for this validation set.
-        seg_metrics = evaluate_batch(preds_arr, targets_arr)
+        seg_metrics = evaluate_batch(
+            preds_arr,
+            targets_arr,
+            scan_uids=all_uids,
+            false_positive_detections=false_positive_detections,
+        )
         # Guard the API training/history path as well, so a non-finite metric
         # from any future metric implementation cannot reach JSON or SQLite.
         seg_metrics = {
@@ -286,6 +303,8 @@ class Trainer:
                 f"Epoch {epoch}/{self.epochs} | "
                 f"train_loss={train_metrics.get('total_loss', 0):.4f} | "
                 f"val_dice={_fmt_metric(val_metrics.get('val_dice'))} | "
+                f"neg_patch_fp_rate={_fmt_metric(val_metrics.get('val_negative_patch_false_positive_rate'))} | "
+                f"fp_detections_per_scan={_fmt_metric(val_metrics.get('val_false_positives_per_scan'))} | "
                 f"val_hd95={_fmt_metric(val_metrics.get('val_hd95'), '.2f')} | "
                 f"val_boundary_f1={_fmt_metric(val_metrics.get('val_boundary_f1'))}"
             )

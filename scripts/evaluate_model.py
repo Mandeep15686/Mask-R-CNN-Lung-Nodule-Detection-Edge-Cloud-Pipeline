@@ -2,7 +2,8 @@
 """
 Full evaluation of a trained Mask R-CNN checkpoint on the LUNA16 test set.
 Produces:
-  - Per-metric summary (Dice, IoU, HD95, Boundary F1, Sensitivity, FROC)
+  - Per-metric summary (Dice, IoU, HD95, Boundary F1, Sensitivity)
+  - A sampled-patch FROC proxy (not official scan-level LUNA16 FROC)
   - Per-nodule-subtype breakdown (solid / GGO / juxta-pleural)
   - Comparison table across multiple checkpoints
   - JSON + CSV reports saved to output directory
@@ -87,10 +88,45 @@ def evaluate_checkpoint(
         device = torch.device(device_str)
     logger.info(f"Device: {device}")
 
+    data_path = Path(data_root).expanduser().resolve()
+    available_folds = sorted(
+        int(path.name.removeprefix("subset"))
+        for path in data_path.glob("subset*")
+        if path.is_dir() and path.name.removeprefix("subset").isdigit()
+    )
+    if fold not in available_folds:
+        raise ValueError(
+            f"Evaluation subset {fold} is unavailable under {data_path}. "
+            f"Available subsets: {available_folds}"
+        )
+    logger.warning(
+        "FROC is computed over sampled patches from the selected subset; "
+        "this is a proxy and is not official scan-level LUNA16 FROC."
+    )
+
     # Load checkpoint metadata
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = ckpt.get("config", {})
     mask_loss_cfg = config.get("mask_loss", {"alpha": 1.0})
+    training_fold = config.get("fold")
+    if training_fold is None:
+        evaluation_data_role = "unknown_training_split"
+        logger.warning(
+            "Checkpoint has no training fold metadata; independence of this "
+            "evaluation subset cannot be established."
+        )
+    elif fold == int(training_fold):
+        evaluation_data_role = "validation_fold_used_during_training"
+        logger.warning(
+            "Selected subset is the checkpoint's validation fold and may have "
+            "been used for model selection; it is not an independent test set."
+        )
+    else:
+        evaluation_data_role = "subset_in_training_data"
+        logger.warning(
+            "Selected subset was included in training because training uses all "
+            "subsets except its validation fold; this is not an independent test set."
+        )
 
     # Build model
     model = LungNoduleMaskRCNN(num_classes=2, mask_loss_cfg=mask_loss_cfg)
@@ -110,6 +146,7 @@ def evaluate_checkpoint(
     logger.info(f"Test samples: {len(test_ds)}")
 
     all_preds, all_targets, all_labels, all_diameters = [], [], [], []
+    all_uids, false_positive_detections = [], []
     all_scores, detection_labels = [], []
     inference_times = []
     subtype_metrics: dict[str, list] = {"small_solid": [], "solid": [], "large": []}
@@ -132,6 +169,10 @@ def evaluate_checkpoint(
                 scores_i = out.get("scores", torch.zeros(0)).cpu().numpy()
                 boxes_i  = out.get("boxes",  torch.zeros(0, 4)).cpu().numpy()
                 masks_i  = out.get("masks",  torch.zeros(0, 1, h, w)).cpu().numpy()
+                false_positive_detections.append(
+                    int(np.any(masks_i > 0.5, axis=(1, 2, 3)).sum())
+                    if len(masks_i) else 0
+                )
 
                 if len(scores_i) > 0:
                     best_idx = int(np.argmax(scores_i))
@@ -147,6 +188,7 @@ def evaluate_checkpoint(
                 gt_mask = masks[i].numpy()
                 all_preds.append(pred_mask)
                 all_targets.append(gt_mask)
+                all_uids.append(str(batch["uid"][i]))
                 all_labels.append(is_nodule_gt)
                 all_diameters.append(float(diams[i].item()))
 
@@ -166,10 +208,16 @@ def evaluate_checkpoint(
     # Aggregate segmentation metrics
     preds_arr   = np.stack(all_preds)
     targets_arr = np.stack(all_targets)
-    seg_metrics = evaluate_batch(preds_arr, targets_arr, threshold=score_threshold)
+    seg_metrics = evaluate_batch(
+        preds_arr,
+        targets_arr,
+        threshold=score_threshold,
+        scan_uids=all_uids,
+        false_positive_detections=false_positive_detections,
+    )
 
     # FROC
-    n_scans = len(test_ds._volume_cache) or max(1, len(test_ds) // 5)
+    n_scans = len({sample["uid"] for sample in test_ds.all_samples})
     froc = compute_froc(all_scores, detection_labels, n_scans=n_scans)
 
     # Per-subtype aggregation
@@ -189,11 +237,13 @@ def evaluate_checkpoint(
         "config_id":            config.get("config_id", Path(checkpoint_path).parent.name),
         "loss_description":     config.get("mask_loss", {}),
         "fold":                 fold,
+        "evaluation_data_role": evaluation_data_role,
         "n_samples":            len(test_ds),
         "avg_inference_ms":     float(np.mean(inference_times)) if inference_times else 0.0,
         **seg_metrics,
-        "froc_score":           froc["froc_score"],
-        "froc_per_point":       froc["froc_per_point"],
+        "patch_sample_froc_score": froc["froc_score"],
+        "patch_sample_froc_per_point": froc["froc_per_point"],
+        "froc_protocol": "sampled_patch_proxy_not_official_scan_level_luna16",
         "subtype_metrics":      subtype_summary,
     }
 
@@ -217,7 +267,7 @@ def compare_checkpoints(
             logger.info(
                 f"  Dice={result['dice']:.4f}  IoU={result['iou']:.4f}  "
                 f"HD95={result['hd95']:.2f}  BF1={result['boundary_f1']:.4f}  "
-                f"FROC={result['froc_score']:.4f}"
+                f"patch-FROC proxy={result['patch_sample_froc_score']:.4f}"
             )
         except Exception as e:
             logger.error(f"  FAILED: {e}")
@@ -237,7 +287,7 @@ def compare_checkpoints(
             "config_id", "checkpoint", "fold", "n_samples",
             "dice", "iou", "sensitivity", "specificity",
             "hd95", "boundary_f1", "asd", "vol_err",
-            "froc_score", "avg_inference_ms",
+            "patch_sample_froc_score", "avg_inference_ms",
         ]
         with open(out / "evaluation_results.csv", "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=flat_keys, extrasaction="ignore")
@@ -248,7 +298,7 @@ def compare_checkpoints(
 
     # Print summary table
     print(f"\n{'='*90}")
-    print(f"{'Config ID':<30} {'Dice':>6} {'IoU':>6} {'HD95':>7} {'BF1':>6} {'FROC':>6} {'ms/img':>7}")
+    print(f"{'Config ID':<30} {'Dice':>6} {'IoU':>6} {'HD95':>7} {'BF1':>6} {'pFROC':>6} {'ms/img':>7}")
     print(f"{'-'*90}")
     for r in results:
         print(
@@ -257,7 +307,7 @@ def compare_checkpoints(
             f"{r.get('iou',0):>6.4f} "
             f"{r.get('hd95',999):>7.2f} "
             f"{r.get('boundary_f1',0):>6.4f} "
-            f"{r.get('froc_score',0):>6.4f} "
+            f"{r.get('patch_sample_froc_score',0):>6.4f} "
             f"{r.get('avg_inference_ms',0):>7.1f}"
         )
     print(f"{'='*90}")
@@ -291,8 +341,8 @@ def main():
     parser.add_argument("--checkpoints", type=str, nargs="+", default=None,
                         help="Glob pattern or list of checkpoint paths")
     parser.add_argument("--data",         required=True, help="LUNA16 data root")
-    parser.add_argument("--fold",         type=int, default=9,
-                        help="LUNA16 subset to use as test (default: 9)")
+    parser.add_argument("--fold",         type=int, required=True,
+                        help="Explicit evaluation subset (must be independent of training/model selection)")
     parser.add_argument("--out",          default="./eval_results")
     parser.add_argument("--batch-size",   type=int,   default=4)
     parser.add_argument("--patch-size",   type=int,   default=64)

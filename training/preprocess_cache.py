@@ -45,6 +45,7 @@ from .dataset import (
     clip_and_normalise,
     extract_patch_2_5d,
     create_spherical_mask,
+    patch_overlaps_nodule,
     HU_MIN,
     HU_MAX,
 )
@@ -66,8 +67,10 @@ def _process_volume(args: dict) -> list[dict]:
     mhd_path   = args["mhd_path"]
     uid        = args["uid"]
     positives  = args["positives"]    # list[{"coord": np.array, "diameter_mm": float}]
+    negative_candidates = args.get("negative_candidates", [])
     neg_count  = args["neg_count"]
     patch_size = args["patch_size"]
+    subset     = args["subset"]
     out_dir    = Path(args["out_dir"])
 
     try:
@@ -78,10 +81,14 @@ def _process_volume(args: dict) -> list[dict]:
         return []
 
     entries = []
+    positive_centers = [
+        (world_to_voxel(ann["coord"], origin, spacing, direction), ann["diameter_mm"])
+        for ann in positives
+    ]
 
     # ---- Positive patches ------------------------------------------------
     for ann_idx, ann in enumerate(positives):
-        center_vox = world_to_voxel(ann["coord"], origin, spacing, direction)
+        center_vox = positive_centers[ann_idx][0]
         patch = extract_patch_2_5d(volume, center_vox, patch_size)
         if patch is None:
             logger.warning(f"  OOB positive patch skipped: {uid} ann {ann_idx}")
@@ -95,7 +102,7 @@ def _process_volume(args: dict) -> list[dict]:
             label=np.int8(1),
             diameter=np.float32(ann["diameter_mm"]),
         )
-        entries.append({"file": fname, "uid": uid, "label": 1,
+        entries.append({"file": fname, "uid": uid, "subset": subset, "label": 1,
                         "diameter_mm": float(ann["diameter_mm"])})
 
     # ---- Negative patches ------------------------------------------------
@@ -103,7 +110,55 @@ def _process_volume(args: dict) -> list[dict]:
     half = patch_size // 2
     saved_neg = 0
     attempts  = 0
-    max_attempts = neg_count * 20  # avoid infinite loop on unusual volumes
+    max_attempts = max(neg_count * 50, 100)  # bounded fallback for unusual volumes
+    seen_centers: set[tuple[int, int, int]] = set()
+
+    def save_negative(center_vox: np.ndarray) -> None:
+        nonlocal saved_neg
+        patch = extract_patch_2_5d(volume, center_vox, patch_size)
+        if patch is None:
+            return
+        fname = f"{uid}_neg_{saved_neg}.npz"
+        np.savez_compressed(
+            out_dir / fname,
+            image=patch,
+            mask=np.zeros((patch_size, patch_size), dtype=np.uint8),
+            label=np.int8(0),
+            diameter=np.float32(0.0),
+        )
+        entries.append({"file": fname, "uid": uid, "subset": subset,
+                        "label": 0, "diameter_mm": 0.0})
+        saved_neg += 1
+
+    # Prefer LUNA16's labeled class-0 candidates, while still excluding any
+    # patch whose physical footprint intersects an annotated nodule region.
+    candidates = list(negative_candidates)
+    random.shuffle(candidates)
+    for coord_world in candidates:
+        if saved_neg >= neg_count:
+            break
+        center_vox = world_to_voxel(coord_world, origin, spacing, direction)
+        cx, cy, cz = (int(v) for v in center_vox)
+        if not (
+            1 <= cz < Z - 1
+            and half <= cy < Y - half
+            and half <= cx < X - half
+        ):
+            continue
+        center_key = tuple(int(v) for v in center_vox)
+        if center_key in seen_centers:
+            continue
+        if volume[cz, cy, cx] < 0.036:
+            continue
+        if any(
+            patch_overlaps_nodule(
+                center_vox, nodule_vox, diameter_mm, spacing, patch_size
+            )
+            for nodule_vox, diameter_mm in positive_centers
+        ):
+            continue
+        seen_centers.add(center_key)
+        save_negative(center_vox)
 
     while saved_neg < neg_count and attempts < max_attempts:
         attempts += 1
@@ -118,21 +173,18 @@ def _process_volume(args: dict) -> list[dict]:
             continue
 
         center_vox = np.array([cx, cy, cz])
-        patch = extract_patch_2_5d(volume, center_vox, patch_size)
-        if patch is None:
+        center_key = tuple(int(v) for v in center_vox)
+        if center_key in seen_centers:
             continue
-
-        mask = np.zeros((patch_size, patch_size), dtype=np.uint8)
-        fname = f"{uid}_neg_{saved_neg}.npz"
-        np.savez_compressed(
-            out_dir / fname,
-            image=patch,
-            mask=mask,
-            label=np.int8(0),
-            diameter=np.float32(0.0),
-        )
-        entries.append({"file": fname, "uid": uid, "label": 0, "diameter_mm": 0.0})
-        saved_neg += 1
+        if any(
+            patch_overlaps_nodule(
+                center_vox, nodule_vox, diameter_mm, spacing, patch_size
+            )
+            for nodule_vox, diameter_mm in positive_centers
+        ):
+            continue
+        seen_centers.add(center_key)
+        save_negative(center_vox)
 
     logger.info(f"  {uid}: {len(positives)} pos, {saved_neg} neg patches saved")
     return entries
@@ -178,6 +230,23 @@ def build_cache(
                 "diameter_mm": float(row["diameter_mm"]),
             })
 
+    # The candidate file provides independently labeled class-0 locations.
+    # They are preferred over arbitrary voxel samples for negative patches.
+    candidates_by_uid: dict[str, list[np.ndarray]] = {}
+    candidates_csv = data_root_path / "candidates.csv"
+    if candidates_csv.exists():
+        with open(candidates_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("class") != "0":
+                    continue
+                candidates_by_uid.setdefault(row["seriesuid"], []).append(
+                    np.array([
+                        float(row["coordX"]),
+                        float(row["coordY"]),
+                        float(row["coordZ"]),
+                    ], dtype=np.float64)
+                )
+
     # ---- Discover all .mhd files ----------------------------------------
     all_mhd = sorted(
         p for p in data_root_path.rglob("*.mhd")
@@ -193,12 +262,24 @@ def build_cache(
         uid       = mhd_file.stem
         positives = annotations.get(uid, [])
         neg_count = max(1, int(len(positives) * neg_ratio)) if positives else 2
+        subset_match = next(
+            (
+                match
+                for parent in mhd_file.parents
+                if (match := re.fullmatch(r"subset(\d+)", parent.name))
+            ),
+            None,
+        )
+        if subset_match is None:
+            raise ValueError(f"Cannot determine LUNA16 subset for {mhd_file}")
         jobs.append({
             "mhd_path":   str(mhd_file),
             "uid":        uid,
             "positives":  positives,
+            "negative_candidates": candidates_by_uid.get(uid, []),
             "neg_count":  neg_count,
             "patch_size": patch_size,
+            "subset":     int(subset_match.group(1)),
             "out_dir":    str(out_path),
         })
 
