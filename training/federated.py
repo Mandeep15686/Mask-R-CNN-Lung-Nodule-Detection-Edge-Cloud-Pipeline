@@ -22,6 +22,7 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
+from importlib import import_module
 from typing import Optional
 from collections import OrderedDict
 
@@ -31,14 +32,21 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _import_flower():
+    """Load the optional Flower dependency only when federated features run."""
+    try:
+        return import_module("flwr")
+    except ImportError as exc:
+        raise ImportError(
+            "Install Flower with `python -m pip install -r training/requirements.txt`"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Flower client
 # ---------------------------------------------------------------------------
 def _flower_client(client_id: int, data_root: str, config: dict):
-    try:
-        import flwr as fl
-    except ImportError:
-        raise ImportError("Install Flower: pip install flwr")
+    fl = _import_flower()
 
     from .model import LungNoduleMaskRCNN
     from .dataset import build_dataloaders
@@ -56,13 +64,31 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             self.criterion = CompositeMaskLoss.from_config(
                 config.get("mask_loss", {"alpha": 0.3, "beta": 0.5, "gamma": 0.5})
             )
-            self.train_loader, self.val_loader = build_dataloaders(
-                data_root=data_root,
-                fold=client_id % 10,
-                batch_size=config.get("batch_size", 4),
-                num_workers=0,
-                patch_size=config.get("patch_size", 64),
+            from pathlib import Path as _Path
+            from .dataset import LUNA16Dataset
+
+            _root = _Path(data_root)
+            _all_subsets = sorted(
+                int(p.name.removeprefix("subset"))
+                for p in _root.glob("subset*")
+                if p.is_dir() and p.name.removeprefix("subset").isdigit()
             )
+            if not _all_subsets:
+                raise ValueError(f"No LUNA16 subsets found under {data_root}")
+
+            client_subset = _all_subsets[client_id % len(_all_subsets)]
+
+            self.train_loader = torch.utils.data.DataLoader(
+                LUNA16Dataset(data_root, [client_subset],
+                            patch_size=config.get("patch_size", 64), augment=True),
+                batch_size=config.get("batch_size", 4), shuffle=True, num_workers=0,
+            )
+            self.val_loader = torch.utils.data.DataLoader(
+                LUNA16Dataset(data_root, [client_subset],
+                            patch_size=config.get("patch_size", 64), augment=False),
+                batch_size=config.get("batch_size", 4), shuffle=False, num_workers=0,
+            )
+            logger.info("Client %d → subset%d", client_id, client_subset)
             logger.info(f"Client {client_id}: {len(self.train_loader)} train batches")
 
         def get_parameters(self, config):
@@ -93,6 +119,10 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             tracker = MetricTracker()
 
             for _epoch in range(n_epochs):
+                proximal_mu = float(config.get("proximal_mu", 0.0))
+                global_weights = [p.data.clone().detach()
+                                for p in self.model.parameters() if p.requires_grad] \
+                                if proximal_mu > 0 else None
                 for batch in self.train_loader:
                     images  = batch["image"].to(self.device)
                     masks   = batch["mask"].to(self.device)
@@ -104,6 +134,14 @@ def _flower_client(client_id: int, data_root: str, config: dict):
 
                     if isinstance(loss_dict, dict):
                         total = sum(loss_dict.values())
+                        if proximal_mu > 0 and global_weights is not None:
+                            prox = torch.tensor(0.0, device=self.device)
+                            for p_local, p_global in zip(
+                                (p for p in self.model.parameters() if p.requires_grad),
+                                global_weights,
+                            ):
+                                prox = prox + ((p_local - p_global.to(self.device)) ** 2).sum()
+                            total = total + (proximal_mu / 2.0) * prox
                         tracker.update({k: v.item() for k, v in loss_dict.items()})
                         if total.requires_grad:
                             total.backward()
@@ -147,10 +185,7 @@ def _flower_client(client_id: int, data_root: str, config: dict):
 # Flower server strategy
 # ---------------------------------------------------------------------------
 def _build_strategy(strategy_name: str, num_clients: int):
-    try:
-        import flwr as fl
-    except ImportError:
-        raise ImportError("Install Flower: pip install flwr")
+    fl = _import_flower()
 
     # Weighted-average aggregation with evaluation metrics
     def evaluate_metrics_aggregation(eval_metrics):
@@ -183,7 +218,7 @@ def _build_strategy(strategy_name: str, num_clients: int):
             min_evaluate_clients=num_clients,
             min_available_clients=num_clients,
             proximal_mu=0.1,   # FedProx regularisation strength
-            on_fit_config_fn=lambda rnd: {"lr": 0.005, "local_epochs": 1},
+            on_fit_config_fn=lambda rnd: {"lr": 0.005, "local_epochs": 1, "proximal_mu": 0.1},
         )
     else:
         raise ValueError(f"Unknown strategy: {strategy_name}. Use 'fedavg' or 'fedprox'")
@@ -204,10 +239,7 @@ def run_simulation(
     Run federated simulation with num_clients in-process.
     Equivalent to running server + all clients on one machine.
     """
-    try:
-        import flwr as fl
-    except ImportError:
-        raise ImportError("Install Flower: pip install flwr")
+    fl = _import_flower()
 
     import json
     from datetime import datetime
@@ -327,7 +359,7 @@ if __name__ == "__main__":
             output_dir=args.out,
         )
     elif args.mode == "server":
-        import flwr as fl
+        fl = _import_flower()
         strategy = _build_strategy(args.strategy, args.num_clients)
         fl.server.start_server(
             server_address=args.server_addr,
@@ -335,6 +367,6 @@ if __name__ == "__main__":
             strategy=strategy,
         )
     elif args.mode == "client":
-        import flwr as fl
+        fl = _import_flower()
         client = _flower_client(args.client_id, args.data, {})
         fl.client.start_numpy_client(server_address=args.server_addr, client=client)

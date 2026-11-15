@@ -72,13 +72,14 @@ class Trainer:
         self.warmup_epochs = warmup_epochs
         self.warmup_lr = lr / 10.0
 
-        # Data
+        # Data — use pre-extracted cache if available (eliminates SSD bottleneck)
         self.train_loader, self.val_loader = build_dataloaders(
             data_root=config["data_root"],
             fold=config.get("fold", 0),
             batch_size=config.get("batch_size", 4),
             num_workers=config.get("num_workers", 2),
             patch_size=config.get("patch_size", 64),
+            cache_dir=config.get("cache_dir"),   # None → slow raw-volume path
         )
 
         self.history: list[dict] = []
@@ -201,8 +202,7 @@ class Trainer:
                 if labels[i].item() == 1 and masks[i].sum() > 0:
                     pred_t = torch.tensor(pred_mask, device=self.device).unsqueeze(0)
                     tgt_t = masks[i].to(self.device).unsqueeze(0).float()
-                    # Approximate validation loss by inverting mask probabilities;
-                    # the primary comparison metrics are computed directly from probabilities.
+                    # logit approximation (clamp to avoid inf)
                     logit = torch.log(
                         pred_t.clamp(1e-7, 1 - 1e-7) /
                         (1 - pred_t.clamp(1e-7, 1 - 1e-7))
@@ -258,7 +258,7 @@ class Trainer:
 
             # Checkpoint
             val_dice = val_metrics.get("val_dice") or 0.0
-            if self.best_epoch == 0 or val_dice > self.best_dice:
+            if val_dice > self.best_dice:
                 self.best_dice = val_dice
                 self.best_epoch = epoch
                 torch.save({
@@ -294,14 +294,6 @@ class Trainer:
             "loss_description": self.model.get_loss_description(),
             "best_epoch": self.best_epoch,
             "best_dice": self.best_dice,
-            "best_hd95": next(
-                (row.get("val_hd95") for row in self.history
-                 if row.get("epoch") == self.best_epoch), None
-            ),
-            "best_boundary_f1": next(
-                (row.get("val_boundary_f1") for row in self.history
-                 if row.get("epoch") == self.best_epoch), None
-            ),
             "loss_weights": {
                 "alpha": self.config.get("mask_loss", {}).get("alpha", 0),
                 "beta": self.config.get("mask_loss", {}).get("beta", 0),

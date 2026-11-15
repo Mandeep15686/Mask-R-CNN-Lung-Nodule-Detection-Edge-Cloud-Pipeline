@@ -10,3 +10,4 @@ scikit-learn==1.5.1
 pandas==2.2.2
 matplotlib==3.9.2
 tqdm==4.66.5
+flwr[simulation]>=1.13,<2.0
