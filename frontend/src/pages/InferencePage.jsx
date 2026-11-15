@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
 import { api } from "../services/api.js";
-import { Upload, Loader2, AlertCircle, Eye, CheckCircle, XCircle } from "lucide-react";
+import { Upload, Loader2, AlertCircle, Eye, CheckCircle, XCircle, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 
 // Model always works on 64×64 patches; box coords are in that space.
 const MODEL_PATCH_SIZE = 64;
@@ -8,7 +8,7 @@ const MODEL_PATCH_SIZE = 64;
 // ---------------------------------------------------------------------------
 // Canvas overlay: draws nodule bounding boxes and masks on CT image
 // ---------------------------------------------------------------------------
-function NoduleCanvas({ imageUrl, nodules, inferenceRan }) {
+function NoduleCanvas({ imageUrl, nodules, inferenceRan, zoom }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
@@ -101,8 +101,12 @@ function NoduleCanvas({ imageUrl, nodules, inferenceRan }) {
   return (
     <canvas
       ref={canvasRef}
-      className="max-w-full rounded-lg border border-slate-700"
-      style={{ imageRendering: "pixelated", maxHeight: 480 }}
+      className="mx-auto block max-w-none rounded-lg border border-slate-700"
+      style={{
+        width: `${MODEL_PATCH_SIZE * zoom}px`,
+        height: `${MODEL_PATCH_SIZE * zoom}px`,
+        imageRendering: "pixelated",
+      }}
     />
   );
 }
@@ -121,6 +125,7 @@ export default function InferencePage() {
   const [history, setHistory]   = useState([]);
   const [experiments, setExps]  = useState([]);
   const [modelStatus, setModelStatus] = useState(null);
+  const [imageZoom, setImageZoom] = useState(8);
   const fileRef                 = useRef(null);
 
   useEffect(() => {
@@ -197,7 +202,7 @@ export default function InferencePage() {
         </p>
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-6">
+      <div className="grid lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)] gap-6">
         {/* Upload panel */}
         <div className="space-y-4">
           {/* Drop zone */}
@@ -300,17 +305,64 @@ export default function InferencePage() {
         {/* Results panel */}
         <div className="space-y-4">
           {/* Canvas viewer */}
-          <div className="card flex items-center justify-center min-h-64 bg-slate-950">
+          <div className="card p-4 sm:p-5 bg-slate-950/70">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <div>
+                <h3 className="text-sm font-bold text-white">Prediction preview</h3>
+                <p className="text-xs text-slate-400 mt-1">Zoom to inspect the patch and detected regions</p>
+              </div>
+              {imageUrl && (
+                <div className="flex items-center gap-2" aria-label="Image zoom controls">
+                  <button
+                    type="button"
+                    className="btn btn-secondary p-2 rounded-lg disabled:opacity-40"
+                    aria-label="Zoom out"
+                    title="Zoom out"
+                    disabled={imageZoom <= 1}
+                    onClick={() => setImageZoom((zoom) => Math.max(1, zoom - 1))}
+                  >
+                    <ZoomOut size={16} />
+                  </button>
+                  <span className="min-w-12 text-center text-xs text-slate-300 tabular-nums">
+                    {imageZoom * 100}%
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-secondary p-2 rounded-lg disabled:opacity-40"
+                    aria-label="Zoom in"
+                    title="Zoom in"
+                    disabled={imageZoom >= 16}
+                    onClick={() => setImageZoom((zoom) => Math.min(16, zoom + 1))}
+                  >
+                    <ZoomIn size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary p-2 rounded-lg"
+                    aria-label="Reset zoom"
+                    title="Reset zoom"
+                    onClick={() => setImageZoom(8)}
+                  >
+                    <RotateCcw size={14} />
+                  </button>
+                </div>
+              )}
+            </div>
             {imageUrl ? (
-              <NoduleCanvas
-                imageUrl={imageUrl}
-                nodules={result?.nodules ?? []}
-                inferenceRan={result != null}
-              />
+              <div className="inference-image-viewport flex min-h-[420px] max-h-[70vh] justify-start overflow-auto rounded-xl border border-slate-700/70 bg-slate-950 p-4">
+                <NoduleCanvas
+                  imageUrl={imageUrl}
+                  nodules={result?.nodules ?? []}
+                  inferenceRan={result != null}
+                  zoom={imageZoom}
+                />
+              </div>
             ) : (
-              <div className="text-slate-600 text-sm text-center">
-                <div className="text-4xl mb-2">🫁</div>
-                Upload a CT patch to see predictions
+              <div className="flex min-h-[420px] max-h-[70vh] items-center justify-center rounded-xl border border-slate-700/70 bg-slate-950 text-slate-600 text-sm text-center">
+                <div>
+                  <div className="text-4xl mb-2">🫁</div>
+                  Upload a CT patch to see predictions
+                </div>
               </div>
             )}
           </div>
