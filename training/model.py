@@ -8,7 +8,7 @@ from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
-from torchvision.ops import roi_align
+from torchvision.ops import MultiScaleRoIAlign, roi_align
 import torch.nn.functional as F
 from typing import Optional
 from contextvars import ContextVar
@@ -113,6 +113,11 @@ class LungNoduleMaskRCNN(nn.Module):
             box_nms_thresh=box_nms_thresh,
             box_detections_per_img=box_detections_per_img,
         )
+        self.model.roi_heads.mask_roi_pool = MultiScaleRoIAlign(
+            featmap_names=["0", "1", "2", "3"],
+            output_size=mask_roi_pool_output_size,
+            sampling_ratio=2,
+        )
 
         # Replace mask predictor for binary nodule masks
         in_features_mask = self.model.roi_heads.mask_predictor.conv5_mask.in_channels
@@ -152,6 +157,7 @@ class LungNoduleMaskRCNN(nn.Module):
             trainable_backbone_layers=cfg.get("trainable_backbone_layers", 3),
             min_size=cfg.get("min_size", 64),
             max_size=cfg.get("max_size", 256),
+            mask_roi_pool_output_size=cfg.get("mask_roi_pool_output_size", 14),
         )
 
 

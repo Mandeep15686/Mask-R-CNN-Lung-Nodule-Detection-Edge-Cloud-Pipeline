@@ -83,7 +83,7 @@ class Trainer:
         )
 
         self.history: list[dict] = []
-        self.best_dice = 0.0
+        self.best_dice = float("-inf")
         self.best_epoch = 0
 
     # ------------------------------------------------------------------
@@ -257,18 +257,20 @@ class Trainer:
             self.history.append(epoch_log)
 
             # Checkpoint
-            val_dice = val_metrics.get("val_dice") or 0.0
-            if val_dice > self.best_dice:
-                self.best_dice = val_dice
-                self.best_epoch = epoch
-                torch.save({
-                    "epoch": epoch,
-                    "model_state": self.model.state_dict(),
-                    "optimizer_state": self.optimizer.state_dict(),
-                    "metrics": epoch_log,
-                    "config": self.config,
-                }, best_ckpt)
-                logger.info(f"  ✓ New best Dice: {val_dice:.4f} → saved checkpoint")
+            val_dice = val_metrics.get("val_dice")
+            if val_dice is not None and np.isfinite(val_dice):
+                val_dice = float(val_dice)
+                if val_dice > self.best_dice:
+                    self.best_dice = val_dice
+                    self.best_epoch = epoch
+                    torch.save({
+                        "epoch": epoch,
+                        "model_state": self.model.state_dict(),
+                        "optimizer_state": self.optimizer.state_dict(),
+                        "metrics": epoch_log,
+                        "config": self.config,
+                    }, best_ckpt)
+                    logger.info(f"  ✓ New best Dice: {val_dice:.4f} → saved checkpoint")
 
             # Save latest
             torch.save({
@@ -293,7 +295,9 @@ class Trainer:
             "config_id": self.config.get("config_id", "unknown"),
             "loss_description": self.model.get_loss_description(),
             "best_epoch": self.best_epoch,
-            "best_dice": self.best_dice,
+            "best_dice": (
+                float(self.best_dice) if np.isfinite(self.best_dice) else None
+            ),
             "loss_weights": {
                 "alpha": self.config.get("mask_loss", {}).get("alpha", 0),
                 "beta": self.config.get("mask_loss", {}).get("beta", 0),
@@ -309,6 +313,7 @@ class Trainer:
             json.dump(summary, f, indent=2, allow_nan=False)
 
         logger.info(
-            f"Training complete. Best Dice: {self.best_dice:.4f} at epoch {self.best_epoch}"
+            f"Training complete. Best Dice: {_fmt_metric(self.best_dice)} "
+            f"at epoch {self.best_epoch}"
         )
         return summary

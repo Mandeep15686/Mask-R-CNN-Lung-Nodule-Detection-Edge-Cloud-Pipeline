@@ -3,9 +3,9 @@
 CLI entry-point to run Phase 1, 2, or 3 loss-weight experiments.
 
 Usage:
-  python scripts/run_experiments.py --phase 1 --data ./data/luna16 --out ./experiments
-  python scripts/run_experiments.py --phase 2 --data ./data/luna16 --out ./experiments --max-configs 20
-  python scripts/run_experiments.py --phase 3 --data ./data/luna16 --out ./experiments --n-trials 50
+  python scripts/run_experiments.py --phase 1 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments
+  python scripts/run_experiments.py --phase 2 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments --max-configs 20
+  python scripts/run_experiments.py --phase 3 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments --n-trials 50
 """
 import argparse
 import logging
@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Mask R-CNN loss-weight experiments")
     parser.add_argument("--phase",       type=int,   default=1,            help="1=ablation, 2=grid, 3=bayesian")
     parser.add_argument("--data",        type=str,   default="./data/luna16", help="LUNA16 data root")
+    parser.add_argument("--cache-dir",   type=str,   default=None,         help="Pre-extracted LUNA16 patch cache directory")
     parser.add_argument("--out",         type=str,   default="./experiments", help="Output directory")
     parser.add_argument("--epochs",      type=int,   default=30)
     parser.add_argument("--batch-size",  type=int,   default=4)
@@ -37,6 +38,7 @@ def main():
     base_cfg = {
         **BASE_CONFIG,
         "data_root":  args.data,
+        "cache_dir":  args.cache_dir,
         "epochs":     args.epochs,
         "batch_size": args.batch_size,
         "fold":       args.fold,
