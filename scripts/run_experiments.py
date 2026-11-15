@@ -37,6 +37,8 @@ def main():
                         help="Reserved independent test subset ID; excluded from training")
     parser.add_argument("--lr",          type=float, default=0.005)
     parser.add_argument("--max-configs", type=int,   default=None,         help="Phase 2: max configs to run")
+    parser.add_argument("--resume", action="store_true",
+                        help="Phase 2: skip configurations with complete validated artifacts")
     parser.add_argument("--n-trials",    type=int,   default=100,          help="Phase 3: Optuna trials")
     args = parser.parse_args()
 
@@ -59,7 +61,7 @@ def main():
     if args.phase == 1:
         runner.run_phase1()
     elif args.phase == 2:
-        runner.run_phase2(max_configs=args.max_configs)
+        runner.run_phase2(max_configs=args.max_configs, resume=args.resume)
     elif args.phase == 3:
         result = runner.run_phase3(n_trials=args.n_trials)
         print("\n=== Phase 3 Best Result ===")

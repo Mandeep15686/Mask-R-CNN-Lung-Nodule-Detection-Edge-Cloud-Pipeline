@@ -15,6 +15,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 # ---------------------------------------------------------------------------
 # Base config shared by all experiments
 # ---------------------------------------------------------------------------
@@ -61,6 +66,18 @@ PHASE1_CONFIGS = [
 # Phase 2: Grid search over (alpha, beta, gamma)
 # ---------------------------------------------------------------------------
 GRID_VALUES = [0.0, 0.3, 0.5, 0.7, 1.0]
+
+
+def select_phase2_configs(max_configs: Optional[int] = None) -> list[dict]:
+    """Return the deterministic Phase 2 selection (seed 42 when sampling)."""
+    configs = generate_phase2_configs()
+    if max_configs is not None:
+        if max_configs < 1:
+            raise ValueError("max_configs must be at least 1")
+        if max_configs < len(configs):
+            configs = random.Random(42).sample(configs, k=max_configs)
+    return configs
+
 
 def generate_phase2_configs() -> list[dict]:
     configs = []
@@ -175,13 +192,84 @@ class ExperimentRunner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.results: list[dict] = []
 
+    def _upsert_result(self, result: dict) -> None:
+        """Keep one result per config ID while retaining prior result order."""
+        config_id = result.get("config_id")
+        if config_id is None:
+            self.results.append(result)
+            return
+
+        replaced = False
+        merged = []
+        for existing in self.results:
+            if existing.get("config_id") == config_id:
+                if not replaced:
+                    merged.append(result)
+                    replaced = True
+            else:
+                merged.append(existing)
+        if not replaced:
+            merged.append(result)
+        self.results = merged
+
+    def _load_prior_results(self) -> None:
+        """Load aggregate results so resume never drops earlier completions."""
+        results_path = self.output_dir / "all_results.json"
+        if not results_path.exists():
+            return
+        try:
+            with results_path.open(encoding="utf-8") as f:
+                saved_results = json.load(f, parse_constant=_reject_json_constant)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not load prior results from %s: %s", results_path, exc)
+            return
+        if not isinstance(saved_results, list):
+            logger.warning("Ignoring non-list prior results in %s", results_path)
+            return
+        for result in saved_results:
+            if isinstance(result, dict) and isinstance(result.get("config_id"), str):
+                self._upsert_result(result)
+
+    def _completed_summary(self, config_id: str, requested_epochs: int) -> Optional[dict]:
+        """Return a summary only when all required completion artifacts validate."""
+        run_dir = self.output_dir / config_id
+        summary_path = run_dir / "summary.json"
+        history_path = run_dir / "history.json"
+        checkpoint_path = run_dir / "latest_model.pth"
+        try:
+            with summary_path.open(encoding="utf-8") as f:
+                summary = json.load(f, parse_constant=_reject_json_constant)
+            if not isinstance(summary, dict) or summary.get("config_id") != config_id:
+                logger.info("Resume: %s has a missing or mismatched summary; rerunning", config_id)
+                return None
+            with history_path.open(encoding="utf-8") as f:
+                history = json.load(f, parse_constant=_reject_json_constant)
+        except (OSError, ValueError) as exc:
+            logger.info("Resume: %s has invalid or incomplete artifacts (%s); rerunning", config_id, exc)
+            return None
+
+        if not isinstance(history, list) or len(history) < requested_epochs:
+            logger.info("Resume: %s has fewer than %d completed epochs; rerunning", config_id, requested_epochs)
+            return None
+        completed_epochs = [
+            entry.get("epoch") for entry in history[:requested_epochs]
+            if isinstance(entry, dict)
+        ]
+        if completed_epochs != list(range(1, requested_epochs + 1)):
+            logger.info("Resume: %s history does not contain sequential completed epochs; rerunning", config_id)
+            return None
+        if not checkpoint_path.is_file():
+            logger.info("Resume: %s is missing latest_model.pth; rerunning", config_id)
+            return None
+        return summary
+
     def _run_single(self, cfg_override: dict) -> dict:
         from .trainer import Trainer
         cfg = {**deepcopy(self.base_config), **cfg_override}
         run_dir = self.output_dir / cfg["config_id"]
         trainer = Trainer(cfg, str(run_dir))
         summary = trainer.train()
-        self.results.append(summary)
+        self._upsert_result(summary)
         self._save_results()
         return summary
 
@@ -191,7 +279,12 @@ class ExperimentRunner:
         # Also save CSV
         import csv
         if self.results:
-            keys = list(self.results[0].keys())
+            keys = list(dict.fromkeys(
+                key
+                for result in self.results
+                for key, value in result.items()
+                if not isinstance(value, dict)
+            ))
             with open(self.output_dir / "all_results.csv", "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
                 writer.writeheader()
@@ -206,18 +299,28 @@ class ExperimentRunner:
             self._run_single(cfg_override)
         logger.info("Phase 1 complete.")
 
-    def run_phase2(self, max_configs: Optional[int] = None):
+    def run_phase2(self, max_configs: Optional[int] = None, resume: bool = False):
         logger.info("=== PHASE 2: Grid search (alpha, beta, gamma) ===")
-        configs = generate_phase2_configs()
-        if max_configs is not None:
-            if max_configs < 1:
-                raise ValueError("max_configs must be at least 1")
-            if max_configs < len(configs):
-                configs = random.Random(42).sample(configs, k=max_configs)
+        configs = select_phase2_configs(max_configs)
+        if resume:
+            self._load_prior_results()
         logger.info(f"Running {len(configs)} configurations...")
+        requested_epochs = int(self.base_config.get("epochs", BASE_CONFIG["epochs"]))
+        if requested_epochs < 1:
+            raise ValueError("epochs must be at least 1")
         for i, cfg_override in enumerate(configs):
-            logger.info(f"[{i+1}/{len(configs)}] {cfg_override['config_id']}")
+            config_id = cfg_override["config_id"]
+            logger.info(f"[{i+1}/{len(configs)}] {config_id}")
+            if resume:
+                completed = self._completed_summary(config_id, requested_epochs)
+                if completed is not None:
+                    self._upsert_result(completed)
+                    self._save_results()
+                    logger.info("Resume: skipping completed configuration %s", config_id)
+                    continue
             self._run_single(cfg_override)
+        if resume:
+            self._save_results()
         logger.info("Phase 2 complete.")
 
     def run_phase3(self, n_trials: int = 100):
