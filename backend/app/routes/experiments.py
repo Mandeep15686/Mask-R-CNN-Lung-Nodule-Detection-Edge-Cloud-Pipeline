@@ -44,6 +44,29 @@ def _experiment_run_dir(config_id: str) -> Path:
     return PROJECT_ROOT / "experiments" / Path(config_id).name
 
 
+def _experiment_artifact_dir(exp: Experiment) -> Path:
+    """Resolve imported runs to their source folder, with traversal protection."""
+    config = exp.config_json or {}
+    relative_dir = config.get("artifact_dir")
+    if not relative_dir:
+        return _experiment_run_dir(exp.config_id)
+
+    project_root = PROJECT_ROOT.resolve()
+    artifact_dir = (project_root / str(relative_dir)).resolve()
+    allowed_roots = [
+        (project_root / name).resolve()
+        for name in (
+            "experiments",
+            "experiments_phase2_5ep_20cfg",
+            "experiments_phase2_screen",
+            "experiments_phase2_v3_5ep_20cfg",
+        )
+    ]
+    if not any(root == artifact_dir or root in artifact_dir.parents for root in allowed_roots):
+        raise ValueError(f"Experiment artifact path is outside the configured run folders: {relative_dir}")
+    return artifact_dir
+
+
 # ---------------------------------------------------------------------------
 # POST /api/experiments
 # ---------------------------------------------------------------------------
@@ -122,7 +145,7 @@ async def get_experiment_logs(exp_id: int, db: Session = Depends(get_db)):
     if not exp:
         raise HTTPException(status_code=404, detail="Experiment not found")
     config_id, status = exp.config_id, exp.status
-    log_path = _experiment_run_dir(config_id) / "terminal.log"
+    log_path = _experiment_artifact_dir(exp) / "terminal.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     return {"experiment_id": exp_id, "status": status, "log": log_text}
 
@@ -145,7 +168,7 @@ async def get_experiment_details(exp_id: int, db: Session = Depends(get_db)):
         for run in runs
     ]
     config_id = exp.config_id
-    log_path = _experiment_run_dir(config_id) / "terminal.log"
+    log_path = _experiment_artifact_dir(exp) / "terminal.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     return json_safe({
         "experiment": experiment_data,

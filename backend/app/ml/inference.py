@@ -157,6 +157,29 @@ class InferenceEngine:
             )
         return checkpoint
 
+    def checkpoint_for_artifact_dir(self, artifact_dir: str) -> Path:
+        """Resolve an imported experiment's checkpoint within known run folders."""
+        relative_dir = Path(artifact_dir)
+        if relative_dir.is_absolute() or ".." in relative_dir.parts:
+            raise ValueError("Experiment artifact_dir must be a safe project-relative path")
+        project_root = _PROJECT_ROOT.resolve()
+        run_dir = (project_root / relative_dir).resolve()
+        allowed_roots = [
+            (project_root / name).resolve()
+            for name in (
+                "experiments",
+                "experiments_phase2_5ep_20cfg",
+                "experiments_phase2_screen",
+                "experiments_phase2_v3_5ep_20cfg",
+            )
+        ]
+        if not any(root == run_dir or root in run_dir.parents for root in allowed_roots):
+            raise ValueError(f"Experiment artifact_dir is outside the configured run folders: {artifact_dir}")
+        checkpoint = run_dir / "best_model.pth"
+        if not checkpoint.is_file():
+            raise CheckpointNotFoundError(f"No best_model.pth checkpoint exists for experiment at {checkpoint}")
+        return checkpoint
+
     def _make_model(self, config: dict) -> torch.nn.Module:
         model_config = dict(config)
         model_config["pretrained_backbone"] = False

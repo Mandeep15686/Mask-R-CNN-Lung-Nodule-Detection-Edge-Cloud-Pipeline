@@ -238,6 +238,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                 ["Phase", details?.phase], ["Validation fold", config.fold],
                 ["Epochs", config.epochs], ["Batch size", config.batch_size],
                 ["Learning rate", config.lr], ["Data root", config.data_root],
+                ["Artifact folder", config.source_folder],
                 ["Created", details?.created_at], ["Started", details?.started_at],
                 ["Finished", details?.finished_at],
               ].map(([label, value]) => (
