@@ -20,11 +20,16 @@ async def run_simulation(args):
     from preprocessor import CTPreprocessor
     from feature_extractor import EdgeFeatureExtractor
     from compressor import FeatureCompressor
-    import torch, io
+    from edge_node import EDGE_MODEL_PATH, _serialize_feature_payload
+    import torch
 
     device = torch.device("cpu")
     prep   = CTPreprocessor(patch_size=64)
-    extractor = EdgeFeatureExtractor(split_layer=args.split, device=device)
+    extractor = EdgeFeatureExtractor(
+        split_layer=args.split,
+        device=device,
+        checkpoint_path=EDGE_MODEL_PATH if args.cloud else None,
+    )
     compressor = FeatureCompressor(method=args.compress, device=device)
 
     with open(args.image, "rb") as f:
@@ -59,13 +64,20 @@ async def run_simulation(args):
     print(f"[Edge] Compress:    {t_compress:.2f} ms | {raw_kb:.1f}→{comp_kb:.1f} KB (ratio={ratio:.2f}x)")
     print(f"[Edge] Total edge:  {(time.perf_counter()-t0)*1000:.2f} ms")
 
-    # 4. Simulate network upload
-    buf = io.BytesIO()
-    torch.save({"features": compressed, "scan_uid": "sim_001",
-                "edge_processing_ms": (time.perf_counter()-t0)*1000,
-                "bandwidth_mbps": 100.0, "compression_method": args.compress,
-                "compression_ratio": ratio}, buf)
-    payload = buf.getvalue()
+    # 4. Build the same wire payload used by the real edge node.
+    payload = _serialize_feature_payload(
+        compressed,
+        {
+            "scan_uid": "sim_001",
+            "edge_processing_ms": (time.perf_counter() - t0) * 1000,
+            "bandwidth_mbps": 100.0,
+            "compression_method": args.compress,
+            "compression_ratio": ratio,
+            "checkpoint_sha256": extractor.checkpoint_sha256,
+            "image_mean": extractor.image_mean,
+            "image_std": extractor.image_std,
+        },
+    )
     print(f"\n[Net]  Payload size:  {len(payload)/1024:.1f} KB")
 
     # Network conditions
@@ -90,7 +102,10 @@ async def run_simulation(args):
                     f"{args.cloud}/api/edge/infer-features",
                     data=payload,
                     params={"node_id": "sim", "scan_uid": "sim_001", "split_layer": args.split},
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "X-Edge-Token": os.getenv("EDGE_API_TOKEN", ""),
+                    },
                 ) as r:
                     result = await r.json()
                     cloud_ms = (time.perf_counter()-t_cloud)*1000
