@@ -10,7 +10,7 @@ import torch
 import numpy as np
 from training.losses import (
     BCELoss, SoftDiceLoss, BoundaryLoss, FocalLoss,
-    TverskyLoss, HausdorffDTLoss, CompositeMaskLoss,
+    HausdorffDTLoss, CompositeMaskLoss,
 )
 
 
@@ -172,34 +172,6 @@ class TestFocalLoss:
         logits, target = random_pred
         logits = logits.requires_grad_(True)
         FocalLoss()(logits, target).backward()
-        assert logits.grad is not None
-
-
-# ---------------------------------------------------------------------------
-# TverskyLoss tests
-# ---------------------------------------------------------------------------
-class TestTverskyLoss:
-    def test_symmetric_at_half(self, random_pred):
-        """At alpha=beta=0.5, Tversky == Dice."""
-        logits, target = random_pred
-        dice   = SoftDiceLoss()(logits, target).item()
-        tversky = TverskyLoss(alpha=0.5, beta=0.5)(logits, target).item()
-        assert abs(dice - tversky) < 0.01, (
-            f"Tversky(0.5,0.5) should ≈ Dice. Got dice={dice:.4f} tversky={tversky:.4f}"
-        )
-
-    def test_fn_penalisation(self, zero_pred):
-        """Higher beta (penalise FN more) → higher loss on all-zero pred."""
-        logits, target = zero_pred
-        t_low  = TverskyLoss(alpha=0.3, beta=0.7)(logits, target).item()
-        t_high = TverskyLoss(alpha=0.1, beta=0.9)(logits, target).item()
-        # Both high, but high beta should produce ≥ low beta loss
-        assert t_high >= t_low - 1e-4
-
-    def test_gradient_flows(self, random_pred):
-        logits, target = random_pred
-        logits = logits.requires_grad_(True)
-        TverskyLoss()(logits, target).backward()
         assert logits.grad is not None
 
 

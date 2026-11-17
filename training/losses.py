@@ -1,6 +1,6 @@
 """
 Composite loss functions for Mask R-CNN lung nodule segmentation.
-Supports: BCE, Soft-Dice, Boundary, Focal, Tversky, Hausdorff-DT losses.
+Supports: BCE, Soft-Dice, Boundary, Focal, and Hausdorff-DT losses.
 
 FIXES APPLIED
 =============
@@ -124,33 +124,7 @@ class FocalLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. Tversky Loss
-# ---------------------------------------------------------------------------
-class TverskyLoss(nn.Module):
-    def __init__(self, alpha: float = 0.3, beta: float = 0.7, smooth: float = 1e-6):
-        """
-        alpha: weight for FP penalties
-        beta:  weight for FN penalties (beta > alpha → penalise false negatives more)
-        """
-        super().__init__()
-        self.alpha  = alpha
-        self.beta   = beta
-        self.smooth = smooth
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_p   = torch.sigmoid(pred)
-        target_f = target.float()
-        tp = (pred_p * target_f).sum(dim=(-2, -1))
-        fp = (pred_p * (1 - target_f)).sum(dim=(-2, -1))
-        fn = ((1 - pred_p) * target_f).sum(dim=(-2, -1))
-        tversky = (tp + self.smooth) / (
-            tp + self.alpha * fp + self.beta * fn + self.smooth
-        )
-        return 1.0 - tversky.mean()
-
-
-# ---------------------------------------------------------------------------
-# 6. Hausdorff DT Loss (differentiable surrogate)
+# 5. Hausdorff DT Loss (differentiable surrogate)
 # ---------------------------------------------------------------------------
 class HausdorffDTLoss(nn.Module):
     """
@@ -212,8 +186,7 @@ class HausdorffDTLoss(nn.Module):
 class CompositeMaskLoss(nn.Module):
     """
     Configurable composite loss:
-      L = alpha*BCE + beta*Dice + gamma*Boundary + delta*Focal
-          + epsilon*HD95 + zeta*Tversky
+      L = alpha*BCE + beta*Dice + gamma*Boundary + delta*Focal + epsilon*HD_DT
 
     Research Usage:
       loss_fn = CompositeMaskLoss(alpha=0.3, beta=0.5, gamma=0.5, delta=0.0, epsilon=0.0)
@@ -226,18 +199,15 @@ class CompositeMaskLoss(nn.Module):
         gamma:   float = 0.0,   # Boundary weight
         delta:   float = 0.0,   # Focal weight
         epsilon: float = 0.0,   # HD95 weight
-        zeta:    float = 0.0,   # Tversky weight
         bce_pos_weight: float = 1.0,
         dice_smooth:    float = 1e-6,
         focal_alpha:    float = 0.25,
         focal_gamma:    float = 2.0,
-        tversky_alpha:  float = 0.3,
-        tversky_beta:   float = 0.7,
     ):
         super().__init__()
 
         # FIX-7: guard against all-zero weights — produces a constant with no gradient
-        if not any([alpha, beta, gamma, delta, epsilon, zeta]):
+        if not any([alpha, beta, gamma, delta, epsilon]):
             raise ValueError(
                 "CompositeMaskLoss: all loss weights are zero. "
                 "At least one weight must be > 0 to produce a gradient."
@@ -248,14 +218,12 @@ class CompositeMaskLoss(nn.Module):
         self.gamma   = gamma
         self.delta   = delta
         self.epsilon = epsilon
-        self.zeta    = zeta
 
         self.bce     = BCELoss(pos_weight=bce_pos_weight)
         self.dice    = SoftDiceLoss(smooth=dice_smooth)
         self.boundary = BoundaryLoss()
         self.focal   = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
         self.hd      = HausdorffDTLoss()
-        self.tversky = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -296,11 +264,6 @@ class CompositeMaskLoss(nn.Module):
             components["hd"] = l_hd
             total = total + self.epsilon * l_hd
 
-        if self.zeta > 0:
-            l_tversky = self.tversky(pred, target)
-            components["tversky"] = l_tversky
-            total = total + self.zeta * l_tversky
-
         components["total"] = total
         return components
 
@@ -312,9 +275,6 @@ class CompositeMaskLoss(nn.Module):
             gamma=cfg.get("gamma", 0.0),
             delta=cfg.get("delta", 0.0),
             epsilon=cfg.get("epsilon", 0.0),
-            zeta=cfg.get("zeta", 0.0),
-            tversky_alpha=cfg.get("tversky_alpha", 0.3),
-            tversky_beta=cfg.get("tversky_beta",  0.7),
         )
 
     def describe(self) -> str:
@@ -325,7 +285,6 @@ class CompositeMaskLoss(nn.Module):
             "gamma":   "Boundary",
             "delta":   "Focal",
             "epsilon": "HD_DT",   # renamed: not exact HD95
-            "zeta":    "Tversky",
         }
         for attr, name in names.items():
             w = getattr(self, attr)

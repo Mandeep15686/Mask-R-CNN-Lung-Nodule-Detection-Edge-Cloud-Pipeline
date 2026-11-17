@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 
 class TestInferenceEngine:
+    last_edge_feature_call = None
     status = {
         "model_loaded": True,
         "checkpoint_path": "test-checkpoint.pth",
@@ -39,6 +40,10 @@ class TestInferenceEngine:
     def predict_from_features(self, features, scan_uid):
         return []
 
+    def predict_from_edge_features(self, features, split_layer, scan_uid, **metadata):
+        TestInferenceEngine.last_edge_feature_call = (features, split_layer, scan_uid)
+        return []
+
     def load_checkpoint(self, checkpoint_path):
         return None
 # ---------------------------------------------------------------------------
@@ -51,6 +56,7 @@ def client():
         db_path = os.path.join(db_dir, "test_lung_nodule.db")
         os.environ["DATABASE_URL"] = f"sqlite:///{db_path.replace(os.sep, '/')}"
         os.environ["MODEL_PATH"] = "/nonexistent/model.pth"
+        os.environ["APP_ENV"] = "test"
         raw_root = os.path.join(db_dir, "raw")
         cache_dir = os.path.join(db_dir, "patch-cache")
         os.makedirs(cache_dir)
@@ -338,6 +344,43 @@ class TestEdge:
     def test_heartbeat_unknown_node(self, client):
         r = client.post("/api/edge/nodes/nonexistent-node/heartbeat")
         assert r.status_code == 404
+
+    def test_network_probe_reports_received_bytes(self, client):
+        payload = b"p" * 65536
+        response = client.post(
+            "/api/edge/network-probe",
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert response.status_code == 200
+        assert response.json()["bytes_received"] == len(payload)
+
+    def test_feature_endpoint_routes_cumulative_backbone_maps(self, client, monkeypatch):
+        monkeypatch.delenv("EDGE_API_TOKEN", raising=False)
+        TestInferenceEngine.last_edge_feature_call = None
+        header = {
+            "version": 2,
+            "keys": ["layer1", "layer2"],
+            "shapes": [[1, 1, 1, 1], [1, 1, 1, 1]],
+            "dtypes": ["int8", "int8"],
+            "scales": [0.25, 0.5],
+            "zero_points": [0, -1],
+            "checkpoint_sha256": "test-checkpoint",
+            "image_mean": [0.485, 0.456, 0.406],
+            "image_std": [0.229, 0.224, 0.225],
+        }
+        body = json.dumps(header).encode("utf-8") + b"\x00" + b"\x01\x02"
+        response = client.post(
+            "/api/edge/infer-features",
+            params={"node_id": "test-edge-01", "scan_uid": "scan-feature", "split_layer": "layer2"},
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert response.status_code == 200, response.text
+        features, split_layer, scan_uid = TestInferenceEngine.last_edge_feature_call
+        assert set(features) == {"layer1", "layer2"}
+        assert all(value.is_quantized for value in features.values())
+        assert (split_layer, scan_uid) == ("layer2", "scan-feature")
 
     def test_log_network_event(self, client):
         r = client.post("/api/edge/network-log", json={

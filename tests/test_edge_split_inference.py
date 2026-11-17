@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from backend.app.ml.inference import InferenceEngine, InferenceUnavailableError
-from backend.app.schemas import LossWeights
 
 
 class _Stage(nn.Module):
@@ -101,18 +100,6 @@ def test_edge_split_runs_remaining_stages_in_order_and_builds_all_fpn_levels(
     ) == []
     assert calls == list(cloud_layers)
     assert fpn.keys == ["0", "1", "2", "3"]
-
-
-def test_tversky_weight_is_a_valid_standalone_loss_configuration():
-    weights = LossWeights(
-        alpha=0.0,
-        beta=0.0,
-        gamma=0.0,
-        delta=0.0,
-        epsilon=0.0,
-        zeta=0.4,
-    )
-    assert weights.is_valid()
 
 
 def test_edge_split_rejects_mismatched_checkpoint_and_normalization():

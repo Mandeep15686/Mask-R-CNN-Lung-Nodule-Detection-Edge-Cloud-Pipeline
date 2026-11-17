@@ -343,7 +343,6 @@ class Trainer:
                 "gamma": self.config.get("mask_loss", {}).get("gamma", 0),
                 "delta": self.config.get("mask_loss", {}).get("delta", 0),
                 "epsilon": self.config.get("mask_loss", {}).get("epsilon", 0),
-                "zeta": self.config.get("mask_loss", {}).get("zeta", 0),
             },
             "final_metrics": self.history[-1] if self.history else {},
             "data_split": self.data_split,

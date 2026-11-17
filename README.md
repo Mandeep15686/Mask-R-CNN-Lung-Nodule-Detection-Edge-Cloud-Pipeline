@@ -271,7 +271,7 @@ The cache endpoint reports the runtime-resolved paths, validation result, patch 
 
 ### Phase 1: single-loss ablations
 
-Runs BCE, Dice, Boundary, Focal, Tversky, and distance-transform Hausdorff surrogate configurations:
+Runs BCE, Dice, Boundary, Focal, and distance-transform Hausdorff surrogate configurations:
 
 ```powershell
 python scripts/run_experiments.py `
@@ -344,10 +344,10 @@ The CLI also accepts `--fold` (legacy fold split), `--test-subset` (only when a 
 The composite mask objective supports these weights/components:
 
 ```text
-L = α·BCE + β·Dice + γ·Boundary + δ·Focal + ε·HD_DT + ζ·Tversky
+L = α·BCE + β·Dice + γ·Boundary + δ·Focal + ε·HD_DT
 ```
 
-`HD_DT` is a distance-transform surrogate; it is not an exact differentiable HD95. Phase 2 currently searches only `α`, `β`, and `γ`; Phase 3 samples `α`, `β`, `γ`, `δ`, and `ε`. The Phase 1 CLI also includes the Tversky (`ζ`) ablation. The web experiment form exposes the five weights `α` through `ε`.
+`HD_DT` is a distance-transform surrogate; it is not an exact differentiable HD95. Phase 2 currently searches only `α`, `β`, and `γ`; Phase 3 samples `α`, `β`, `γ`, `δ`, and `ε`. Phase 1 evaluates the five supported loss terms. The web experiment form exposes the five weights `α` through `ε`.
 
 Validation includes Dice, IoU, HD95, boundary F1, sensitivity, specificity, average surface distance, and volume error where defined. The training evaluator also reports sampled-negative-patch false-positive rate and sampled-patch detections-per-scan proxy. Those are patch-sampling diagnostics, not official scan-level false positives per scan. A metric can be unavailable on a dataset that lacks the cases needed to define it.
 
@@ -424,7 +424,7 @@ Interactive request/response schemas are available at <http://localhost:8000/doc
 | `GET` | `/api/results/pareto` | Validation Dice vs. HD95 Pareto set; optional filters |
 | `GET` | `/api/results/experiment/{id}/learning-curve` | Epoch learning curve |
 
-The experiment API supports `loss_weights` (`alpha` BCE, `beta` Dice, `gamma` Boundary, `delta` Focal, `epsilon` distance-transform Hausdorff surrogate), `cache_mode`, `cache_dir`, `patch_size`, epochs, batch size, learning rate, and optional explicit subset split. The CLI additionally includes the Phase 1 Tversky ablation.
+The experiment API and CLI support `loss_weights` (`alpha` BCE, `beta` Dice, `gamma` Boundary, `delta` Focal, `epsilon` distance-transform Hausdorff surrogate), `cache_mode`, `cache_dir`, `patch_size`, epochs, batch size, learning rate, and optional explicit subset split.
 
 Example development request (replace the paths and split with files that actually exist on the backend host):
 

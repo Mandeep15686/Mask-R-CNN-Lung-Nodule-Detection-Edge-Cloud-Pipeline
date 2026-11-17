@@ -24,7 +24,7 @@ experiment = load_module("experiment", "training/experiment.py")
 # ---------------------------------------------------------------------------
 class TestPhase1Configs:
     def test_count(self):
-        assert len(experiment.PHASE1_CONFIGS) == 6
+        assert len(experiment.PHASE1_CONFIGS) == 5
 
     def test_all_have_config_id(self):
         for c in experiment.PHASE1_CONFIGS:
@@ -39,7 +39,7 @@ class TestPhase1Configs:
         """Each Phase 1 config should activate exactly one loss."""
         for c in experiment.PHASE1_CONFIGS:
             ml    = c["mask_loss"]
-            keys  = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+            keys  = ["alpha", "beta", "gamma", "delta", "epsilon"]
             active = [v for k, v in ml.items() if k in keys and v > 0]
             assert len(active) == 1, (
                 f"{c['config_id']} should use exactly 1 loss, "
@@ -56,15 +56,15 @@ class TestPhase1Configs:
         ids = [c["config_id"] for c in experiment.PHASE1_CONFIGS]
         assert len(ids) == len(set(ids))
 
-    def test_covers_all_six_losses(self):
-        """All configured loss types, including Tversky, appear in Phase 1."""
+    def test_covers_all_five_losses(self):
+        """All supported loss types appear in Phase 1."""
         active_keys = set()
         for c in experiment.PHASE1_CONFIGS:
             ml = c["mask_loss"]
             for k, v in ml.items():
                 if v > 0:
                     active_keys.add(k)
-        assert active_keys == {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
+        assert active_keys == {"alpha", "beta", "gamma", "delta", "epsilon"}
 
 
 # ---------------------------------------------------------------------------
