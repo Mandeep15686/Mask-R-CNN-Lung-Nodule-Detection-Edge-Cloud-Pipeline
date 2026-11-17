@@ -5,18 +5,22 @@
 # =============================================================================
 
 .PHONY: help setup setup-dev data backend frontend edge \
-        docker docker-gpu docker-down \
+        docker docker-gpu docker-down docker-logs data-real \
         train-p1 train-p2 train-p3 \
         evaluate federated dp \
+        simulate-edge simulate-edge-cloud \
         test test-metrics test-api test-losses \
         lint clean
 
 PYTHON      ?= python3
 DATA_ROOT   ?= ./data/luna16
+SYNTHETIC_DATA_ROOT ?= ./data/synthetic_luna16
+SAMPLE_PATCH_DIR ?= ./data/sample_patches
 EXP_OUT     ?= ./experiments
 EVAL_OUT    ?= ./eval_results
 FOLD        ?= 0
 TEST_FOLD   ?= 9
+DP_FOLD     ?= $(TEST_FOLD)
 EPOCHS      ?= 30
 BATCH       ?= 4
 CHECKPOINT  ?= $(EXP_OUT)/best_model.pth
@@ -69,17 +73,19 @@ setup:
 	cd frontend && npm install
 
 setup-dev: setup
-	$(PYTHON) -m pip install pytest pytest-asyncio httpx optuna flwr scikit-learn
+	$(PYTHON) -m pip install pytest pytest-asyncio httpx optuna flwr scikit-learn flake8
 	@echo "Dev tools installed."
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 data:
 	@echo "Generating synthetic LUNA16 test data..."
 	$(PYTHON) scripts/generate_test_data.py \
-	  --out $(DATA_ROOT) \
+	  --out $(SYNTHETIC_DATA_ROOT) \
+	  --patch-dir $(SAMPLE_PATCH_DIR) \
 	  --n-scans 20 \
 	  --n-nodules 3 \
 	  --subsets 2
+	@echo "Use DATA_ROOT=$(SYNTHETIC_DATA_ROOT) when running training/evaluation commands on this synthetic data."
 
 data-real:
 	@echo "Download LUNA16 from https://luna16.grand-challenge.org/Download/"
@@ -182,22 +188,17 @@ dp:
 	  --checkpoint $(CHECKPOINT) \
 	  --data $(DATA_ROOT) \
 	  --split layer2 \
+	  --fold $(DP_FOLD) \
 	  --epsilons 0.1 0.5 1.0 5.0 10.0 50.0 \
 	  --out $(EXP_OUT)/cn5_dp
 
 simulate-edge:
-	@$(eval SAMPLE := $(shell ls data/sample_patches/*.png 2>/dev/null | head -1))
-	@if [ -z "$(SAMPLE)" ]; then \
-	  echo "No sample patches found. Run 'make data' first."; exit 1; fi
 	PYTHONPATH=. $(PYTHON) scripts/simulate_edge.py \
-	  --image $(SAMPLE) \
 	  --split layer2 \
 	  --compress int8
 
 simulate-edge-cloud:
-	@$(eval SAMPLE := $(shell ls data/sample_patches/*.png 2>/dev/null | head -1))
 	PYTHONPATH=. $(PYTHON) scripts/simulate_edge.py \
-	  --image $(SAMPLE) \
 	  --split layer2 \
 	  --compress int8 \
 	  --cloud http://localhost:8000

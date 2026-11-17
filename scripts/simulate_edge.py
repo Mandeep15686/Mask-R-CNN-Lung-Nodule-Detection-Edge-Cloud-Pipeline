@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import sys, os
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../edge"))
@@ -36,7 +37,7 @@ async def run_simulation(args):
         img_bytes = f.read()
 
     print(f"\n{'='*60}")
-    print(f"Edge–Cloud Pipeline Simulation")
+    print("Edge–Cloud Pipeline Simulation")
     print(f"  Split layer : {args.split}")
     print(f"  Compression : {args.compress}")
     print(f"  Image       : {args.image} ({len(img_bytes)/1024:.1f} KB)")
@@ -51,6 +52,7 @@ async def run_simulation(args):
     t1 = time.perf_counter()
     features = extractor.extract(patch.unsqueeze(0))
     t_extract = (time.perf_counter()-t1)*1000
+    print(f"[Edge] Feature extraction: {t_extract:.2f} ms")
     for k, v in features.items():
         print(f"[Edge] Features [{k}]: shape={list(v.shape)}, size={v.numel()*4/1024:.1f} KB (fp32)")
 
@@ -61,7 +63,7 @@ async def run_simulation(args):
     comp_kb = sum(v.numel()*v.element_size() for v in compressed.values() if hasattr(v,"numel")) / 1024
     raw_kb  = sum(v.numel()*4 for v in features.values()) / 1024
     ratio = raw_kb / max(comp_kb, 0.001)
-    print(f"[Edge] Compress:    {t_compress:.2f} ms | {raw_kb:.1f}→{comp_kb:.1f} KB (ratio={ratio:.2f}x)")
+    print(f"[Edge] Compress:    {t_compress:.2f} ms | {raw_kb:.1f} -> {comp_kb:.1f} KB (ratio={ratio:.2f}x)")
     print(f"[Edge] Total edge:  {(time.perf_counter()-t0)*1000:.2f} ms")
 
     # 4. Build the same wire payload used by the real edge node.
@@ -118,11 +120,17 @@ async def run_simulation(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--image",    required=True, help="Path to CT patch image (PNG/JPEG)")
+    p.add_argument("--image",    default=None, help="Path to CT patch image (PNG/JPEG); defaults to the first generated sample")
     p.add_argument("--split",    default="layer2", choices=["layer1","layer2","layer3"])
     p.add_argument("--compress", default="int8",   choices=["none","int8","learned"])
     p.add_argument("--cloud",    default=None,  help="Cloud API URL (optional, e.g. http://localhost:8000)")
     args = p.parse_args()
+    if args.image is None:
+        project_root = Path(__file__).resolve().parents[1]
+        sample_images = sorted((project_root / "data" / "sample_patches").glob("*.png"))
+        if not sample_images:
+            p.error("No sample patches found. Run 'make data' or pass --image PATH.")
+        args.image = str(sample_images[0])
     asyncio.run(run_simulation(args))
 
 

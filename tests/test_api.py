@@ -94,8 +94,26 @@ def client():
         os.environ["DATA_ROOT"] = raw_root
         os.environ["LUNA16_CACHE_DIR"] = cache_dir
 
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        import backend.app.database as database_module
         from backend.app.main import app
-        from backend.app.database import engine
+
+        # Other test modules may import the database module during collection,
+        # before this fixture sets DATABASE_URL. Rebind its globals so API
+        # requests and create_tables use this fixture's temporary database.
+        original_engine = database_module.engine
+        original_session_local = database_module.SessionLocal
+        original_database_url = database_module.DATABASE_URL
+        test_engine = create_engine(
+            f"sqlite:///{db_path.replace(os.sep, '/')}",
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+        database_module.engine = test_engine
+        database_module.SessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=test_engine
+        )
+        database_module.DATABASE_URL = f"sqlite:///{db_path.replace(os.sep, '/')}"
 
         try:
             from backend.app.ml import inference as inference_module
@@ -108,9 +126,12 @@ def client():
                 with TestClient(app) as c:
                     yield c
         finally:
-            # Close pooled SQLite connections before the temporary directory
-            # removes the test database.
-            engine.dispose()
+            # Close the fixture's connections before its temporary directory
+            # removes the test database, then restore the shared test globals.
+            test_engine.dispose()
+            database_module.engine = original_engine
+            database_module.SessionLocal = original_session_local
+            database_module.DATABASE_URL = original_database_url
 
             import gc
             gc.collect()

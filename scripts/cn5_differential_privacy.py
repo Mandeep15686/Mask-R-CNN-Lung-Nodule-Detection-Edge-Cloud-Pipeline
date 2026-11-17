@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-CN5 Research: Differential Privacy for Edge–Cloud Feature Transmission.
+CN5 prototype: Gaussian perturbation of edge features.
+
+This script does not establish a formal differential privacy guarantee. Its
+current Dice routine reconstructs a crude image from noised features instead
+of continuing the model from those features, and its MIA member/non-member
+samples are not separated by scan UID. Treat its outputs as exploratory only.
 
 Applies Gaussian noise (ε-DP) to intermediate feature maps at the split point
 and measures the privacy–utility tradeoff:
@@ -20,7 +25,6 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +45,10 @@ def add_gaussian_dp_noise(
     sensitivity: float = 1.0,
 ) -> dict:
     """
-    Add calibrated Gaussian noise to feature tensors to achieve (ε, δ)-DP.
+    Add Gaussian noise to feature tensors using the conventional sigma formula.
+
+    This helper alone does not guarantee (ε, δ)-DP: the feature sensitivity is
+    not bounded here and repeated-query accounting is not implemented.
 
     Noise std σ = (sensitivity / epsilon) * sqrt(2 * ln(1.25 / delta))
 
@@ -161,7 +168,6 @@ def run_dp_experiment(
     import torch
     from training.model import LungNoduleMaskRCNN
     from training.dataset import LUNA16Dataset
-    from training.metrics import dice_score
     from edge.feature_extractor import EdgeFeatureExtractor
     from torch.utils.data import DataLoader
 
@@ -170,13 +176,23 @@ def run_dp_experiment(
 
     # Load model
     ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    cfg   = ckpt.get("config", {})
-    model = LungNoduleMaskRCNN(num_classes=2, mask_loss_cfg=cfg.get("mask_loss", {}))
-    model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
+    cfg = dict(ckpt.get("config", {}))
+    cfg["pretrained_backbone"] = False
+    model = LungNoduleMaskRCNN.from_config(cfg)
+    state = dict(ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
+    old_bce_key = "composite_mask_loss.bce.loss_fn.pos_weight"
+    new_bce_key = "composite_mask_loss.bce.pos_weight"
+    if old_bce_key in state and new_bce_key not in state:
+        state[new_bce_key] = state.pop(old_bce_key)
+    model.load_state_dict(state, strict=True)
     model.to(device).eval()
 
     # Feature extractor (edge)
-    extractor = EdgeFeatureExtractor(split_layer=split_layer, device=device)
+    extractor = EdgeFeatureExtractor(
+        split_layer=split_layer,
+        device=device,
+        checkpoint_path=checkpoint_path,
+    )
 
     # Dataset — use test fold
     ds = LUNA16Dataset(data_root, subsets=[fold], patch_size=64, augment=False)
@@ -184,7 +200,6 @@ def run_dp_experiment(
 
     # Collect training (member) and test (non-member) features
     member_feats, nonmember_feats = [], []
-    member_preds,  nonmember_preds = [], []
 
     logger.info(f"Extracting features from {min(n_samples * 2, len(ds))} samples...")
     with torch.no_grad():
@@ -219,7 +234,7 @@ def run_dp_experiment(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for eps in epsilons:
-        logger.info(f"\n--- ε = {eps} ---")
+        logger.info(f"\n--- epsilon = {eps} ---")
         sigma = 0.0 if eps == float("inf") else (1.0 / eps) * np.sqrt(2 * np.log(1.25 / delta))
 
         # Add DP noise to features
@@ -259,8 +274,8 @@ def run_dp_experiment(
         }
         results.append(entry)
         logger.info(
-            f"  σ={sigma:.3f}  Dice={dice_noised:.4f} (drop={dice_drop:.4f})  "
-            f"MIA={mia_noised or '—'}"
+            f"  sigma={sigma:.3f}  Dice={dice_noised:.4f} (drop={dice_drop:.4f})  "
+            f"MIA={mia_noised if mia_noised is not None else 'unavailable'}"
         )
 
     # Save results
@@ -278,11 +293,11 @@ def run_dp_experiment(
 
     # Print table
     print(f"\n{'='*72}")
-    print(f"CN5 · Differential Privacy — Privacy–Utility Tradeoff")
+    print("CN5 - Differential Privacy - Privacy-Utility Tradeoff")
     print(f"Split: {split_layer} | Checkpoint: {Path(checkpoint_path).parent.name}")
-    print(f"Baseline: Dice={baseline_dice:.4f}  MIA={baseline_mia or '—'}")
+    print(f"Baseline: Dice={baseline_dice:.4f}  MIA={baseline_mia if baseline_mia is not None else 'unavailable'}")
     print(f"{'-'*72}")
-    print(f"{'ε':>8}  {'σ':>8}  {'Dice':>7}  {'ΔDice':>7}  {'MIA acc':>8}  {'ΔMIA':>7}")
+    print(f"{'epsilon':>8}  {'sigma':>8}  {'Dice':>7}  {'delta Dice':>10}  {'MIA acc':>8}  {'delta MIA':>9}")
     print(f"{'-'*72}")
     for r in results:
         print(
@@ -299,7 +314,7 @@ def run_dp_experiment(
 
 
 # ---------------------------------------------------------------------------
-# Helper: measure Dice running cloud-side inference from (noisy) features
+# Helper: measure an approximate Dice proxy from (noisy) features
 # ---------------------------------------------------------------------------
 def _measure_dice_from_features(
     model, feature_list: list, loader, device, noise_sigma: float = 0.0
@@ -307,40 +322,45 @@ def _measure_dice_from_features(
     """
     Average Dice over a list of pre-extracted (and optionally noised) features.
 
-    FIX-16: The noised features are now actually used during inference.
-    The noised feature map is upsampled back to the original patch size and
-    passed through the model, making the Dice score sensitive to noise_sigma
-    (and therefore to epsilon). Without this fix, changing epsilon had zero
-    effect on the reported Dice score.
+    FIX-16: The noised features are now actually used for inference.
+    The noised features are converted to a crude image approximation and fed
+    through the full model. This is a prototype proxy, not split inference.
     """
     import torch
     import torch.nn.functional as F
     from training.metrics import dice_score
+
     dices = []
     loader_iter = iter(loader)
+
     with torch.no_grad():
         for feat_dict in feature_list[:20]:
             try:
                 batch = next(loader_iter)
             except StopIteration:
                 break
+
             gt_mask = batch["mask"][0].numpy()
-            # FIX-16: move noised features to device -- these are what we use
+            # FIX-16: move the noised features to the inference device
             feat_device = {k: v.to(device) for k, v in feat_dict.items()}
+
             try:
                 imgs = batch["image"].to(device)
                 B, C, H, W = imgs.shape
 
-                # Upscale the noised feature map back to the original patch size.
-                # This is lossy but it makes Dice sensitive to the noise level.
-                feat_key = list(feat_device.keys())[-1]
-                feat_up = F.interpolate(
+                # --- Crude noised-feature reconstruction proxy ----------------
+                # Reconstruct an approximation of the input by bilinear-upsampling
+                # the noised feature map back to the original patch resolution.
+                # It is not a valid substitute for model continuation from the
+                # transmitted backbone features.
+                feat_key  = list(feat_device.keys())[-1]
+                feat_up   = F.interpolate(
                     feat_device[feat_key],
                     size=(H, W),
                     mode="bilinear",
                     align_corners=False,
                 )
-                # Average across channels to get a 3-channel approximation
+                # Project channels back to 3 (RGB) with a 1×1 average
                 feat_rgb = feat_up.mean(dim=1, keepdim=True).expand(-1, 3, -1, -1)
                 # Normalise to [0, 1]
                 feat_min = feat_rgb.amin(dim=(2, 3), keepdim=True)
@@ -351,12 +371,14 @@ def _measure_dice_from_features(
                 if len(out) > 0 and len(out[0].get("masks", [])) > 0:
                     scores = out[0]["scores"].cpu().numpy()
                     if len(scores) > 0:
-                        best = int(np.argmax(scores))
-                        pred = out[0]["masks"][best, 0].cpu().numpy()
+                        best     = int(np.argmax(scores))
+                        pred     = out[0]["masks"][best, 0].cpu().numpy()
                         pred_bin = (pred > 0.3).astype(np.uint8)
                         dices.append(dice_score(pred_bin, gt_mask))
+
             except Exception as exc:
                 logger.debug("Inference failed for one sample: %s", exc)
+
     return float(np.mean(dices)) if dices else 0.0
 
 

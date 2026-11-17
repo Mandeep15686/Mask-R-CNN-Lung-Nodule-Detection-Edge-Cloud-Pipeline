@@ -8,10 +8,9 @@ FIX-16  Noised features not passed to model inference:
           but then ran `out = model(list(imgs))` using the *original* raw images.
           Changing epsilon had zero effect on the Dice score because the noise
           was computed and then discarded.
-  AFTER:  The function now passes the noised features to the cloud endpoint's
-          split-inference route.  If that route is not yet implemented (501),
-          it falls back to full inference on the noised + reconstructed image,
-          making the epsilon-Dice curve at least reflect some effect of the noise.
+  AFTER:  The function now uses the noised features to build a crude image
+          approximation and runs the full model on it. This is only a proxy;
+          it is not cloud split inference or a valid segmentation utility score.
 
 NOTE: A truly valid (ε,δ)-DP guarantee also requires:
   1. Bounded L2 sensitivity (clip features before adding noise).
@@ -36,10 +35,8 @@ def _measure_dice_from_features(
     Average Dice over a list of pre-extracted (and optionally noised) features.
 
     FIX-16: The noised features are now actually used for inference.
-    When the split-inference cloud endpoint is available, features are sent
-    there.  Otherwise, the noised features are decoded back to pixel space via
-    nearest-neighbour upsampling and fed through the full model — a lossy but
-    at least epsilon-dependent fallback.
+    The noised features are converted to a crude image approximation and fed
+    through the full model. This is a prototype proxy, not split inference.
     """
     import torch
     import torch.nn.functional as F
@@ -63,40 +60,33 @@ def _measure_dice_from_features(
                 imgs = batch["image"].to(device)
                 B, C, H, W = imgs.shape
 
-                # --- Attempt 1: cloud split-inference route --------------------
-                # This path will work once the FPN feature-contract mismatch
-                # (edge/feature_extractor → cloud /edge/predict) is resolved.
-                # For now it falls through to Attempt 2.
-                cloud_out = None  # placeholder; wire up HTTP call here when ready
-
-                # --- Attempt 2: upscale noised features → crude reconstruction -
+                # --- Crude noised-feature reconstruction proxy ----------------
                 # Reconstruct an approximation of the input by bilinear-upsampling
                 # the noised feature map back to the original patch resolution.
-                # This is lossy but it makes the Dice metric sensitive to sigma.
-                if cloud_out is None:
-                    # Use the last available feature level (deepest = most compressed)
-                    feat_key  = list(feat_device.keys())[-1]
-                    feat_up   = F.interpolate(
-                        feat_device[feat_key],
-                        size=(H, W),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    # Project channels back to 3 (RGB) with a 1×1 average
-                    feat_rgb = feat_up.mean(dim=1, keepdim=True).expand(-1, 3, -1, -1)
-                    # Normalise to [0, 1]
-                    feat_min = feat_rgb.amin(dim=(2, 3), keepdim=True)
-                    feat_max = feat_rgb.amax(dim=(2, 3), keepdim=True)
-                    feat_norm = (feat_rgb - feat_min) / (feat_max - feat_min + 1e-6)
+                # It is not a valid substitute for model continuation from the
+                # transmitted backbone features.
+                feat_key  = list(feat_device.keys())[-1]
+                feat_up   = F.interpolate(
+                    feat_device[feat_key],
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                # Project channels back to 3 (RGB) with a 1×1 average
+                feat_rgb = feat_up.mean(dim=1, keepdim=True).expand(-1, 3, -1, -1)
+                # Normalise to [0, 1]
+                feat_min = feat_rgb.amin(dim=(2, 3), keepdim=True)
+                feat_max = feat_rgb.amax(dim=(2, 3), keepdim=True)
+                feat_norm = (feat_rgb - feat_min) / (feat_max - feat_min + 1e-6)
 
-                    out = model(list(feat_norm))
-                    if len(out) > 0 and len(out[0].get("masks", [])) > 0:
-                        scores = out[0]["scores"].cpu().numpy()
-                        if len(scores) > 0:
-                            best     = int(np.argmax(scores))
-                            pred     = out[0]["masks"][best, 0].cpu().numpy()
-                            pred_bin = (pred > 0.3).astype(np.uint8)
-                            dices.append(dice_score(pred_bin, gt_mask))
+                out = model(list(feat_norm))
+                if len(out) > 0 and len(out[0].get("masks", [])) > 0:
+                    scores = out[0]["scores"].cpu().numpy()
+                    if len(scores) > 0:
+                        best     = int(np.argmax(scores))
+                        pred     = out[0]["masks"][best, 0].cpu().numpy()
+                        pred_bin = (pred > 0.3).astype(np.uint8)
+                        dices.append(dice_score(pred_bin, gt_mask))
 
             except Exception as exc:
                 logger.debug("Inference failed for one sample: %s", exc)
@@ -121,7 +111,7 @@ def _measure_dice_from_features(
 #
 
 if __name__ == "__main__":
-    import argparse, ast, pathlib, textwrap
+    import argparse, pathlib, textwrap
 
     parser = argparse.ArgumentParser(description="Apply FIX-16 to cn5_differential_privacy.py")
     parser.add_argument("--apply", action="store_true")
@@ -141,7 +131,7 @@ if __name__ == "__main__":
         if not target.exists():
             raise FileNotFoundError(f"Target not found: {target}")
 
-        src = target.read_text()
+        src = target.read_text(encoding="utf-8")
         MARKER_START = "def _measure_dice_from_features("
         MARKER_END_SIGNATURE = "    return float(np.mean(dices)) if dices else 0.0\n"
 
@@ -150,7 +140,12 @@ if __name__ == "__main__":
         if start == -1 or end == -1:
             raise ValueError("Could not locate _measure_dice_from_features in the file.")
 
+        current_function = src[start:end]
+        if "FIX-16: The noised features are now actually used for inference." in current_function:
+            print(f"FIX-16 already present in {target}; no changes written.")
+            raise SystemExit(0)
+
         end   += len(MARKER_END_SIGNATURE)
         new_src = src[:start] + textwrap.dedent(REPLACEMENT_FUNCTION).lstrip("\n") + src[end:]
-        target.write_text(new_src)
+        target.write_text(new_src, encoding="utf-8")
         print(f"Patched {target}")

@@ -168,9 +168,15 @@ def run_split_analysis(
 
     # Load model
     ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    cfg   = ckpt.get("config", {})
-    model = LungNoduleMaskRCNN(num_classes=2, mask_loss_cfg=cfg.get("mask_loss", {}))
-    model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
+    cfg = dict(ckpt.get("config", {}))
+    cfg["pretrained_backbone"] = False
+    model = LungNoduleMaskRCNN.from_config(cfg)
+    state = dict(ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
+    old_bce_key = "composite_mask_loss.bce.loss_fn.pos_weight"
+    new_bce_key = "composite_mask_loss.bce.pos_weight"
+    if old_bce_key in state and new_bce_key not in state:
+        state[new_bce_key] = state.pop(old_bce_key)
+    model.load_state_dict(state, strict=True)
     model.to(device).eval()
     logger.info(f"Model loaded from {checkpoint_path}")
 
@@ -192,7 +198,11 @@ def run_split_analysis(
         if split_layer in ("input", "cloud_only"):
             extractor = None
         else:
-            extractor = EdgeFeatureExtractor(split_layer=split_layer, device=device)
+            extractor = EdgeFeatureExtractor(
+                split_layer=split_layer,
+                device=device,
+                checkpoint_path=checkpoint_path,
+            )
 
         profile = profile_split_point(
             split_layer=split_layer,
@@ -255,10 +265,9 @@ def run_split_analysis(
 
     # Print summary table
     print(f"\n{'='*78}")
-    print(f"CN1 · Split-Point Latency Analysis")
+    print("CN1 · Split-Point Latency Analysis")
     print(f"{'='*78}")
-    header = f"{'Split Layer':<14}" + "".join(f"{c:>14}" for c in conditions)
-    print(f"\n  Total Latency (ms) per network condition:\n")
+    print("\n  Total Latency (ms) per network condition:\n")
     print(f"  {'Split Layer':<14}" + "".join(f"{c:>14}" for c in conditions))
     print(f"  {'-'*14}" + "".join(f"{'':->14}" for _ in conditions))
     for split_layer in SPLIT_LAYERS:
@@ -269,14 +278,14 @@ def run_split_analysis(
             row += f"{match['total_ms']:>13.1f} " if match else f"{'—':>14}"
         print(row)
 
-    print(f"\n  Feature map sizes per split layer:")
+    print("\n  Feature map sizes per split layer:")
     for split_layer, p in profiles.items():
         print(f"  {split_layer:<14}  {p['avg_feature_kb']:>8.1f} KB  "
               f"(edge={p['avg_edge_ms']:.1f}ms, cloud={p['avg_cloud_ms']:.1f}ms)")
 
-    print(f"\n  Optimal split per condition:")
+    print("\n  Optimal split per condition:")
     for cond_name, opt in optimal.items():
-        print(f"  {cond_name:<8}  →  {opt['split_layer']:<14}  "
+        print(f"  {cond_name:<8}  ->  {opt['split_layer']:<14}  "
               f"total={opt['total_ms']:.1f}ms  feature={opt['feature_kb']:.1f}KB")
 
     print(f"\n  Full report saved to: {out_dir}/cn1_split_analysis.json")
