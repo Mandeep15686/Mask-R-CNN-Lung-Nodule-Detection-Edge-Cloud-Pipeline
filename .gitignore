@@ -28,6 +28,8 @@ data/
 
 # Experiment outputs
 experiments/
+experiments_phase2_screen/
+experiments_phase2_5ep_20cfg/
 experiments_phase2_v3_5ep_20cfg/
 eval_results/
 mlflow_data/
