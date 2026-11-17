@@ -243,6 +243,46 @@ class TestDifferentialPrivacy:
 # ---------------------------------------------------------------------------
 # Network monitor tests (pure-python, no network calls)
 # ---------------------------------------------------------------------------
+def test_v2_feature_serializer_preserves_int8_bytes():
+    import json
+    import torch
+    from edge_node import _serialize_feature_payload
+
+    source = torch.linspace(-1.0, 1.0, steps=128).reshape(1, 2, 8, 8)
+    quantized = torch.quantize_per_tensor(source, scale=1 / 64, zero_point=0, dtype=torch.qint8)
+    payload = _serialize_feature_payload({"layer1": quantized}, {"split_layer": "layer1"})
+    header_bytes, raw = payload.split(b"\x00", 1)
+    header = json.loads(header_bytes)
+
+    assert header["version"] == 2
+    assert header["dtypes"] == ["int8"]
+    assert header["scales"] == [pytest.approx(1 / 64)]
+    assert header["zero_points"] == [0]
+    assert len(raw) == quantized.numel()
+    restored_int8 = torch.frombuffer(bytearray(raw), dtype=torch.int8).reshape(quantized.shape)
+    restored = torch._make_per_tensor_quantized_tensor(
+        restored_int8, header["scales"][0], header["zero_points"][0]
+    )
+    assert torch.equal(restored.int_repr(), quantized.int_repr())
+
+
+@pytest.mark.parametrize(
+    ("split_layer", "expected_keys"),
+    [
+        ("layer1", {"layer1"}),
+        ("layer2", {"layer1", "layer2"}),
+        ("layer3", {"layer1", "layer2", "layer3"}),
+    ],
+)
+def test_feature_extractor_returns_all_levels_through_split(split_layer, expected_keys):
+    import torch
+    from feature_extractor import EdgeFeatureExtractor
+
+    extractor = EdgeFeatureExtractor(split_layer=split_layer, pretrained=False)
+    features = extractor.extract(torch.rand(1, 3, 64, 64))
+    assert set(features) == expected_keys
+
+
 class TestNetworkMonitor:
     def test_should_use_cloud_default(self):
         from network_monitor import NetworkMonitor

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import sys
 import threading
@@ -53,6 +54,22 @@ NMS_THRESHOLD = _env_float("NMS_THRESHOLD", 0.5, 0.0, 1.0)
 PATCH_SIZE = int(os.getenv("PATCH_SIZE", "64"))
 DEFAULT_SPACING_MM = _env_float("PATCH_SPACING_MM", 1.0, 1e-6, 100.0)
 
+_BACKBONE_LAYERS = ("layer1", "layer2", "layer3", "layer4")
+_LAYER_TO_FPN_KEY = {name: str(index) for index, name in enumerate(_BACKBONE_LAYERS)}
+_LAYERS_AFTER_SPLIT = {
+    "layer1": ("layer2", "layer3", "layer4"),
+    "layer2": ("layer3", "layer4"),
+    "layer3": ("layer4",),
+}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 class InferenceUnavailableError(RuntimeError):
     """Raised when a trained checkpoint cannot provide predictions."""
@@ -84,6 +101,7 @@ class LoadedCheckpoint:
     epoch: Optional[int]
     metrics: dict
     spacing_mm: tuple[float, float, float]
+    sha256: str
     inference_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -248,6 +266,7 @@ class InferenceEngine:
                 epoch=checkpoint.get("epoch"),
                 metrics=metrics,
                 spacing_mm=spacing_mm,
+                sha256=_sha256_file(path),
             )
             self._models[key] = loaded
             if path == self.default_checkpoint_path:
@@ -360,6 +379,133 @@ class InferenceEngine:
         detections = self._postprocess(outputs, loaded.spacing_mm)
         logger.info("Final inference detection count=%d", len(detections))
         return detections
+
+    @torch.inference_mode()
+    def predict_from_edge_features(
+        self,
+        edge_features: dict,
+        split_layer: str,
+        scan_uid: str,
+        *,
+        expected_checkpoint_sha256: str | None = None,
+        edge_image_mean: list[float] | None = None,
+        edge_image_std: list[float] | None = None,
+    ) -> list[NoduleDetection]:
+        """
+        Continue Mask R-CNN from backbone features produced on the edge device.
+
+        The edge runs the ResNet-50 stem + layers up to `split_layer` and sends
+        the resulting intermediate feature maps keyed as "layer1", "layer2",
+        or "layer3".  This method:
+          1. Dequantises any INT8 features.
+          2. Runs the remaining ResNet-50 backbone layers on the cloud to
+             obtain ALL four backbone feature levels (C2–C5 / layer1–layer4).
+          3. Feeds the full set into the FPN to build the proper five-level
+             feature pyramid.
+          4. Passes the FPN output to RPN + RoI heads and returns detections.
+
+        Without this, the endpoint returned HTTP 501 because the FPN requires
+        keys {"0","1","2","3","pool"} but the edge had been sending a single
+        backbone-layer tensor.
+        """
+        del scan_uid  # patient identifiers are never logged
+        loaded = self._get_checkpoint(None)
+        if not expected_checkpoint_sha256:
+            raise InferenceUnavailableError(
+                "Edge payload is missing the checkpoint fingerprint; split inference is disabled"
+            )
+        if expected_checkpoint_sha256 != loaded.sha256:
+            raise InferenceUnavailableError(
+                "Edge and cloud are using different model checkpoints"
+            )
+
+        # Dequantise INT8 and move to device
+        features_dev: dict[str, torch.Tensor] = {}
+        for k, v in edge_features.items():
+            if isinstance(v, torch.Tensor):
+                v = v.dequantize() if v.is_quantized else v
+                features_dev[k] = v.float().to(self.device)
+
+        valid_split_layers = ("layer1", "layer2", "layer3")
+        if split_layer not in valid_split_layers:
+            raise InferenceUnavailableError(
+                f"split_layer must be one of {valid_split_layers}, got {split_layer!r}"
+            )
+        split_index = _BACKBONE_LAYERS.index(split_layer)
+        expected_edge_layers = set(_BACKBONE_LAYERS[:split_index + 1])
+        if set(features_dev) != expected_edge_layers:
+            raise InferenceUnavailableError(
+                f"Expected feature keys {sorted(expected_edge_layers)!r} for "
+                f"split_layer={split_layer!r}, got {sorted(features_dev)!r}"
+            )
+
+        try:
+            with loaded.inference_lock:
+                det_model = loaded.model.model          # torchvision MaskRCNN
+                transform = det_model.transform
+                cloud_mean = [float(value) for value in transform.image_mean]
+                cloud_std = [float(value) for value in transform.image_std]
+                if edge_image_mean != cloud_mean or edge_image_std != cloud_std:
+                    raise InferenceUnavailableError(
+                        "Edge and cloud input normalization does not match"
+                    )
+                body      = det_model.backbone.body     # IntermediateLayerGetter
+                fpn       = det_model.backbone.fpn      # FeaturePyramidNetwork
+
+                # --- continue the backbone from the selected split ---
+                # Keep all edge-side levels for the FPN, then run every later
+                # ResNet stage in order (layer1 splits must include layer2).
+                body_outputs: dict[str, torch.Tensor] = {
+                    _LAYER_TO_FPN_KEY[name]: tensor
+                    for name, tensor in features_dev.items()
+                }
+                x = features_dev[split_layer]
+                for layer_name in _LAYERS_AFTER_SPLIT[split_layer]:
+                    x = body[layer_name](x)
+                    body_outputs[_LAYER_TO_FPN_KEY[layer_name]] = x
+
+                # --- build FPN input (string keys from IntermediateLayerGetter) ---
+                fpn_input: dict[str, torch.Tensor] = {
+                    _LAYER_TO_FPN_KEY[layer_name]: body_outputs[_LAYER_TO_FPN_KEY[layer_name]]
+                    for layer_name in _BACKBONE_LAYERS
+                    if _LAYER_TO_FPN_KEY[layer_name] in body_outputs
+                }
+                if len(fpn_input) != 4:
+                    raise InferenceUnavailableError(
+                        f"Expected 4 FPN input levels, got {sorted(fpn_input)!r}"
+                    )
+
+                # --- run FPN ---
+                fpn_features = fpn(fpn_input)
+
+                # --- RPN + RoI heads ---
+                dummy_img = torch.zeros(
+                    1, 3, PATCH_SIZE, PATCH_SIZE, device=self.device
+                )
+                image_list, _ = det_model.transform([dummy_img], None)
+                proposals, _  = det_model.rpn(image_list, fpn_features, None)
+                detections, _ = det_model.roi_heads(
+                    fpn_features, proposals, image_list.image_sizes, None
+                )
+                outputs = det_model.transform.postprocess(
+                    detections,
+                    image_list.image_sizes,
+                    [(PATCH_SIZE, PATCH_SIZE)],
+                )
+
+            result = self._postprocess(outputs, loaded.spacing_mm)
+            logger.info(
+                "Edge-split inference (split=%s) detection count=%d",
+                split_layer, len(result),
+            )
+            return result
+        except InferenceUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Edge-split inference failed (split_layer=%s)", split_layer)
+            raise InferenceUnavailableError(
+                f"Edge-split inference failed: {exc}"
+            ) from exc
 
     @torch.inference_mode()
     def predict_from_features(self, features: dict, scan_uid: str) -> list[NoduleDetection]:

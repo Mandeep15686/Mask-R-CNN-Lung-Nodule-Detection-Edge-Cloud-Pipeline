@@ -541,7 +541,9 @@ There is no separate frontend test script configured in `frontend/package.json` 
 | `PATCH_SPACING_MM` | Backend inference geometry | `1.0` |
 | `SCORE_THRESHOLD` | Backend inference | `0.05` |
 | `NMS_THRESHOLD` | Backend inference | `0.5` |
-| `EDGE_API_TOKEN` | Edge feature endpoint/node | Shared secret; endpoint is unavailable if not configured and rejects invalid credentials |
+| `APP_ENV` | Backend edge authentication | Defaults to `production`; an absent `EDGE_API_TOKEN` is allowed only for explicit `dev`, `development`, `test`, or `testing` environments |
+| `EDGE_API_TOKEN` | Edge feature endpoint/node | Shared secret; required outside explicit development/test mode and rejects invalid credentials |
+| `EDGE_MODEL_PATH` | Edge node | Must point to the same trained checkpoint loaded by backend `MODEL_PATH`; Compose mounts `experiments/` read-only |
 | `EDGE_HEARTBEAT_TIMEOUT_SECONDS` | Dashboard status | `60` seconds for dashboard online status |
 | `CORS_ALLOW_ORIGINS` | Backend | `http://localhost:3000,http://127.0.0.1:3000` |
 | `CORS_ALLOW_CREDENTIALS` | Backend | `false` |
@@ -551,7 +553,7 @@ There is no separate frontend test script configured in `frontend/package.json` 
 | `COMPRESSION` | Edge node | `int8` |
 | `HEARTBEAT_SEC` | Edge node | `30` seconds |
 | `LEARNED_COMPRESSOR_CHECKPOINT` | Edge learned compressor | Optional checkpoint path; learned compression needs a trained compatible checkpoint |
-Docker Compose passes an `APP_ENV` value to the backend container, but the current FastAPI application does not use that variable to switch behavior. Docker Compose reads the root `.env`; a manually launched Python process does not automatically read `.env` in this code. Export/set the needed variables in the shell before launching a local process.
+Docker Compose defaults `APP_ENV` to `production`; set it explicitly to `development` only for a local setup that intentionally has no edge token. The edge extractor loads the checkpoint at `EDGE_MODEL_PATH`, and split inference verifies its SHA-256 against the backend checkpoint and checks that edge/cloud input normalization matches. Keep `EDGE_MODEL_PATH` and `MODEL_PATH` pointed at the same file. Docker Compose reads the root `.env`; a manually launched Python process does not automatically read `.env` in this code. Export/set the needed variables in the shell before launching a local process.
 
 The FastAPI app creates its tables at startup. An initial Alembic migration is also checked in under `backend/alembic/versions/`; set `DATABASE_URL` before invoking Alembic for a deployment migration workflow.
 

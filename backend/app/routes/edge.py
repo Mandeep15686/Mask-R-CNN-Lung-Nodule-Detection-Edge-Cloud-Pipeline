@@ -20,18 +20,54 @@ from ..ml.inference import InferenceUnavailableError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_MAX_PROBE_BYTES = 1024 * 1024
+_BACKBONE_PREFIXES = {
+    "layer1": {"layer1"},
+    "layer2": {"layer1", "layer2"},
+    "layer3": {"layer1", "layer2", "layer3"},
+}
+_DEVELOPMENT_ENVS = {"dev", "development", "test", "testing"}
+
+
+def _validate_edge_token(supplied_token: str, *, expected_token: str | None = None,
+                         app_env: str | None = None) -> None:
+    """Require a configured token outside explicitly selected dev/test modes."""
+    expected = os.getenv("EDGE_API_TOKEN", "") if expected_token is None else expected_token
+    environment = (os.getenv("APP_ENV", "production") if app_env is None else app_env).strip().lower()
+    if not expected:
+        if environment in _DEVELOPMENT_ENVS:
+            return
+        raise HTTPException(
+            status_code=503,
+            detail="Edge feature inference is disabled until EDGE_API_TOKEN is configured",
+        )
+    if not hmac.compare_digest(supplied_token, expected):
+        raise HTTPException(status_code=401, detail="Invalid edge node credentials")
 
 
 # ---------------------------------------------------------------------------
 # Edge node registration
 # ---------------------------------------------------------------------------
-from fastapi import Request
-
 @router.post("/network-probe")
 async def network_probe(request: Request):
-    """Dedicated endpoint for edge-node bandwidth probes."""
-    await request.body()   # consume and discard
-    return {"status": "ok"}
+    """Consume a bounded probe body and report the number of bytes received."""
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        try:
+            declared = int(declared_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
+        if declared < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+        if declared > _MAX_PROBE_BYTES:
+            raise HTTPException(status_code=413, detail="Network probe exceeds 1 MiB")
+
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _MAX_PROBE_BYTES:
+            raise HTTPException(status_code=413, detail="Network probe exceeds 1 MiB")
+    return {"status": "ok", "bytes_received": total}
 
 
 @router.post("/nodes/register", response_model=EdgeNodeResponse)
@@ -98,12 +134,8 @@ async def infer_from_features(
     and complete the remaining Mask R-CNN computation (RPN + RoI + Mask head).
     """
     t0 = time.perf_counter()
-    expected_token = os.getenv("EDGE_API_TOKEN", "")
     supplied_token = request.headers.get("x-edge-token", "")
-    if not expected_token:
-        raise HTTPException(status_code=503, detail="Edge feature endpoint is not configured")
-    if not hmac.compare_digest(supplied_token, expected_token):
-        raise HTTPException(status_code=401, detail="Invalid edge node credentials")
+    _validate_edge_token(supplied_token)
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -124,11 +156,11 @@ async def infer_from_features(
         feature_data = json.loads(header.decode("utf-8"))
         if not isinstance(feature_data, dict):
             raise ValueError("Feature header must be a JSON object")
+        version = feature_data.get("version")
         keys = feature_data.get("keys")
         shapes = feature_data.get("shapes")
         if (
-            feature_data.get("version") != 1
-            or feature_data.get("dtype") != "float32"
+            version not in (1, 2)
             or not isinstance(keys, list)
             or not isinstance(shapes, list)
             or not keys
@@ -139,9 +171,32 @@ async def infer_from_features(
         ):
             raise ValueError("Invalid feature header schema")
 
-        features = {}
+        # Version 2 carries per-key dtypes + quantisation params; version 1
+        # was float32-only (the "dtype" field).  Normalise to per-key lists.
+        if version == 2:
+            dtypes_list = feature_data.get("dtypes")
+            scales_list = feature_data.get("scales")
+            zps_list    = feature_data.get("zero_points")
+            if (
+                not isinstance(dtypes_list, list)
+                or len(dtypes_list) != len(keys)
+                or not isinstance(scales_list, list)
+                or len(scales_list) != len(keys)
+                or not isinstance(zps_list, list)
+                or len(zps_list) != len(keys)
+            ):
+                raise ValueError("Invalid version-2 feature header (dtypes/scales/zero_points)")
+        else:
+            # version 1 — all float32, no quantisation
+            if feature_data.get("dtype") != "float32":
+                raise ValueError("Version-1 feature header must have dtype='float32'")
+            dtypes_list = ["float32"] * len(keys)
+            scales_list = [1.0] * len(keys)
+            zps_list    = [0]   * len(keys)
+
+        features: dict = {}
         expected_bytes = 0
-        for key, shape in zip(keys, shapes):
+        for key, shape, dtype_str, scale, zp in zip(keys, shapes, dtypes_list, scales_list, zps_list):
             if (
                 not isinstance(shape, list)
                 or not shape
@@ -149,39 +204,88 @@ async def infer_from_features(
                 or any(type(dim) is not int or dim < 1 for dim in shape)
             ):
                 raise ValueError(f"Invalid shape for feature {key!r}")
+            if dtype_str not in ("float32", "int8"):
+                raise ValueError(f"Unsupported dtype {dtype_str!r} for feature {key!r}")
+            if dtype_str == "int8":
+                if (
+                    isinstance(scale, bool)
+                    or not isinstance(scale, (int, float))
+                    or not np.isfinite(scale)
+                    or scale <= 0
+                    or type(zp) is not int
+                    or not -128 <= zp <= 127
+                ):
+                    raise ValueError(f"Invalid quantisation parameters for feature {key!r}")
+            np_dtype  = np.dtype("<f4") if dtype_str == "float32" else np.dtype("int8")
+            item_size = np_dtype.itemsize
+
             element_count = 1
             for dim in shape:
-                if element_count > (64 * 1024 * 1024 // 4) // dim:
+                if element_count > (64 * 1024 * 1024 // item_size) // dim:
                     raise ValueError("Decoded feature data exceeds 64 MiB")
                 element_count *= dim
-            expected_bytes += element_count * np.dtype("<f4").itemsize
+            byte_count = element_count * item_size
+            expected_bytes += byte_count
             if expected_bytes > 64 * 1024 * 1024:
                 raise ValueError("Decoded feature data exceeds 64 MiB")
-            arr = np.frombuffer(raw[: element_count * 4], dtype="<f4")
+
+            arr = np.frombuffer(raw[:byte_count], dtype=np_dtype)
             if arr.size != element_count:
-                raise ValueError("Feature data is truncated")
+                raise ValueError(f"Feature {key!r} data is truncated")
             arr = arr.copy().reshape(shape)
-            if not np.isfinite(arr).all():
-                raise ValueError(f"Feature {key!r} contains non-finite values")
-            features[key] = torch.from_numpy(arr)
-            raw = raw[element_count * 4 :]
+            raw = raw[byte_count:]
+
+            if dtype_str == "int8":
+                # Reconstruct the quantised tensor so downstream can dequantise
+                t_int8 = torch.from_numpy(arr).to(torch.int8)
+                features[key] = torch._make_per_tensor_quantized_tensor(
+                    t_int8, float(scale), int(zp)
+                )
+            else:
+                if not np.isfinite(arr).all():
+                    raise ValueError(f"Feature {key!r} contains non-finite values")
+                features[key] = torch.from_numpy(arr)
+
         if raw:
             raise ValueError("Feature data contains unexpected trailing bytes")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid feature payload: {e}")
 
     engine = request.app.state.inference_engine
-    required_fpn_keys = {"0", "1", "2", "3", "pool"}
-    if set(features) != required_fpn_keys:
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "This edge extractor sends a single intermediate feature map, but cloud "
-                "inference currently requires all five FPN feature maps. No prediction was run."
-            ),
-        )
+    # BUG-FIX: previously a strict equality check against FPN output keys
+    # {"0","1","2","3","pool"} raised HTTP 501 for every real edge request,
+    # because the edge sends backbone-layer keys ("layer1"/"layer2"/"layer3").
+    # Now we route by key set:
+    #  • FPN keys  → legacy direct-FPN path (predict_from_features)
+    #  • layer keys → edge-split path: cloud runs remaining layers + FPN
+    #                 (predict_from_edge_features)
+    feature_keys = set(features)
     try:
-        nodules = engine.predict_from_features(features, scan_uid)
+        fpn_keys = {"0", "1", "2", "3", "pool"}
+        if feature_keys == fpn_keys:
+            # Direct FPN features (e.g. from a future full-FPN edge extractor)
+            nodules = engine.predict_from_features(features, scan_uid)
+        elif split_layer in _BACKBONE_PREFIXES and feature_keys == _BACKBONE_PREFIXES[split_layer]:
+            # Backbone layer features from edge split — normal production path
+            nodules = engine.predict_from_edge_features(
+                features,
+                split_layer,
+                scan_uid,
+                expected_checkpoint_sha256=feature_data.get("checkpoint_sha256"),
+                edge_image_mean=feature_data.get("image_mean"),
+                edge_image_std=feature_data.get("image_std"),
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Feature keys {sorted(feature_keys)!r} do not match split_layer="
+                    f"{split_layer!r}. Expected the cumulative backbone features "
+                    f"{sorted(_BACKBONE_PREFIXES.get(split_layer, set()))!r} or FPN keys."
+                ),
+            )
+    except HTTPException:
+        raise
     except InferenceUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:

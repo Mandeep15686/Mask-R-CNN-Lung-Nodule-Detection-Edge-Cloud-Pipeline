@@ -52,33 +52,76 @@ PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",   "1"))
 HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC","30"))
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PROJECT_ROOT    = Path(__file__).resolve().parents[1]
+EDGE_MODEL_PATH = Path(
+    os.getenv("EDGE_MODEL_PATH")
+    or os.getenv("MODEL_PATH")
+    or (PROJECT_ROOT / "experiments" / "best_model.pth")
+).expanduser()
+if not EDGE_MODEL_PATH.is_absolute():
+    EDGE_MODEL_PATH = (PROJECT_ROOT / EDGE_MODEL_PATH).resolve()
 
 
 def _serialize_feature_payload(features: dict, metadata: dict) -> bytes:
-    """Encode named features as a JSON header followed by little-endian float32 data."""
+    """
+    Encode named features as a JSON header followed by packed binary data.
+
+    Version 2 wire format:
+    - INT8/QINT8 tensors are serialised as raw int8 bytes with per-tensor
+      scale and zero_point stored in the header.  This achieves the intended
+      ~4× bandwidth reduction over float32.
+    - Float tensors are serialised as little-endian float32 (unchanged).
+
+    Prior to this fix the serialiser dequantised INT8 tensors immediately and
+    wrote them as float32, negating all compression benefit.
+    """
     keys = list(features)
     shapes = []
+    dtypes = []
+    scales = []
+    zero_points = []
     arrays = []
+
     for key in keys:
         value = features[key]
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"Feature {key!r} must be a tensor")
+
         if value.is_quantized:
-            value = value.dequantize()
-        array = value.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
-        if not np.isfinite(array).all():
-            raise ValueError(f"Feature {key!r} contains non-finite values")
-        shapes.append(list(array.shape))
-        arrays.append(array.astype("<f4", copy=False).tobytes(order="C"))
+            # Serialise as int8 — actual 4× wire savings vs float32
+            int_repr = value.int_repr()          # torch.int8 tensor
+            q_scale  = float(value.q_scale())
+            q_zp     = int(value.q_zero_point())
+            array    = int_repr.detach().cpu().contiguous().numpy()
+            shapes.append(list(array.shape))
+            dtypes.append("int8")
+            scales.append(q_scale)
+            zero_points.append(q_zp)
+            arrays.append(array.tobytes())
+        else:
+            array = value.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+            if not np.isfinite(array).all():
+                raise ValueError(f"Feature {key!r} contains non-finite values")
+            shapes.append(list(array.shape))
+            dtypes.append("float32")
+            scales.append(1.0)
+            zero_points.append(0)
+            arrays.append(array.astype("<f4", copy=False).tobytes(order="C"))
 
     header = {
         **metadata,
-        "version": 1,
+        "version": 2,
         "keys": keys,
         "shapes": shapes,
-        "dtype": "float32",
+        "dtypes": dtypes,
+        "scales": scales,
+        "zero_points": zero_points,
     }
-    return json.dumps(header, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\x00" + b"".join(arrays)
+    return (
+        json.dumps(header, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        + b"\x00"
+        + b"".join(arrays)
+    )
 
 
 class EdgeNode:
@@ -88,33 +131,49 @@ class EdgeNode:
         if COMPRESSION == "learned" and SPLIT_LAYER != "layer2":
             raise ValueError("Learned compression checkpoint currently supports only layer2 features")
         self.preprocessor  = CTPreprocessor(patch_size=PATCH_SIZE)
-        self.extractor     = EdgeFeatureExtractor(split_layer=SPLIT_LAYER, device=DEVICE)
+        self.extractor     = EdgeFeatureExtractor(
+            split_layer=SPLIT_LAYER,
+            device=DEVICE,
+            checkpoint_path=EDGE_MODEL_PATH,
+        )
         self.compressor    = FeatureCompressor(method=COMPRESSION, device=DEVICE)
         self.net_monitor   = NetworkMonitor(cloud_url=CLOUD_API_URL)
         self.session: Optional[aiohttp.ClientSession] = None
         self._running      = False
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self.result_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     async def start(self):
+        if self.session is not None and not self.session.closed:
+            return
         logger.info(f"Starting Edge Node [{NODE_ID}] | split={SPLIT_LAYER} | compress={COMPRESSION}")
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         )
         self._running = True
         await self._register()
-        # Start heartbeat in background
-        asyncio.create_task(self._heartbeat_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("Edge node ready. Waiting for scan submissions...")
 
     async def stop(self):
         self._running = False
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         if self.session:
             await self.session.close()
+            self.session = None
         logger.info("Edge node stopped.")
 
     # ------------------------------------------------------------------
     async def _register(self):
+        if self.session is None or self.session.closed:
+            return
         try:
             async with self.session.post(
                 f"{CLOUD_API_URL}/api/edge/nodes/register",
@@ -134,14 +193,16 @@ class EdgeNode:
             logger.warning(f"Could not register (cloud offline?): {e}")
 
     async def _heartbeat_loop(self):
-        while self._running:
+        while self._running and self.session is not None and not self.session.closed:
             try:
                 async with self.session.post(
                     f"{CLOUD_API_URL}/api/edge/nodes/{NODE_ID}/heartbeat"
                 ):
                     pass
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                pass
+                logger.debug("Edge heartbeat failed", exc_info=True)
             await asyncio.sleep(HEARTBEAT_SEC)
 
     # ------------------------------------------------------------------
@@ -157,30 +218,34 @@ class EdgeNode:
         """
         t_start = time.perf_counter()
 
-        # 1. Preprocess
+        # Preprocess once for the local fallback and, if the link is healthy,
+        # for edge feature extraction.
         patch_tensor = self.preprocessor.preprocess_bytes(image_bytes, source_format)
-        t_preprocess = time.perf_counter()
 
-        # 2. Extract early features
+        # Probe before spending time extracting/compressing features. A failed
+        # or poor link should select local fallback instead of a doomed upload.
+        bw_mbps, latency_ms = await self.net_monitor.measure()
+        if not self.net_monitor.should_use_cloud():
+            logger.info(
+                "[%s] Network below cloud policy (%.2f Mbps, %.1f ms); using local fallback",
+                scan_uid,
+                bw_mbps,
+                latency_ms,
+            )
+            return await self.predict_local(image_bytes, scan_uid)
+
+        # Extract and compress only when the cloud path is viable.
         with torch.no_grad():
             features = self.extractor.extract(patch_tensor.unsqueeze(0).to(DEVICE))
-        t_extract = time.perf_counter()
-
-        # 3. Compress
         compressed_payload = self.compressor.compress(features)
         t_compress = time.perf_counter()
 
-        # Measure sizes
-        # Measure feature bytes before and after compression, not image bytes.
         raw_feature_bytes = sum(v.numel() * v.element_size() for v in features.values())
-        # The wire format is float32, including for dequantized INT8 values.
-        wire_feature_bytes = sum(v.numel() * 4 for v in compressed_payload.values())
+        wire_feature_bytes = sum(
+            v.numel() * v.element_size() for v in compressed_payload.values()
+        )
         compression_ratio = raw_feature_bytes / max(wire_feature_bytes, 1)
 
-        # 4. Measure network latency
-        bw_mbps, latency_ms = await self.net_monitor.measure()
-
-        # 5. Upload to cloud
         payload_bytes = _serialize_feature_payload(
             compressed_payload,
             {
@@ -189,15 +254,21 @@ class EdgeNode:
                 "bandwidth_mbps": bw_mbps,
                 "compression_method": COMPRESSION,
                 "compression_ratio": compression_ratio,
+                "checkpoint_sha256": self.extractor.checkpoint_sha256,
+                "image_mean": self.extractor.image_mean,
+                "image_std": self.extractor.image_std,
             },
         )
         payload_kb = len(payload_bytes) / 1024
 
-        t_upload_start = time.perf_counter()
-        result = await self._send_features(payload_bytes, scan_uid)
-        t_upload_end = time.perf_counter()
+        try:
+            result = await self._send_features(payload_bytes, scan_uid)
+        except Exception as exc:
+            logger.warning("[%s] Cloud feature inference failed; using local fallback: %s", scan_uid, exc)
+            result = await self.predict_local(image_bytes, scan_uid)
+            result["fallback_reason"] = str(exc)
 
-        total_ms = (t_upload_end - t_start) * 1000
+        total_ms = (time.perf_counter() - t_start) * 1000
 
         # 6. Log to cloud
         await self._log_network_event({
@@ -225,6 +296,8 @@ class EdgeNode:
         return result
 
     async def _send_features(self, payload_bytes: bytes, scan_uid: str) -> dict:
+        if self.session is None or self.session.closed:
+            raise RuntimeError("Edge HTTP session is not started")
         try:
             async with self.session.post(
                 f"{CLOUD_API_URL}/api/edge/infer-features",
@@ -246,6 +319,8 @@ class EdgeNode:
             raise RuntimeError(f"Network error sending features: {e}") from e
 
     async def _log_network_event(self, data: dict):
+        if self.session is None or self.session.closed:
+            return
         try:
             async with self.session.post(
                 f"{CLOUD_API_URL}/api/edge/network-log", json=data

@@ -21,7 +21,7 @@ services:
       - MODEL_PATH=${MODEL_PATH:-/app/experiments/best_model.pth}
       - EXPERIMENTS_DIR=${EXPERIMENTS_DIR:-/app/experiments}
       - EDGE_API_TOKEN=${EDGE_API_TOKEN:-}
-      - APP_ENV=${APP_ENV:-development}
+      - APP_ENV=${APP_ENV:-production}
       - SCORE_THRESHOLD=${SCORE_THRESHOLD:-0.05}
       - NMS_THRESHOLD=${NMS_THRESHOLD:-0.5}
       - PATCH_SIZE=64
@@ -62,6 +62,8 @@ services:
     container_name: lung_edge
     ports:
       - "9090:9090"
+    volumes:
+      - ./experiments:/app/experiments:ro
     environment:
       - CLOUD_API_URL=http://backend:8000
       - NODE_ID=edge-node-docker
@@ -70,6 +72,7 @@ services:
       - SPLIT_LAYER=layer2
       - COMPRESSION=int8
       - EDGE_API_TOKEN=${EDGE_API_TOKEN:-}
+      - EDGE_MODEL_PATH=${EDGE_MODEL_PATH:-/app/experiments/best_model.pth}
       - PATCH_SIZE=64
     depends_on:
       backend:
