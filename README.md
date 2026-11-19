@@ -99,8 +99,7 @@ Local data contents, the default `experiments/` output, model weight files, SQLi
 ## System Architecture
 
 ![System Architecture](assets/Architecture.png)
-
-[![Architecture diagram of mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline](https://gitdiagram.com/mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline/diagram.png)](https://gitdiagram.com/mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline?utm_source=readme&utm_medium=picture)
+![Details](assets/details.png)
 
 ## Requirements
 
