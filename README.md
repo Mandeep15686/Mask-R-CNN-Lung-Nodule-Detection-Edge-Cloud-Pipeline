@@ -96,6 +96,12 @@ This repository is a research prototype. It is **not a clinical product** and it
 
 Local data contents, the default `experiments/` output, model weight files, SQLite databases, and `.env` secrets are excluded by Git. Some named Phase 2 output folders are not globally ignored, so check `git status` before staging large run artifacts. Their exact contents depend on each developer’s machine.
 
+## System Architecture
+
+![System Architecture](assets/Architecture.png)
+
+[![Architecture diagram of mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline](https://gitdiagram.com/mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline/diagram.png)](https://gitdiagram.com/mandeep15686/mask-r-cnn-lung-nodule-detection-edge-cloud-pipeline?utm_source=readme&utm_medium=picture)
+
 ## Requirements
 
 - 64-bit Python 3.11 is the tested project environment. GPU training requires a compatible NVIDIA driver and PyTorch CUDA runtime; CPU is supported but training is slower.
