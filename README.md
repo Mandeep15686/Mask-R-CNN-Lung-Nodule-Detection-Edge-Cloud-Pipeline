@@ -27,6 +27,7 @@ This repository is a research prototype. It is **not a clinical product** and it
 - [Data, checkpoints, and Git](#data-checkpoints-and-git)
 - [Research scope and limitations](#research-scope-and-limitations)
 
+
 ## Repository map
 
 ```text
@@ -633,3 +634,4 @@ The backend database contains `experiments`, `training_runs`, `inference_results
 - Setio et al., [Validation, comparison, and combination of algorithms for automatic detection of pulmonary nodules in CT images: the LUNA16 challenge](https://doi.org/10.1016/j.media.2017.06.011), 2017.
 - Karimi and Salcudean, [Reducing the Hausdorff Distance in Medical Image Segmentation with Convolutional Neural Networks](https://arxiv.org/abs/1904.10030), 2019.
 - McMahan et al., [Communication-Efficient Learning of Deep Networks from Decentralized Data](https://arxiv.org/abs/1602.05629), 2017.
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Mandeep15686/Mask-R-CNN-Lung-Nodule-Detection-Edge-Cloud-Pipeline)
