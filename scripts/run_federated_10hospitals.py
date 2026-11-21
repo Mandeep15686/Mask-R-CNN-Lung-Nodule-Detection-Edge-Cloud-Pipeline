@@ -42,7 +42,7 @@ def main():
     )
     parser.add_argument(
         "--data", default="./data/luna16",
-        help="Path to LUNA16 root (must contain subset0 through subset9)"
+        help="Path to LUNA16 root (must contain subset0 … subset9)"
     )
     parser.add_argument(
         "--out", default="./experiments/federated_10h",
@@ -70,15 +70,15 @@ def main():
     )
     parser.add_argument(
         "--alpha", type=float, default=0.3,
-        help="Composite mask-loss alpha (BCE weight, default: 0.3)"
+        help="Composite mask-loss α (BCE weight, default: 0.3)"
     )
     parser.add_argument(
         "--beta", type=float, default=0.5,
-        help="Composite mask-loss beta (Dice weight, default: 0.5)"
+        help="Composite mask-loss β (Dice weight, default: 0.5)"
     )
     parser.add_argument(
         "--gamma", type=float, default=0.5,
-        help="Composite mask-loss gamma (Focal weight, default: 0.5)"
+        help="Composite mask-loss γ (Focal weight, default: 0.5)"
     )
     args = parser.parse_args()
 

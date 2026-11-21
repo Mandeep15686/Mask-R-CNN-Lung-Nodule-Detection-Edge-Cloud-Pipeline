@@ -68,22 +68,95 @@ if not EDGE_MODEL_PATH.is_absolute():
     EDGE_MODEL_PATH = (PROJECT_ROOT / EDGE_MODEL_PATH).resolve()
 
 
+class _DPAccountant:
+    """
+    Per-node privacy accountant using the moments/Rényi composition rule.
+
+    Each call to ``record_release`` accumulates privacy spend.  When the
+    total exceeds the configured budget (DP_EPSILON_BUDGET), the accountant
+    returns False from ``can_release`` and the edge node refuses to send
+    more features until reset (e.g. at the start of a new patient session).
+
+    This is a simplified RDP accountant (alpha=10 Rényi order); a full
+    implementation would use google/dp-accounting or autodp.
+    """
+
+    _RENYI_ALPHA = 10  # Rényi order
+
+    def __init__(self, epsilon_budget: float, delta: float):
+        self.epsilon_budget = epsilon_budget
+        self.delta = delta
+        self._epsilon_spent: float = 0.0
+        self._n_releases: int = 0
+
+    def record_release(self, sigma: float, sensitivity: float) -> None:
+        """Add one Gaussian mechanism release to the privacy ledger."""
+        # RDP ε(α) for Gaussian: α * sensitivity² / (2σ²)
+        rdp = self._RENYI_ALPHA * (sensitivity ** 2) / (2.0 * sigma ** 2)
+        # Convert RDP → (ε, δ)-DP via standard bound
+        eps_dp = rdp + (
+            np.log(1.0 / self.delta) / (self._RENYI_ALPHA - 1)
+        )
+        self._epsilon_spent += eps_dp
+        self._n_releases += 1
+
+    def can_release(self) -> bool:
+        return self._epsilon_spent < self.epsilon_budget
+
+    def reset(self) -> None:
+        self._epsilon_spent = 0.0
+        self._n_releases = 0
+
+    @property
+    def epsilon_spent(self) -> float:
+        return self._epsilon_spent
+
+    @property
+    def n_releases(self) -> int:
+        return self._n_releases
+
+
+# Module-level accountant; shared across all scans in a session.
+_dp_accountant: "_DPAccountant | None" = None
+if DP_EPSILON > 0.0:
+    _dp_budget = float(os.getenv("DP_EPSILON_BUDGET", str(DP_EPSILON * 100)))
+    _dp_accountant = _DPAccountant(epsilon_budget=_dp_budget, delta=DP_DELTA)
+
+
 def _add_dp_noise(features: dict, epsilon: float, delta: float = 1e-5, sensitivity: float = 1.0) -> dict:
     """
     Inject calibrated Gaussian noise into feature tensors for (ε, δ)-DP.
 
+    Steps:
+      1. L2-clip each feature tensor to bound the sensitivity (per-sample).
+      2. Add Gaussian noise scaled to the clipped sensitivity.
+      3. Record the release in the module-level privacy accountant.
+
     σ = (sensitivity / epsilon) * sqrt(2 * ln(1.25 / delta))
 
-    Note: bounding the L2 sensitivity of the feature extraction function
-    requires clipping in a production deployment; this implementation uses
-    the user-supplied ``sensitivity`` parameter.  Set DP_EPSILON > 0 via
-    the environment to enable live DP noise injection.
+    The clipping norm equals ``sensitivity``, which the caller supplies via
+    DP_SENSITIVITY.  Set this to the empirical 95th-percentile L2 norm of
+    your feature tensors for a tight but safe bound.
     """
+    if _dp_accountant is not None and not _dp_accountant.can_release():
+        raise RuntimeError(
+            f"DP budget exhausted after {_dp_accountant.n_releases} releases "
+            f"(ε_spent={_dp_accountant.epsilon_spent:.4f} ≥ budget={_dp_accountant.epsilon_budget:.4f}). "
+            "Call _dp_accountant.reset() to start a new privacy epoch."
+        )
+
     sigma = (sensitivity / epsilon) * (2.0 * np.log(1.25 / delta)) ** 0.5
     noised = {}
     for k, v in features.items():
         fp = v.dequantize().float() if v.is_quantized else v.float()
+        # Per-sample L2 clipping: scale each tensor so its L2 norm ≤ sensitivity
+        l2_norm = fp.norm(p=2)
+        fp = fp * (sensitivity / (l2_norm + 1e-8)).clamp(max=1.0)
         noised[k] = fp + torch.randn_like(fp) * sigma
+
+    if _dp_accountant is not None:
+        _dp_accountant.record_release(sigma=sigma, sensitivity=sensitivity)
+
     return noised
 
 
@@ -263,7 +336,22 @@ class EdgeNode:
                 bw_mbps,
                 latency_ms,
             )
-            return await self.predict_local(image_bytes, scan_uid)
+            # Record the scheduling decision so the dashboard can show fallback frequency.
+            await self._log_network_event({
+                "node_id": NODE_ID,
+                "latency_ms": latency_ms,
+                "bandwidth_mbps": bw_mbps,
+                "payload_size_kb": 0.0,
+                "inference_time_ms": 0.0,
+                "split_layer": SPLIT_LAYER,
+                "compression_method": "local_fallback",
+                "compression_ratio": 0.0,
+            })
+            result = await self.predict_local(image_bytes, scan_uid)
+            result["adaptive_decision"] = "local_fallback"
+            result["probe_bandwidth_mbps"] = bw_mbps
+            result["probe_latency_ms"] = latency_ms
+            return result
 
         # Extract and optionally apply live DP noise before compression.
         with torch.no_grad():
@@ -274,8 +362,11 @@ class EdgeNode:
                 features, epsilon=DP_EPSILON, delta=DP_DELTA, sensitivity=DP_SENSITIVITY
             )
             logger.info(
-                "[%s] DP noise applied (ε=%.4f, δ=%g, sensitivity=%.3f)",
+                "[%s] DP noise applied (ε=%.4f, δ=%g, sensitivity=%.3f) | "
+                "accountant: ε_spent=%.4f, releases=%d",
                 scan_uid, DP_EPSILON, DP_DELTA, DP_SENSITIVITY,
+                _dp_accountant.epsilon_spent if _dp_accountant else 0.0,
+                _dp_accountant.n_releases if _dp_accountant else 1,
             )
 
         compressed_payload = self.compressor.compress(features)
@@ -289,6 +380,8 @@ class EdgeNode:
                 "bandwidth_mbps": bw_mbps,
                 "compression_method": COMPRESSION,
                 "dp_epsilon": DP_EPSILON if DP_EPSILON > 0.0 else None,
+                "dp_epsilon_spent": _dp_accountant.epsilon_spent if _dp_accountant else None,
+                "dp_releases": _dp_accountant.n_releases if _dp_accountant else None,
                 "checkpoint_sha256": self.extractor.checkpoint_sha256,
                 "image_mean": self.extractor.image_mean,
                 "image_std": self.extractor.image_std,
@@ -296,8 +389,7 @@ class EdgeNode:
         )
         payload_kb = len(payload_bytes) / 1024
 
-        # Include the complete HTTP body (header + tensor bytes), not an
-        # estimated header subtraction or in-memory tensor size.
+        # Use the complete serialized request body, including its JSON header.
         compression_ratio = _wire_compression_ratio(features, payload_bytes)
 
         try:

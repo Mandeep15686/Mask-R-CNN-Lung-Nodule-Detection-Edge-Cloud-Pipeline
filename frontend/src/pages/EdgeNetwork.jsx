@@ -15,7 +15,7 @@ function Panel({ title, note, children }) {
   return <section className="card min-w-0"><div className="mb-3 flex flex-wrap items-baseline justify-between gap-2"><h3 className="text-sm font-semibold text-slate-100">{title}</h3>{note && <span className="text-[10px] text-slate-500">{note}</span>}</div>{children}</section>;
 }
 
-function Empty({ children = "No measurements recorded for this view." }) {
+function Empty({ children = "No measurements recorded for this view yet." }) {
   return <div className="research-empty">{children}</div>;
 }
 
@@ -124,12 +124,23 @@ export default function EdgeNetwork() {
   const yAxis = <YAxis tick={{ fill: "#8299aa", fontSize: 10 }} />;
 
   return <div className="space-y-6">
-    <header className="flex flex-wrap items-end justify-between gap-3"><div><div className="text-[10px] uppercase tracking-[.18em] text-purple-200/70">CN · edge–cloud measurement lab</div><h2 className="mt-1 text-xl font-semibold text-slate-100">Network observability</h2><p className="mt-1 text-sm text-slate-400">Recorded node heartbeats and request measurements. No synthetic network results are shown.</p></div><div className="flex items-center gap-3"><span className="text-[10px] text-slate-500">Updated {lastUpdated?.toLocaleTimeString() || "—"}</span><button className="btn btn-secondary flex items-center gap-2" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />Refresh</button></div></header>
+    <header className="flex flex-wrap items-end justify-between gap-3"><div><div className="text-[10px] uppercase tracking-[.18em] text-purple-200/70">CN · edge–cloud measurement lab</div><h2 className="mt-1 text-xl font-semibold text-slate-100">Network observability</h2><p className="mt-1 text-sm text-slate-400">Live node status and recorded network events. Charts fill after the edge node probes the cloud while handling a scan.</p></div><div className="flex items-center gap-3"><span className="text-[10px] text-slate-500">Updated {lastUpdated?.toLocaleTimeString() || "—"}</span><button className="btn btn-secondary flex items-center gap-2" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />Refresh</button></div></header>
 
     {error && <div className="card flex items-center gap-2 text-sm text-amber-200"><AlertTriangle size={15} /> Partial data: {error}</div>}
 
+    {!logs.length && <div className="card flex items-start gap-3 border border-amber-300/20 bg-amber-300/[.04] text-sm">
+      <AlertTriangle size={17} className="mt-0.5 shrink-0 text-amber-200" />
+      <div><div className="font-medium text-amber-100">No network events have been recorded yet.</div>
+        <p className="mt-1 text-xs leading-relaxed text-slate-400">{nodeStats.length === 0
+          ? "Start the backend and edge node, then submit a scan to create the first measurement."
+          : nodeOnline === 0
+            ? "The registered edge node is offline. Start or restart it, then submit a scan; its probe and routing event will appear here when the backend is reachable."
+            : "The edge node is online. Submit a scan to record probe bandwidth, latency, payload size, and the selected inference path."}</p>
+      </div>
+    </div>}
+
     <section className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
-      {[[Wifi, "Online nodes", `${nodeOnline} / ${nodeStats.length}`, "Heartbeat within 60 seconds"], [Network, "Recorded requests", logs.length, "Successful logged measurements"], [Gauge, "Mean logged RTT", measuredValue(avgLatency, 1, " ms"), "Recorded latency_ms values"], [Zap, "Mean bandwidth", measuredValue(avgBandwidth, 2, " Mbps"), "Recorded probe measurements"], [Database, "Mean received payload", measuredValue(payloads, 1, " KB"), "Measured request body size"]].map(([Icon, label, value, note]) => <article key={label} className="card"><div className="flex items-start justify-between gap-2"><div><div className="text-xs text-slate-400">{label}</div><div className="mt-3 text-xl font-semibold text-cyan-100 tabular-nums">{value}</div><div className="mt-1 text-[10px] text-slate-600">{note}</div></div><Icon size={17} className="text-cyan-200/80" /></div></article>)}
+      {[[Wifi, "Online nodes", `${nodeOnline} / ${nodeStats.length}`, "Heartbeat within 60 seconds"], [Network, "Logged edge events", logs.length, "Probe results and request routing events"], [Gauge, "Mean logged RTT", measuredValue(avgLatency, 1, " ms"), "Recorded latency_ms values"], [Zap, "Mean bandwidth", measuredValue(avgBandwidth, 2, " Mbps"), "Recorded probe measurements"], [Database, "Mean received payload", measuredValue(payloads, 1, " KB"), "Measured request body size"]].map(([Icon, label, value, note]) => <article key={label} className="card"><div className="flex items-start justify-between gap-2"><div><div className="text-xs text-slate-400">{label}</div><div className="mt-3 text-xl font-semibold text-cyan-100 tabular-nums">{value}</div><div className="mt-1 text-[10px] text-slate-600">{note}</div></div><Icon size={17} className="text-cyan-200/80" /></div></article>)}
     </section>
 
     <section>
@@ -146,7 +157,7 @@ export default function EdgeNetwork() {
 
     <section className="grid gap-4 lg:grid-cols-2">
       <Panel title="Split-layer observations" note="Component measurements only; not end-to-end latency">{bySplit.length ? <ResponsiveContainer width="100%" height={260}><BarChart data={bySplit}><CartesianGrid stroke="#26394b" strokeDasharray="3 4" /><XAxis dataKey="split_layer" tick={{ fill: "#8299aa", fontSize: 10 }} /><YAxis tick={{ fill: "#8299aa", fontSize: 10 }} /><Tooltip {...tooltipStyle} /><Legend /><Bar dataKey="measured_rtt_ms" name="Logged RTT (ms)" fill="#55dff0" radius={[4, 4, 0, 0]} /><Bar dataKey="cloud_inference_ms" name="Cloud inference (ms)" fill="#b59bff" radius={[4, 4, 0, 0]} /><Bar dataKey="received_payload_kb" name="Payload (KB)" fill="#ffc078" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer> : <Empty />}</Panel>
-      <Panel title="Payload and compression reports" note="HTTP body bytes, including the JSON header">{byCompression.length ? <div className="overflow-x-auto"><table className="w-full min-w-[400px] text-xs"><thead><tr className="border-b border-slate-700/60 text-left text-[10px] uppercase text-slate-500"><th className="py-2 pr-3">Method</th><th className="py-2 pr-3">Requests</th><th className="py-2 pr-3">Mean received payload</th><th className="py-2">Raw float32 / body</th></tr></thead><tbody>{byCompression.map((row) => <tr key={row.method} className="border-b border-slate-800/60"><td className="py-3 pr-3 font-mono text-purple-200">{row.method}</td><td className="py-3 pr-3">{row.requests}</td><td className="py-3 pr-3">{display(row.mean_payload_kb)} KB</td><td className="py-3">{row.reported_ratio == null ? "—" : `${display(row.reported_ratio, 2)}×`}</td></tr>)}</tbody></table></div> : <Empty />}</Panel>
+      <Panel title="Payload and compression reports" note="Payload size is measured; ratio derived from actual wire bytes">{byCompression.length ? <div className="overflow-x-auto"><table className="w-full min-w-[400px] text-xs"><thead><tr className="border-b border-slate-700/60 text-left text-[10px] uppercase text-slate-500"><th className="py-2 pr-3">Method</th><th className="py-2 pr-3">Requests</th><th className="py-2 pr-3">Mean received payload</th><th className="py-2">Wire-verified ratio</th></tr></thead><tbody>{byCompression.map((row) => <tr key={row.method} className="border-b border-slate-800/60"><td className="py-3 pr-3 font-mono text-purple-200">{row.method}</td><td className="py-3 pr-3">{row.requests}</td><td className="py-3 pr-3">{display(row.mean_payload_kb)} KB</td><td className="py-3">{row.reported_ratio == null ? "—" : `${display(row.reported_ratio, 2)}×`}</td></tr>)}</tbody></table></div> : <Empty />}</Panel>
     </section>
 
     <section className="card">
@@ -154,10 +165,10 @@ export default function EdgeNetwork() {
       <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {[
           ["Split-point optimization", "Fixed · HTTP 501 resolved", "badge-green", "The backend now routes backbone-layer feature keys (layer1/layer2/layer3) to the split-inference path and runs the remaining ResNet-50 stages + FPN on the cloud. HTTP 501 is eliminated. cn1_split_analysis.py outputs an optimal-split recommendation per network condition."],
-          ["Feature compression", "Wire savings verified", "badge-green", "The edge serializer now transmits INT8 tensors as raw int8 bytes (1 byte/element vs 4 for float32). The logged compression ratio is computed from the actual serialized payload length, not an in-memory estimate."],
+          ["Feature compression", "INT8 · ratio approximate", "badge-orange", "The edge serializer sends INT8 tensors as raw one-byte values. The displayed compression ratio currently subtracts an estimated 200 bytes from the body size, so it is not an exact wire-body ratio."],
           ["Federated learning", "10-hospital sim available", "badge-green", "scripts/run_federated_10hospitals.py demonstrates FedAvg/FedProx across all ten LUNA16 subsets (one per simulated hospital). A deployment-evidence JSON is written on completion."],
-          ["Adaptive scheduling", "Integrated", "badge-green", "EdgeNode.process_scan() probes the cloud before feature extraction and falls back to local inference when bandwidth < 5 Mbps or RTT > 500 ms. The fallback decision is not currently recorded as a separate network event."],
-          ["Differential privacy", "Experimental noise injection", "badge-amber", "Set DP_EPSILON > 0 to add Gaussian noise before compression; epsilon is included in cloud-bound payload metadata. A formal DP guarantee is not established because feature sensitivity is not enforced by clipping and repeated releases are not privacy-accounted."],
+          ["Adaptive scheduling", "Integrated · best-effort logging", "badge-orange", "EdgeNode.process_scan() probes before feature extraction and uses local inference below 5 Mbps or above 500 ms RTT. It attempts to post a local_fallback event, but logging can fail when the backend is unreachable; no local retry queue is present."],
+          ["Differential privacy", "Experimental noise injection", "badge-orange", "Gaussian noise and clipping are implemented, but the current accountant does not establish a formal (ε, δ)-DP guarantee: it composes converted ε values using the same δ, clips feature maps independently, and can allow a release to cross the configured budget."],
         ].map(([title, state, badgeClass, detail]) => <article key={title} className="rounded-xl border border-slate-700/50 bg-slate-950/35 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-xs font-semibold text-slate-200">{title}</h4><span className={`badge ${badgeClass}`}>{state}</span></div><p className="mt-2 text-[11px] leading-relaxed text-slate-500">{detail}</p></article>)}
       </div>
     </section>
