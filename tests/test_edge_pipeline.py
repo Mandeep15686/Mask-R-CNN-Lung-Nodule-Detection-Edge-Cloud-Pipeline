@@ -266,6 +266,20 @@ def test_v2_feature_serializer_preserves_int8_bytes():
     assert torch.equal(restored.int_repr(), quantized.int_repr())
 
 
+def test_wire_compression_ratio_uses_complete_serialized_body():
+    import torch
+    from edge_node import _serialize_feature_payload, _wire_compression_ratio
+
+    source = torch.ones(1, 8, 4, 4)
+    quantized = torch.quantize_per_tensor(source, scale=0.1, zero_point=0, dtype=torch.qint8)
+    payload = _serialize_feature_payload({"layer1": quantized}, {"scan_uid": "test"})
+
+    assert _wire_compression_ratio({"layer1": source}, payload) == pytest.approx(
+        source.numel() * 4 / len(payload)
+    )
+    assert len(payload) > quantized.numel()  # header bytes are included
+
+
 @pytest.mark.parametrize(
     ("split_layer", "expected_keys"),
     [

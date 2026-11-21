@@ -52,6 +52,12 @@ PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",   "1"))
 HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC","30"))
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Differential privacy: set DP_EPSILON > 0 to add Gaussian noise to features
+# before compression. Set to 0 (default) to disable live DP noise injection.
+_DP_EPSILON_STR = os.getenv("DP_EPSILON", "0").strip()
+DP_EPSILON      = float(_DP_EPSILON_STR) if _DP_EPSILON_STR else 0.0
+DP_DELTA        = float(os.getenv("DP_DELTA", "1e-5"))
+DP_SENSITIVITY  = float(os.getenv("DP_SENSITIVITY", "1.0"))
 PROJECT_ROOT    = Path(__file__).resolve().parents[1]
 EDGE_MODEL_PATH = Path(
     os.getenv("EDGE_MODEL_PATH")
@@ -60,6 +66,25 @@ EDGE_MODEL_PATH = Path(
 ).expanduser()
 if not EDGE_MODEL_PATH.is_absolute():
     EDGE_MODEL_PATH = (PROJECT_ROOT / EDGE_MODEL_PATH).resolve()
+
+
+def _add_dp_noise(features: dict, epsilon: float, delta: float = 1e-5, sensitivity: float = 1.0) -> dict:
+    """
+    Inject calibrated Gaussian noise into feature tensors for (ε, δ)-DP.
+
+    σ = (sensitivity / epsilon) * sqrt(2 * ln(1.25 / delta))
+
+    Note: bounding the L2 sensitivity of the feature extraction function
+    requires clipping in a production deployment; this implementation uses
+    the user-supplied ``sensitivity`` parameter.  Set DP_EPSILON > 0 via
+    the environment to enable live DP noise injection.
+    """
+    sigma = (sensitivity / epsilon) * (2.0 * np.log(1.25 / delta)) ** 0.5
+    noised = {}
+    for k, v in features.items():
+        fp = v.dequantize().float() if v.is_quantized else v.float()
+        noised[k] = fp + torch.randn_like(fp) * sigma
+    return noised
 
 
 def _serialize_feature_payload(features: dict, metadata: dict) -> bytes:
@@ -122,6 +147,12 @@ def _serialize_feature_payload(features: dict, metadata: dict) -> bytes:
         + b"\x00"
         + b"".join(arrays)
     )
+
+
+def _wire_compression_ratio(features: dict, payload_bytes: bytes) -> float:
+    """Return float32-baseline bytes divided by the complete serialized body."""
+    raw_float32_bytes = sum(value.numel() for value in features.values()) * 4
+    return raw_float32_bytes / max(len(payload_bytes), 1)
 
 
 class EdgeNode:
@@ -234,17 +265,21 @@ class EdgeNode:
             )
             return await self.predict_local(image_bytes, scan_uid)
 
-        # Extract and compress only when the cloud path is viable.
+        # Extract and optionally apply live DP noise before compression.
         with torch.no_grad():
             features = self.extractor.extract(patch_tensor.unsqueeze(0).to(DEVICE))
+
+        if DP_EPSILON > 0.0:
+            features = _add_dp_noise(
+                features, epsilon=DP_EPSILON, delta=DP_DELTA, sensitivity=DP_SENSITIVITY
+            )
+            logger.info(
+                "[%s] DP noise applied (ε=%.4f, δ=%g, sensitivity=%.3f)",
+                scan_uid, DP_EPSILON, DP_DELTA, DP_SENSITIVITY,
+            )
+
         compressed_payload = self.compressor.compress(features)
         t_compress = time.perf_counter()
-
-        raw_feature_bytes = sum(v.numel() * v.element_size() for v in features.values())
-        wire_feature_bytes = sum(
-            v.numel() * v.element_size() for v in compressed_payload.values()
-        )
-        compression_ratio = raw_feature_bytes / max(wire_feature_bytes, 1)
 
         payload_bytes = _serialize_feature_payload(
             compressed_payload,
@@ -253,13 +288,17 @@ class EdgeNode:
                 "edge_processing_ms": (t_compress - t_start) * 1000,
                 "bandwidth_mbps": bw_mbps,
                 "compression_method": COMPRESSION,
-                "compression_ratio": compression_ratio,
+                "dp_epsilon": DP_EPSILON if DP_EPSILON > 0.0 else None,
                 "checkpoint_sha256": self.extractor.checkpoint_sha256,
                 "image_mean": self.extractor.image_mean,
                 "image_std": self.extractor.image_std,
             },
         )
         payload_kb = len(payload_bytes) / 1024
+
+        # Include the complete HTTP body (header + tensor bytes), not an
+        # estimated header subtraction or in-memory tensor size.
+        compression_ratio = _wire_compression_ratio(features, payload_bytes)
 
         try:
             result = await self._send_features(payload_bytes, scan_uid)
@@ -270,7 +309,7 @@ class EdgeNode:
 
         total_ms = (time.perf_counter() - t_start) * 1000
 
-        # 6. Log to cloud
+        # 6. Log to cloud — use wire-verified compression_ratio
         await self._log_network_event({
             "node_id": NODE_ID,
             "latency_ms": latency_ms,
