@@ -272,7 +272,49 @@ The cache endpoint reports the runtime-resolved paths, validation result, patch 
 
 ## Training experiments
 
-`scripts/run_experiments.py` supports three phases. Commands below assume a validated cache exists and matches the selected subsets. The `--cache-dir` value must be visible to the training process.
+`scripts/run_experiments.py` supports three fixed-weight experiment phases and a separate MGDA strategy. Commands below assume a validated cache exists and matches the selected subsets. The `--cache-dir` value must be visible to the training process.
+
+### MGDA: adaptive all-loss training
+
+Select MGDA with `--strategy mgda`. It runs one all-objective experiment using BCE, Dice, Boundary, Focal, and the differentiable Hausdorff distance-transform surrogate. On each batch, it measures gradients on the shared Mask R-CNN mask head and predictor, builds the gradient Gram matrix, and solves the simplex-constrained minimum-norm objective. The resulting weights combine the five mask losses; detector losses continue through the same optimizer. The default run ID includes the epoch count, and an existing non-empty run directory is never silently overwritten.
+
+```powershell
+python scripts/run_experiments.py `
+  --strategy mgda `
+  --data .\data\luna16 `
+  --train-subsets 1 `
+  --validation-subset 0 `
+  --out .\experiments `
+  --epochs 10 `
+  --batch-size 4 `
+  --lr 0.005
+```
+
+MGDA writes per-epoch component losses, simplex weights, applied coefficients, shared-parameter gradient norms, pairwise gradient diagnostics, full optimizer gradient norms before/after clipping, learning rate, and an SGD step-norm estimate to `history.json` and `terminal.log`; the best checkpoint also contains its selected epoch metrics. The fixed-weight phase commands below remain the default when `--strategy fixed` is selected (or omitted).
+
+Three MGDA profiles are available via `--mgda-profile`: `raw_mask_head` preserves the original behavior, `raw_shared_path` solves over trainable backbone, FPN, and mask-branch parameters, and `unit_shared_path` solves over per-objective unit gradients and applies matching `lambda / gradient_norm` coefficients. No minimum task weights are imposed. The latter profiles receive distinct run IDs and do not overwrite the original MGDA run. Epoch history includes pairwise gradient cosine similarities and Gram entries for conflict analysis.
+
+The new profiles can be run independently with the baseline's split and training settings:
+
+```powershell
+python scripts/run_experiments.py --strategy mgda --mgda-profile raw_shared_path --data .\data\luna16 --train-subsets 1 --validation-subset 0 --epochs 10 --batch-size 4 --lr 0.005
+python scripts/run_experiments.py --strategy mgda --mgda-profile unit_shared_path --data .\data\luna16 --train-subsets 1 --validation-subset 0 --epochs 10 --batch-size 4 --lr 0.005
+```
+
+Before longer runs, inspect a few cached positive patches with the bounded diagnostic:
+
+```powershell
+python scripts/diagnose_mgda.py `
+  --checkpoint .\experiments\MGDA-all5-ep10\best_model.pth `
+  --cache-dir .\data\patches_cache_v2 `
+  --subset 1 `
+  --max-samples 2 `
+  --out .\experiments\MGDA-all5-ep10\gradient_diagnostic.json
+```
+
+This diagnostic reports losses, gradient norms, cosine conflicts, and raw versus unit-gradient simplex weights. It is not a training run or validation result.
+
+To compare with `G-all5-ep10`, use the same train/validation subsets, raw or cached input path, preprocessing, epoch count, batch size, learning rate, and checkpoint selection rule. The reference values supplied for that run are Dice 0.8826, HD95 3.11 mm, and Boundary F1 0.9346. The MGDA result must come from an executed run; these reference metrics are not a promise of MGDA performance. The local reference configuration used subset1 for training and subset0 for validation, and has no recorded independent test set.
 
 ### Phase 1: single-loss ablations
 
@@ -352,7 +394,7 @@ The composite mask objective supports these weights/components:
 L = α·BCE + β·Dice + γ·Boundary + δ·Focal + ε·HD_DT
 ```
 
-`HD_DT` is a distance-transform surrogate; it is not an exact differentiable HD95. Phase 2 currently searches only `α`, `β`, and `γ`; Phase 3 samples `α`, `β`, `γ`, `δ`, and `ε`. Phase 1 evaluates the five supported loss terms. The web experiment form exposes the five weights `α` through `ε`.
+`HD_DT` is a differentiable distance-transform surrogate; it is not the exact 95th-percentile Hausdorff metric reported during validation. Phase 2 currently searches only `α`, `β`, and `γ`; Phase 3 samples `α`, `β`, `γ`, `δ`, and `ε`. Phase 1 evaluates the five supported loss terms. The web experiment form selects fixed weights or MGDA; its fixed-weight controls remain available for the existing strategy.
 
 Validation includes Dice, IoU, HD95, boundary F1, sensitivity, specificity, average surface distance, and volume error where defined. The training evaluator also reports sampled-negative-patch false-positive rate and sampled-patch detections-per-scan proxy. Those are patch-sampling diagnostics, not official scan-level false positives per scan. A metric can be unavailable on a dataset that lacks the cases needed to define it.
 

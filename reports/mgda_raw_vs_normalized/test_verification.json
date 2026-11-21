@@ -1,0 +1,12 @@
+{
+  "all_experiments_completed": true,
+  "errors": {},
+  "initial_state_sha256": "77fba3fea25953626ee0280d45b6e2ec8fdba98fbc22a6f355fbb9b414e4bbba",
+  "seed": 20261121,
+  "required_epochs": 10,
+  "required_train_batches_per_epoch": 1070,
+  "completed_config_ids": [
+    "MGDA-raw-maskhead-10ep",
+    "MGDA-normalized-maskhead-10ep"
+  ]
+}

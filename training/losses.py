@@ -27,6 +27,16 @@ from scipy.ndimage import distance_transform_edt
 import numpy as np
 
 
+# Canonical task mapping used by MGDA and its configuration helpers.
+_TASK_REGISTRY = {
+    "bce": ("alpha", "bce"),
+    "dice": ("beta", "dice"),
+    "boundary": ("gamma", "boundary"),
+    "focal": ("delta", "focal"),
+    "hd": ("epsilon", "hd"),
+}
+
+
 # ---------------------------------------------------------------------------
 # 1. Binary Cross-Entropy Loss
 # ---------------------------------------------------------------------------
@@ -224,6 +234,10 @@ class CompositeMaskLoss(nn.Module):
         self.boundary = BoundaryLoss()
         self.focal   = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
         self.hd      = HausdorffDTLoss()
+        # Populated during Mask R-CNN training so MGDA can access the
+        # differentiable objectives before the detector loss is scalarized.
+        self.capture_components = False
+        self.last_components: dict[str, torch.Tensor] | None = None
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -237,6 +251,7 @@ class CompositeMaskLoss(nn.Module):
             dict with 'total' and individual component losses
         """
         components: dict[str, torch.Tensor] = {}
+        self.last_components = None
         total = torch.tensor(0.0, device=pred.device)
 
         if self.alpha > 0:
@@ -264,6 +279,11 @@ class CompositeMaskLoss(nn.Module):
             components["hd"] = l_hd
             total = total + self.epsilon * l_hd
 
+        self.last_components = (
+            {key: value for key, value in components.items() if key != "total"}
+            if self.capture_components
+            else None
+        )
         components["total"] = total
         return components
 
@@ -276,6 +296,31 @@ class CompositeMaskLoss(nn.Module):
             delta=cfg.get("delta", 0.0),
             epsilon=cfg.get("epsilon", 0.0),
         )
+
+    def active_tasks(self) -> list[str]:
+        """Return configured, non-zero objectives in canonical order."""
+        return [
+            task for task, (weight_attr, _) in _TASK_REGISTRY.items()
+            if float(getattr(self, weight_attr)) > 0.0
+        ]
+
+    def forward_single_task(
+        self, pred: torch.Tensor, target: torch.Tensor, task: str
+    ) -> torch.Tensor:
+        """Evaluate one unweighted loss objective."""
+        if task not in _TASK_REGISTRY:
+            raise ValueError(f"Unknown mask-loss task {task!r}; expected one of {list(_TASK_REGISTRY)}")
+        _, module_attr = _TASK_REGISTRY[task]
+        return getattr(self, module_attr)(pred, target)
+
+    def forward_all_tasks(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Evaluate all configured active objectives without fixed weighting."""
+        return {
+            task: self.forward_single_task(pred, target, task)
+            for task in self.active_tasks()
+        }
 
     def describe(self) -> str:
         parts = []

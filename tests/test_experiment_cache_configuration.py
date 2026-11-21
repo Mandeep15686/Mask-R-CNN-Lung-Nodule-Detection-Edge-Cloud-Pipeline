@@ -155,10 +155,35 @@ def test_api_create_persists_resolved_paths_split_and_cache_override(tmp_path, m
         assert created.config_json["train_subsets"] == [1]
         assert created.config_json["validation_subset"] == 0
         assert created.config_json["test_subset"] is None
+        assert created.config_json["training_strategy"] == "fixed"
         assert created.config_json["cache_summary"]["total_patches"] == 4
         assert set(created.config_json["data_split"]["train_scan_uids"]).isdisjoint(
             created.config_json["data_split"]["validation_scan_uids"]
         )
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_api_create_persists_mgda_training_strategy(tmp_path, monkeypatch):
+    raw = _raw_root(tmp_path)
+    cache = _cache(tmp_path / "mgda-cache", raw)
+    monkeypatch.setenv("DATA_ROOT", str(raw))
+    engine, db = _db_session()
+    try:
+        created = _run_sync_route(experiments.create_experiment(
+            _payload(
+                "mgda-exp",
+                cache_dir=str(cache),
+                training_strategy="mgda",
+                mgda_gradient_normalization="unit",
+                mgda_parameter_scope="shared_mask_path",
+            )
+        , db))
+        assert created.config_json["training_strategy"] == "mgda"
+        assert created.config_json["mgda_gradient_normalization"] == "unit"
+        assert created.config_json["mgda_parameter_scope"] == "shared_mask_path"
+        assert created.loss_description.startswith("MGDA")
     finally:
         db.close()
         engine.dispose()

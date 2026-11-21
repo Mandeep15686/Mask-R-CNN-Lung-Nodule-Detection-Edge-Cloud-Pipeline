@@ -13,7 +13,8 @@ function CreateForm({ onCreated }) {
   const [runtime, setRuntime] = useState(null);
   const [loadingInfo, setLoadingInfo] = useState(true);
   const [form, setForm] = useState({
-    config_id: "", phase: 1,
+    config_id: "", phase: 1, training_strategy: "fixed",
+    mgda_gradient_normalization: "raw", mgda_parameter_scope: "mask_head",
     alpha: 0.3, beta: 0.5, gamma: 0.5, delta: 0.0, epsilon: 0.0,
     epochs: 30, batch_size: 4, lr: 0.005,
     data_root: "", cache_dir: "", cache_selection: "default",
@@ -63,8 +64,13 @@ function CreateForm({ onCreated }) {
       await api.createExperiment({
         config_id: form.config_id,
         phase: Number(form.phase),
-        loss_weights: { alpha: form.alpha, beta: form.beta, gamma: form.gamma,
-                        delta: form.delta, epsilon: form.epsilon },
+        training_strategy: form.training_strategy,
+        mgda_gradient_normalization: form.mgda_gradient_normalization,
+        mgda_parameter_scope: form.mgda_parameter_scope,
+        loss_weights: form.training_strategy === "mgda"
+          ? { alpha: 0.2, beta: 0.2, gamma: 0.2, delta: 0.2, epsilon: 0.2 }
+          : { alpha: form.alpha, beta: form.beta, gamma: form.gamma,
+              delta: form.delta, epsilon: form.epsilon },
         epochs: Number(form.epochs),
         batch_size: Number(form.batch_size),
         fold: Number(form.validation_subset),
@@ -174,6 +180,13 @@ function CreateForm({ onCreated }) {
           </select>
         </div>
         <div>
+          <label className="label">Training strategy</label>
+          <select className="input" value={form.training_strategy} onChange={field("training_strategy")}>
+            <option value="fixed">Fixed loss weights</option>
+            <option value="mgda">MGDA adaptive weights</option>
+          </select>
+        </div>
+        <div>
           <label className="label">Validation subset</label>
           <select className="input" value={form.validation_subset} onChange={field("validation_subset")}>
             {(runtime?.available_subset_ids ?? []).map((subset) => (
@@ -183,21 +196,50 @@ function CreateForm({ onCreated }) {
         </div>
       </div>
 
-      {/* Loss weights */}
+      {/* Fixed weights remain configurable; MGDA derives weights per batch. */}
       <div>
-        <label className="label mb-3">Loss Weights</label>
-        <div className="grid grid-cols-5 gap-3">
-          {LW.map(({ k, label, color }) => (
-            <div key={k}>
-              <label className={`label ${color}`}>{label}</label>
-              <input className="input" type="number" min={0} max={1} step={0.1}
-                     value={form[k]} onChange={num(k)} />
+        <label className="label mb-3">{form.training_strategy === "mgda" ? "MGDA Objectives" : "Loss Weights"}</label>
+        {form.training_strategy === "mgda" ? (
+          <div className="space-y-3 rounded-lg border border-cyan-500/20 bg-slate-950/50 p-3">
+            <p className="text-xs text-slate-300">
+              MGDA combines BCE, Dice, Boundary, Focal, and differentiable HD-distance objectives. All objectives remain enabled; zero simplex weights can still occur when the measured gradients conflict.
+            </p>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div>
+                <label className="label">Gradient scaling</label>
+                <select className="input mt-1" value={form.mgda_gradient_normalization}
+                        onChange={field("mgda_gradient_normalization")}>
+                  <option value="raw">Raw task gradients</option>
+                  <option value="unit">Unit-normalized task gradients</option>
+                </select>
+                <p className="mt-1 text-xs text-slate-500">Unit mode solves on normalized gradients and applies matching inverse-norm coefficients.</p>
+              </div>
+              <div>
+                <label className="label">Parameters used by MGDA</label>
+                <select className="input mt-1" value={form.mgda_parameter_scope}
+                        onChange={field("mgda_parameter_scope")}>
+                  <option value="mask_head">Mask head and predictor</option>
+                  <option value="shared_mask_path">Trainable backbone and mask branch</option>
+                </select>
+              </div>
             </div>
-          ))}
-        </div>
-        <div className="mt-2 text-xs text-slate-400">
-          Preview: {LW.filter(l => form[l.k] > 0).map(l => `${form[l.k]}·${l.label.split(" ")[1]}`).join(" + ") || "None"}
-        </div>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-5 gap-3">
+              {LW.map(({ k, label, color }) => (
+                <div key={k}>
+                  <label className={`label ${color}`}>{label}</label>
+                  <input className="input" type="number" min={0} max={1} step={0.1}
+                         value={form[k]} onChange={num(k)} />
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-xs text-slate-400">
+              Preview: {LW.filter(l => form[l.k] > 0).map(l => `${form[l.k]}·${l.label.split(" ")[1]}`).join(" + ") || "None"}
+            </div>
+          </>
+        )}
       </div>
 
       {/* Training params */}
@@ -394,7 +436,8 @@ function ExperimentRow({ exp, onDelete, onStart }) {
             <h3 className="text-sm font-semibold text-white mb-3">Run configuration</h3>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
               {[
-                ["Phase", details?.phase], ["Validation fold", config.fold],
+                ["Phase", details?.phase], ["Training strategy", config.training_strategy ?? "fixed"],
+                ["Validation fold", config.fold],
                 ["Epochs", config.epochs], ["Batch size", config.batch_size],
                 ["Learning rate", config.lr], ["Data root", config.data_root],
                 ["Loading mode", config.cache_mode === "cached" ? "Cached NPZ (fast path)" : "Raw CT volumes"],
@@ -440,7 +483,11 @@ function ExperimentRow({ exp, onDelete, onStart }) {
               </details>
             )}
             <div className="flex flex-wrap gap-2 mt-3">
-              {weights.map((key) => (
+              {config.training_strategy === "mgda" ? (
+                <span className="rounded bg-cyan-950/70 px-2 py-1 text-xs text-cyan-200">
+                  Adaptive weights, component losses, and shared gradient norms are logged per epoch.
+                </span>
+              ) : weights.map((key) => (
                 <span key={key} className="rounded bg-slate-800 px-2 py-1 text-xs text-slate-300">
                   {lossNames[key]}: {details?.[key] ?? "—"}
                 </span>

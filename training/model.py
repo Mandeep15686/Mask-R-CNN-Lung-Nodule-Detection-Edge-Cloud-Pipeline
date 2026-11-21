@@ -18,6 +18,7 @@ from .losses import CompositeMaskLoss
 
 
 _ACTIVE_COMPOSITE_MASK_LOSS = ContextVar("active_composite_mask_loss", default=None)
+_MGDA_CACHE = ContextVar("mgda_mask_cache", default=None)
 _TORCHVISION_MASK_LOSS = roi_heads_module.maskrcnn_loss
 
 
@@ -39,6 +40,13 @@ def _composite_maskrcnn_loss(mask_logits, proposals, gt_masks, gt_labels, matche
         return mask_logits.sum() * 0.0
     targets = torch.cat(mask_targets, dim=0)[positive]
     logits = mask_logits[positive, labels[positive]]
+    mgda_cache = _MGDA_CACHE.get()
+    if mgda_cache is not None:
+        mgda_cache["logits"] = logits
+        mgda_cache["targets"] = targets
+        # Keep the mask branch attached to this forward graph. The final MGDA
+        # scalar is formed from these cached logits before a single backward.
+        return logits.sum() * 0.0
     return loss_fn(logits, targets)["total"]
 
 
@@ -138,12 +146,24 @@ class LungNoduleMaskRCNN(nn.Module):
         Returns losses dict (train) or list of prediction dicts (eval).
         """
         if self.training and targets is not None:
+            self.composite_mask_loss.last_components = None
             token = _ACTIVE_COMPOSITE_MASK_LOSS.set(self.composite_mask_loss)
             try:
                 return self.model(images, targets)
             finally:
                 _ACTIVE_COMPOSITE_MASK_LOSS.reset(token)
         return self.model(images, targets)
+
+    def forward_mgda(self, images: list, targets: list, mgda_cache: dict):
+        """Run one training forward while capturing positive mask ROI logits."""
+        self.composite_mask_loss.last_components = None
+        loss_token = _ACTIVE_COMPOSITE_MASK_LOSS.set(self.composite_mask_loss)
+        cache_token = _MGDA_CACHE.set(mgda_cache)
+        try:
+            return self.model(images, targets)
+        finally:
+            _MGDA_CACHE.reset(cache_token)
+            _ACTIVE_COMPOSITE_MASK_LOSS.reset(loss_token)
 
     def get_loss_description(self) -> str:
         return self.composite_mask_loss.describe()

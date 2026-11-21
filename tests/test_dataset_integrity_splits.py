@@ -151,6 +151,31 @@ def test_explicit_train_validation_test_uid_separation(tmp_path):
     assert split["test_subset"] == 2
 
 
+def test_seeded_training_sampler_repeats_epoch_orders_across_runs(tmp_path):
+    raw = _raw_root(tmp_path, subset_ids=(0, 1))
+    cache = tmp_path / "cache"
+    entries = [
+        {"file": f"{subset}-{index}.npz", "uid": f"1.2.3.{subset + 1}",
+         "subset": subset, "label": index % 2}
+        for subset in (0, 1) for index in range(8)
+    ]
+    _cache(cache, entries)
+
+    first, _ = build_dataloaders(
+        raw, train_subsets=[0], validation_subset=1, cache_dir=cache,
+        patch_size=8, batch_size=2, num_workers=0, seed=20261121,
+    )
+    second, _ = build_dataloaders(
+        raw, train_subsets=[0], validation_subset=1, cache_dir=cache,
+        patch_size=8, batch_size=2, num_workers=0, seed=20261121,
+    )
+    first_epoch_a = list(first.sampler)
+    second_epoch_a = list(first.sampler)
+    first_epoch_b = list(second.sampler)
+    assert first_epoch_a == first_epoch_b
+    assert first_epoch_a != second_epoch_a
+
+
 def test_explicit_splits_reject_unavailable_or_overlapping_subsets(tmp_path):
     raw = _raw_root(tmp_path, subset_ids=(0, 1))
     cache = tmp_path / "cache"
@@ -182,6 +207,21 @@ def test_api_experiment_schema_validates_explicit_split():
     )
     assert valid.train_subsets == [0]
     assert valid.test_subset == 2
+    assert valid.training_strategy == "fixed"
+
+    mgda = ExperimentCreate(
+        config_id="mgda-strategy",
+        loss_weights=LossWeights(alpha=0.2, beta=0.2, gamma=0.2, delta=0.2, epsilon=0.2),
+        training_strategy="mgda",
+    )
+    assert mgda.training_strategy == "mgda"
+
+    with pytest.raises(ValueError):
+        ExperimentCreate(
+            config_id="invalid-strategy",
+            loss_weights=LossWeights(alpha=1.0),
+            training_strategy="unknown",
+        )
 
     with pytest.raises(ValueError, match="disjoint"):
         ExperimentCreate(

@@ -195,6 +195,15 @@ class TestHausdorffDTLoss:
         loss = HausdorffDTLoss()(logits, target)
         assert loss.item() >= 0.0
 
+    def test_distance_surrogate_has_finite_nonzero_gradient(self):
+        logits = torch.zeros((1, 16, 16), requires_grad=True)
+        target = torch.zeros((1, 16, 16))
+        target[:, 5:10, 5:10] = 1.0
+        HausdorffDTLoss()(logits, target).backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+        assert torch.linalg.vector_norm(logits.grad) > 0
+
 
 # ---------------------------------------------------------------------------
 # CompositeMaskLoss tests

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-CLI entry-point to run Phase 1, 2, or 3 loss-weight experiments.
+CLI entry-point to run Phase 1-4 loss-weight experiments.
 
 Usage:
   python scripts/run_experiments.py --phase 1 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments
   python scripts/run_experiments.py --phase 2 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments --max-configs 20
   python scripts/run_experiments.py --phase 3 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments --n-trials 50
+  python scripts/run_experiments.py --phase 4 --data ./data/luna16 --cache-dir ./data/patches_cache_v2 --out ./experiments --epochs 10
 """
 import argparse
 import logging
@@ -22,7 +23,18 @@ logging.basicConfig(
 
 def main():
     parser = argparse.ArgumentParser(description="Run Mask R-CNN loss-weight experiments")
-    parser.add_argument("--phase",       type=int,   default=1,            help="1=ablation, 2=grid, 3=bayesian")
+    parser.add_argument("--phase",       type=int,   default=1,            help="1=ablation, 2=grid, 3=bayesian, 4=MGDA study")
+    parser.add_argument("--strategy", choices=("fixed", "mgda"), default="fixed",
+                        help="fixed loss weights (existing) or one MGDA all-loss run")
+    parser.add_argument("--config-id", type=str, default=None,
+                        help="Optional output ID for a standalone MGDA run")
+    parser.add_argument(
+        "--mgda-profile",
+        choices=("raw_mask_head", "raw_shared_path", "unit_shared_path"),
+        default="raw_mask_head",
+        help=("MGDA diagnostic profile: original raw mask-head, raw shared path, "
+              "or unit-gradient shared path"),
+    )
     parser.add_argument("--data",        type=str,   default="./data/luna16", help="LUNA16 data root")
     parser.add_argument("--cache-dir",   type=str,   default=None,         help="Pre-extracted LUNA16 patch cache directory")
     parser.add_argument("--out",         type=str,   default="./experiments", help="Output directory")
@@ -40,6 +52,10 @@ def main():
     parser.add_argument("--resume", action="store_true",
                         help="Phase 2: skip configurations with complete validated artifacts")
     parser.add_argument("--n-trials",    type=int,   default=100,          help="Phase 3: Optuna trials")
+    parser.add_argument("--mgda-max-iter", type=int, default=200, help="Phase 4: Frank-Wolfe solver iterations")
+    parser.add_argument("--mgda-tol", type=float, default=1e-8, help="Phase 4: Frank-Wolfe stopping tolerance")
+    parser.add_argument("--mgda-log-conflict", action="store_true", help="Phase 4: include pairwise gradient conflict diagnostics")
+    parser.add_argument("--mgda-vs-fixed", action="store_true", help="Phase 4: run matched fixed-weight and MGDA comparisons")
     args = parser.parse_args()
 
     from training.experiment import ExperimentRunner, BASE_CONFIG
@@ -54,11 +70,17 @@ def main():
         "validation_subset": args.validation_subset,
         "test_subset": args.test_subset,
         "lr":         args.lr,
+        "training_strategy": args.strategy,
+        "mgda_profile": args.mgda_profile,
     }
 
     runner = ExperimentRunner(base_cfg, args.out)
 
-    if args.phase == 1:
+    if args.strategy == "mgda":
+        if args.phase != 1:
+            parser.error("--strategy mgda runs one all-loss experiment; leave --phase at its default (1)")
+        runner.run_mgda(config_id=args.config_id, profile=args.mgda_profile)
+    elif args.phase == 1:
         runner.run_phase1()
     elif args.phase == 2:
         runner.run_phase2(max_configs=args.max_configs, resume=args.resume)
@@ -67,6 +89,18 @@ def main():
         print("\n=== Phase 3 Best Result ===")
         import json
         print(json.dumps(result, indent=2))
+    elif args.phase == 4:
+        if args.mgda_max_iter < 1 or args.mgda_tol <= 0:
+            parser.error("--mgda-max-iter and --mgda-tol must be positive")
+        if args.mgda_vs_fixed:
+            runner.run_mgda_vs_fixed_comparison(
+                max_iter=args.mgda_max_iter, tol=args.mgda_tol, resume=args.resume,
+            )
+        else:
+            runner.run_phase4(
+                max_iter=args.mgda_max_iter, tol=args.mgda_tol,
+                resume=args.resume, log_conflict=args.mgda_log_conflict,
+            )
     else:
         print(f"Unknown phase: {args.phase}", file=sys.stderr)
         sys.exit(1)

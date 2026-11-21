@@ -26,10 +26,29 @@ from typing import Optional
 import numpy as np
 import SimpleITK as sitk
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torchvision.transforms.functional as TF
 
 logger = logging.getLogger(__name__)
+
+
+class _SeededEpochSampler(Sampler[int]):
+    """Epoch-keyed shuffle whose order can be audited and reproduced."""
+
+    def __init__(self, dataset: Dataset, seed: int):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+        self.last_indices: list[int] = []
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        self.last_indices = torch.randperm(len(self.dataset), generator=generator).tolist()
+        return iter(self.last_indices)
+
+    def __len__(self):
+        return len(self.dataset)
 
 # LUNA16 Hounsfield Unit windows for lung parenchyma
 HU_MIN, HU_MAX = -1000, 400
@@ -621,6 +640,7 @@ def build_dataloaders(
     validation_subset: Optional[int] = None,
     test_subset: Optional[int] = None,
     target_spacing_mm: tuple[float, float, float] = TARGET_SPACING_MM,
+    seed: Optional[int] = None,
 ) -> tuple[DataLoader, DataLoader]:
     """
     Build train/validation DataLoaders. Explicit scan-disjoint subset groups
@@ -638,6 +658,7 @@ def build_dataloaders(
                      When supplied, raw LUNA16 volumes are never read during training.
         train_subsets, validation_subset, test_subset: explicit disjoint subsets.
         target_spacing_mm: physical voxel spacing for raw-volume resampling.
+        seed: optional generator seed for reproducible shuffled training order.
     """
     root_arg = Path(data_root).expanduser()
     if root_arg.is_absolute():
@@ -840,14 +861,17 @@ def build_dataloaders(
     # negative centers. Keep it in one process; cached loading can be parallel.
     safe_workers = 0 if platform.system() == "Windows" or cache_dir is None else num_workers
 
+    seeded_sampler = _SeededEpochSampler(train_ds, seed) if seed is not None else None
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=seeded_sampler is None,
+        sampler=seeded_sampler,
         num_workers=safe_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=(safe_workers > 0),   # avoids worker respawn overhead
+        generator=(torch.Generator().manual_seed(int(seed)) if seed is not None else None),
     )
     val_loader = DataLoader(
         val_ds,

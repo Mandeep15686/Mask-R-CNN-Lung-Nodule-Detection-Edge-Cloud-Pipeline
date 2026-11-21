@@ -182,6 +182,9 @@ async def create_experiment(
             "epochs": payload.epochs,
             "batch_size": payload.batch_size,
             "lr": payload.lr,
+            "training_strategy": payload.training_strategy,
+            "mgda_gradient_normalization": payload.mgda_gradient_normalization,
+            "mgda_parameter_scope": payload.mgda_parameter_scope,
         })
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -200,7 +203,11 @@ async def create_experiment(
         gamma=lw.gamma,
         delta=lw.delta,
         epsilon=lw.epsilon,
-        loss_description=_describe_loss(lw),
+        loss_description=(
+            "MGDA (adaptive BCE, Dice, Boundary, Focal, and HD-distance surrogate)"
+            if payload.training_strategy == "mgda"
+            else _describe_loss(lw)
+        ),
         status="pending",
         config_json=experiment_config,
     )
@@ -426,7 +433,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
                 temporary_checkpoint.replace(canonical_checkpoint)
                 inference_engine.load_checkpoint(str(canonical_checkpoint))
 
-            _set_experiment_status(exp_id, "done")
+            _set_experiment_status(exp_id, "done", summary=summary)
             logger.info("Experiment %s completed successfully", experiment_id)
 
         except Exception as e:
@@ -441,7 +448,7 @@ async def _run_experiment_bg(exp_id: int, config_json: dict, inference_engine=No
             db.close()
 
 
-def _set_experiment_status(exp_id: int, status: str):
+def _set_experiment_status(exp_id: int, status: str, summary: Optional[dict] = None):
     from ..database import SessionLocal
     db = SessionLocal()
     try:
@@ -449,6 +456,22 @@ def _set_experiment_status(exp_id: int, status: str):
         if exp:
             exp.status = status
             exp.finished_at = datetime.now(timezone.utc)
+            if summary and summary.get("training_strategy") == "mgda":
+                weights = summary.get("loss_weights", {})
+                exp.alpha = weights.get("alpha", exp.alpha)
+                exp.beta = weights.get("beta", exp.beta)
+                exp.gamma = weights.get("gamma", exp.gamma)
+                exp.delta = weights.get("delta", exp.delta)
+                exp.epsilon = weights.get("epsilon", exp.epsilon)
+                exp.loss_description = (
+                    "MGDA final adaptive weights: "
+                    f"BCE={exp.alpha:.3f}, Dice={exp.beta:.3f}, "
+                    f"Boundary={exp.gamma:.3f}, Focal={exp.delta:.3f}, "
+                    f"HD-distance={exp.epsilon:.3f}"
+                )
+                config = dict(exp.config_json or {})
+                config["adaptive_loss_weights"] = weights
+                exp.config_json = config
             db.commit()
     finally:
         db.close()
@@ -463,11 +486,11 @@ def _log_epoch_to_db(exp_id: int, fold: int, epoch: int, train_m: dict, val_m: d
             fold=fold,
             epoch=epoch,
             train_total_loss=train_m.get("total_loss"),
-            train_bce_loss=train_m.get("bce"),
-            train_dice_loss=train_m.get("dice"),
-            train_boundary_loss=train_m.get("boundary"),
-            train_focal_loss=train_m.get("focal"),
-            train_hd_loss=train_m.get("hd"),
+            train_bce_loss=train_m.get("bce", train_m.get("mgda_loss_bce")),
+            train_dice_loss=train_m.get("dice", train_m.get("mgda_loss_dice")),
+            train_boundary_loss=train_m.get("boundary", train_m.get("mgda_loss_boundary")),
+            train_focal_loss=train_m.get("focal", train_m.get("mgda_loss_focal")),
+            train_hd_loss=train_m.get("hd", train_m.get("mgda_loss_hd")),
             lr=train_m.get("lr"),
             val_dice=val_m.get("val_dice"),
             val_iou=val_m.get("val_iou"),

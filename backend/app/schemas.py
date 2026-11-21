@@ -29,6 +29,9 @@ class LossWeights(BaseModel):
 class ExperimentCreate(BaseModel):
     config_id: str = Field(..., min_length=1, max_length=64)
     phase: int = Field(1, ge=1, le=3)
+    training_strategy: Literal["fixed", "mgda"] = "fixed"
+    mgda_gradient_normalization: Literal["raw", "unit"] = "raw"
+    mgda_parameter_scope: Literal["mask_head", "shared_mask_path"] = "mask_head"
     loss_weights: LossWeights
     epochs: int = Field(30, ge=1, le=200)
     batch_size: int = Field(4, ge=1, le=32)
