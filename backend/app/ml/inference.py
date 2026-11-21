@@ -479,8 +479,10 @@ class InferenceEngine:
                 fpn_features = fpn(fpn_input)
 
                 # --- RPN + RoI heads ---
+                # GeneralizedRCNNTransform expects each list element to be
+                # an unbatched [C, H, W] image; it creates the batch itself.
                 dummy_img = torch.zeros(
-                    1, 3, PATCH_SIZE, PATCH_SIZE, device=self.device
+                    3, PATCH_SIZE, PATCH_SIZE, device=self.device
                 )
                 image_list, _ = det_model.transform([dummy_img], None)
                 proposals, _  = det_model.rpn(image_list, fpn_features, None)
@@ -520,7 +522,8 @@ class InferenceEngine:
         try:
             with loaded.inference_lock:
                 detection_model = loaded.model.model
-                dummy_img = torch.zeros(1, 3, PATCH_SIZE, PATCH_SIZE, device=self.device)
+                # GeneralizedRCNNTransform expects unbatched [C, H, W] images.
+                dummy_img = torch.zeros(3, PATCH_SIZE, PATCH_SIZE, device=self.device)
                 image_list, _ = detection_model.transform([dummy_img], None)
                 proposals, _ = detection_model.rpn(image_list, features_device, None)
                 detections, _ = detection_model.roi_heads(

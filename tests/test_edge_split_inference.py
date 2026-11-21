@@ -36,6 +36,8 @@ class _Transform:
     image_std = [0.229, 0.224, 0.225]
 
     def __call__(self, images, targets):
+        assert all(image.ndim == 3 for image in images)
+        assert all(image.shape[0] == 3 for image in images)
         return SimpleNamespace(image_sizes=[(64, 64)]), targets
 
     @staticmethod
@@ -150,3 +152,30 @@ def test_edge_auth_requires_configured_token_outside_dev(monkeypatch):
         _validate_edge_token("wrong", app_env="production")
     assert exc.value.status_code == 401
     _validate_edge_token("secret", app_env="production")
+
+
+def test_direct_feature_inference_passes_unbatched_image_to_transform():
+    class _RPN:
+        def __call__(self, image_list, features, targets):
+            return [], None
+
+    class _ROIHeads:
+        def __call__(self, features, proposals, image_sizes, targets):
+            return [{}], None
+
+    detection_model = SimpleNamespace(
+        transform=_Transform(),
+        rpn=_RPN(),
+        roi_heads=_ROIHeads(),
+    )
+    loaded = SimpleNamespace(
+        model=SimpleNamespace(model=detection_model),
+        inference_lock=RLock(),
+        spacing_mm=(1.0, 1.0, 1.0),
+    )
+    engine = object.__new__(InferenceEngine)
+    engine.device = torch.device("cpu")
+    engine._get_checkpoint = lambda checkpoint_path=None: loaded
+
+    features = {str(level): torch.zeros(1, 1, 2, 2) for level in range(5)}
+    assert engine.predict_from_features(features, "scan-test") == []
