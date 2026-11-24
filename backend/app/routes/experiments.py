@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -224,8 +224,8 @@ async def create_experiment(
 async def list_experiments(
     phase: Optional[int] = None,
     status: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     q = db.query(Experiment)
@@ -234,6 +234,20 @@ async def list_experiments(
     if status:
         q = q.filter(Experiment.status == status)
     return q.order_by(Experiment.created_at.desc()).offset(offset).limit(limit).all()
+
+
+@router.post("/sync-artifacts")
+async def sync_experiment_artifacts(db: Session = Depends(get_db)):
+    """Refresh website records from saved experiment folders and their histories."""
+    from ..artifact_sync import sync_saved_experiment_artifacts
+
+    try:
+        stats = sync_saved_experiment_artifacts(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Experiment artifact sync failed")
+        raise HTTPException(status_code=500, detail=f"Experiment artifact sync failed: {exc}") from exc
+    return {"status": "ok", **stats}
 
 
 @router.get("/{exp_id}", response_model=ExperimentResponse)

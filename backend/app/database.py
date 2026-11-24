@@ -4,6 +4,7 @@ Uses SQLite by default; swap DATABASE_URL env var for PostgreSQL.
 """
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Generator
 
 from sqlalchemy import (
@@ -12,7 +13,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lung_nodule.db")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATABASE_URL = f"sqlite:///{(PROJECT_ROOT / 'backend' / 'lung_nodule.db').as_posix()}"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 engine = create_engine(
     DATABASE_URL,

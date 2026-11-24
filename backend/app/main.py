@@ -25,6 +25,16 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
     logger.info("Starting Lung Nodule Detection API...")
     create_tables()
+    # Index existing checkpoint folders so website pages see runs even when
+    # the optional one-time CLI importer has not been run manually.
+    if os.getenv("APP_ENV", "production").lower() != "test":
+        try:
+            from .artifact_sync import sync_on_startup
+            sync_stats = sync_on_startup()
+            logger.info("Experiment artifact sync complete: %s", sync_stats)
+        except Exception:
+            # A malformed artifact folder should not prevent inference/API use.
+            logger.exception("Could not sync saved experiment artifacts at startup")
     # Pre-load inference engine
     from .ml.inference import InferenceEngine
     app.state.inference_engine = InferenceEngine()

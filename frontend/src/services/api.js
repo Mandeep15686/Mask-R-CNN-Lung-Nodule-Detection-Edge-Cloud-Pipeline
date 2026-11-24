@@ -29,6 +29,7 @@ export const api = {
 
   // Experiments CRUD
   listExperiments: (params = {})  => http.get("/experiments/", { params }),
+  syncExperimentArtifacts:       () => http.post("/experiments/sync-artifacts"),
   getExperiment:   (id)           => http.get(`/experiments/${id}`),
   getExperimentDetails:(id)       => http.get(`/experiments/${id}/details`),
   createExperiment:(data)         => http.post("/experiments/", data),

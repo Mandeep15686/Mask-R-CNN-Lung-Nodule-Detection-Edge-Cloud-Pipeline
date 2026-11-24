@@ -56,6 +56,17 @@ def _number(record: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _json_finite(value: Any) -> Any:
+    """Keep imported JSON safe for API serialization (JSON has no Infinity)."""
+    if isinstance(value, dict):
+        return {str(key): _json_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_finite(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _weight_config(config: dict[str, Any], summary: dict[str, Any]) -> dict[str, float]:
     configured = summary.get("loss_weights") or config.get("mask_loss") or {}
     if not isinstance(configured, dict):
@@ -105,6 +116,7 @@ def _config_for_database(
                 split_summary[f"{key}_count"] = len(split[key])
         if split_summary:
             details["data_split_summary"] = split_summary
+    details["artifact_summary"] = _json_finite(summary)
     details.update({
         "source_folder": folder.parent.name,
         "artifact_dir": source,
@@ -126,11 +138,13 @@ def _database_config_id(source_root: Path, original_config_id: str) -> str:
 
 
 def _collect_runs() -> list[dict[str, Any]]:
-    imported: list[dict[str, Any]] = []
+    imported_by_id: dict[str, tuple[int, dict[str, Any]]] = {}
     for root_name in SOURCE_FOLDERS:
         source_root = PROJECT_ROOT / root_name
         if not source_root.is_dir():
-            raise ValueError(f"Experiment folder does not exist: {source_root}")
+            # The older Phase 2 output roots may have been merged into
+            # ./experiments. Their absence must not hide the runs that remain.
+            continue
         for folder in sorted(path for path in source_root.iterdir() if path.is_dir()):
             checkpoint = folder / "best_model.pth"
             if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
@@ -160,7 +174,7 @@ def _collect_runs() -> list[dict[str, Any]]:
             # presented as completed experiments.
             status = "done" if completed_epochs >= requested_epochs else "failed"
             history_stat = (folder / "history.json").stat()
-            imported.append({
+            item = {
                 "config_id": db_id,
                 "original_config_id": original_id,
                 "phase": _phase(original_id, config),
@@ -171,8 +185,104 @@ def _collect_runs() -> list[dict[str, Any]]:
                 "config_json": config_json,
                 "history": history,
                 "artifact_mtime": datetime.fromtimestamp(history_stat.st_mtime, timezone.utc),
-            })
-    return imported
+            }
+            # A copied/aggregate directory can contain a duplicate config_id.
+            # Prefer the directory named for that config so details and logs
+            # resolve to the canonical run rather than an incidental copy.
+            rank = 0 if folder.name == original_id else 1
+            previous = imported_by_id.get(db_id)
+            if previous is None or (rank, -item["artifact_mtime"].timestamp()) < (
+                previous[0], -previous[1]["artifact_mtime"].timestamp()
+            ):
+                imported_by_id[db_id] = (rank, item)
+    return [item for _, item in sorted(imported_by_id.values(), key=lambda pair: pair[1]["config_id"])]
+
+
+def sync_experiment_folders(
+    db,
+    imports: list[dict[str, Any]] | None = None,
+    *,
+    experiment_model=None,
+    training_run_model=None,
+) -> dict[str, int]:
+    """Upsert artifact histories without moving/deleting checkpoint files."""
+    imports = _collect_runs() if imports is None else imports
+    stats = {
+        "discovered": len(imports),
+        "created": 0,
+        "updated": 0,
+        "skipped_running": 0,
+        "history_rows": 0,
+        "complete": 0,
+        "incomplete": 0,
+    }
+    if experiment_model is None or training_run_model is None:
+        from backend.app.database import Experiment, TrainingRun
+        experiment_model = experiment_model or Experiment
+        training_run_model = training_run_model or TrainingRun
+
+    for item in imports:
+        experiment = (
+            db.query(experiment_model)
+            .filter(experiment_model.config_id == item["config_id"])
+            .one_or_none()
+        )
+        if experiment is not None and experiment.status in {"pending", "running"}:
+            # Do not let an artifact scan overwrite a live API-created run.
+            stats["skipped_running"] += 1
+            continue
+        if experiment is None:
+            experiment = experiment_model(config_id=item["config_id"])
+            db.add(experiment)
+            db.flush()
+            stats["created"] += 1
+        else:
+            stats["updated"] += 1
+
+        experiment.phase = item["phase"]
+        for key, value in item["weights"].items():
+            setattr(experiment, key, value)
+        experiment.loss_description = item["loss_description"]
+        experiment.status = item["status"]
+        experiment.config_json = item["config_json"]
+        if experiment.created_at is None:
+            experiment.created_at = item["artifact_mtime"]
+        experiment.finished_at = item["artifact_mtime"]
+
+        db.query(training_run_model).filter(
+            training_run_model.experiment_id == experiment.id
+        ).delete(synchronize_session=False)
+        fold = int(item["config_json"].get("fold") or 0)
+        for ordinal, epoch_data in enumerate(item["history"], start=1):
+            epoch = int(epoch_data.get("epoch") or ordinal)
+            db.add(training_run_model(
+                experiment_id=experiment.id,
+                fold=fold,
+                epoch=epoch,
+                train_total_loss=_number(epoch_data, "total_loss", "train_total_loss"),
+                train_bce_loss=_number(epoch_data, "bce", "train_bce_loss"),
+                train_dice_loss=_number(epoch_data, "dice", "train_dice_loss"),
+                train_boundary_loss=_number(epoch_data, "boundary", "train_boundary_loss"),
+                train_focal_loss=_number(epoch_data, "focal", "train_focal_loss"),
+                train_hd_loss=_number(epoch_data, "hd", "train_hd_loss"),
+                lr=_number(epoch_data, "lr"),
+                val_dice=_number(epoch_data, "val_dice"),
+                val_iou=_number(epoch_data, "val_iou"),
+                val_total_loss=_number(epoch_data, "val_total_loss", "val_total"),
+                val_hd95=_number(epoch_data, "val_hd95"),
+                val_boundary_f1=_number(epoch_data, "val_boundary_f1"),
+                val_sensitivity=_number(epoch_data, "val_sensitivity"),
+                val_specificity=_number(epoch_data, "val_specificity"),
+                val_asd=_number(epoch_data, "val_asd"),
+                val_vol_err=_number(epoch_data, "val_vol_err"),
+            ))
+            stats["history_rows"] += 1
+        if item["status"] == "done":
+            stats["complete"] += 1
+        else:
+            stats["incomplete"] += 1
+    db.commit()
+    return stats
 
 
 def main() -> int:
@@ -209,58 +319,14 @@ def main() -> int:
         if args.dry_run:
             return 0
 
-        from backend.app.database import Experiment, SessionLocal, TrainingRun
+        from backend.app.database import SessionLocal
 
         with SessionLocal() as db:
-            for item in imports:
-                experiment = (
-                    db.query(Experiment)
-                    .filter(Experiment.config_id == item["config_id"])
-                    .one_or_none()
-                )
-                if experiment is None:
-                    experiment = Experiment(config_id=item["config_id"])
-                    db.add(experiment)
-                    db.flush()
-
-                experiment.phase = item["phase"]
-                for key, value in item["weights"].items():
-                    setattr(experiment, key, value)
-                experiment.loss_description = item["loss_description"]
-                experiment.status = item["status"]
-                experiment.config_json = item["config_json"]
-                if experiment.created_at is None:
-                    experiment.created_at = item["artifact_mtime"]
-                experiment.finished_at = item["artifact_mtime"]
-
-                db.query(TrainingRun).filter(
-                    TrainingRun.experiment_id == experiment.id
-                ).delete(synchronize_session=False)
-                fold = int(item["config_json"].get("fold") or 0)
-                for ordinal, epoch_data in enumerate(item["history"], start=1):
-                    epoch = int(epoch_data.get("epoch") or ordinal)
-                    db.add(TrainingRun(
-                        experiment_id=experiment.id,
-                        fold=fold,
-                        epoch=epoch,
-                        train_total_loss=_number(epoch_data, "total_loss", "train_total_loss"),
-                        train_bce_loss=_number(epoch_data, "bce", "train_bce_loss"),
-                        train_dice_loss=_number(epoch_data, "dice", "train_dice_loss"),
-                        train_boundary_loss=_number(epoch_data, "boundary", "train_boundary_loss"),
-                        train_focal_loss=_number(epoch_data, "focal", "train_focal_loss"),
-                        train_hd_loss=_number(epoch_data, "hd", "train_hd_loss"),
-                        lr=_number(epoch_data, "lr"),
-                        val_dice=_number(epoch_data, "val_dice"),
-                        val_iou=_number(epoch_data, "val_iou"),
-                        val_hd95=_number(epoch_data, "val_hd95"),
-                        val_boundary_f1=_number(epoch_data, "val_boundary_f1"),
-                        val_sensitivity=_number(epoch_data, "val_sensitivity"),
-                        val_specificity=_number(epoch_data, "val_specificity"),
-                        val_asd=_number(epoch_data, "val_asd"),
-                        val_vol_err=_number(epoch_data, "val_vol_err"),
-                    ))
-            db.commit()
-        print(f"Imported or refreshed {len(imports)} experiment entries and epoch histories.")
+            stats = sync_experiment_folders(db, imports)
+        print(
+            "Imported/refreshed {discovered} artifact runs: {created} new, {updated} updated, "
+            "{complete} complete, {incomplete} incomplete, {history_rows} epoch rows.".format(**stats)
+        )
         return 0
     except Exception as exc:
         print(f"Import failed: {exc}", file=sys.stderr)

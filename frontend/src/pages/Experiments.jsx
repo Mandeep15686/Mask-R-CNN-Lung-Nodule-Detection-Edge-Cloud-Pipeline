@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { api, openTrainingWS } from "../services/api.js";
-import { Plus, Play, Trash2, ChevronDown, ChevronRight, Loader2, AlertCircle, Terminal } from "lucide-react";
+import { Plus, Play, Trash2, ChevronDown, ChevronRight, Loader2, AlertCircle, Terminal, RefreshCw } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend,
 } from "recharts";
@@ -384,6 +384,8 @@ function ExperimentRow({ exp, onDelete, onStart }) {
     "Boundary F1": run.val_boundary_f1,
   }));
   const config = details?.config_json ?? {};
+  const artifactSummary = config.artifact_summary ?? {};
+  const finalMetrics = artifactSummary.final_metrics ?? {};
   const weights = ["alpha", "beta", "gamma", "delta", "epsilon"];
   const lossNames = { alpha: "BCE", beta: "Dice", gamma: "Boundary", delta: "Focal", epsilon: "HD95" };
   const shown = (value, digits = 4) => Number.isFinite(value) ? value.toFixed(digits) : "—";
@@ -450,7 +452,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                 ["Training scans", config.data_split?.train_scan_uids?.length],
                 ["Validation scans", config.data_split?.validation_scan_uids?.length],
                 ["Test scans", config.data_split?.test_scan_uids?.length ?? 0],
-                ["Artifact folder", config.source_folder],
+                ["Artifact folder", config.artifact_dir ?? config.source_folder],
                 ["Created", details?.created_at], ["Started", details?.started_at],
                 ["Finished", details?.finished_at],
               ].map(([label, value]) => (
@@ -460,6 +462,29 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                 </div>
               ))}
             </div>
+            {(artifactSummary.best_dice != null || Object.keys(finalMetrics).length > 0) && (
+              <div className="mt-4">
+                <h4 className="text-xs font-semibold text-slate-200 mb-2">Saved artifact summary</h4>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                  {[
+                    ["Best epoch", artifactSummary.best_epoch],
+                    ["Best pseudo-mask Dice", artifactSummary.best_dice],
+                    ["Final epoch", finalMetrics.epoch],
+                    ["Final train loss", finalMetrics.total_loss],
+                    ["Final validation loss", finalMetrics.val_total ?? finalMetrics.val_total_loss],
+                    ["Final pseudo-mask Dice", finalMetrics.val_dice],
+                    ["Final IoU", finalMetrics.val_iou],
+                    ["Final HD95 (mm)", finalMetrics.val_hd95],
+                    ["Final Boundary F1", finalMetrics.val_boundary_f1],
+                  ].filter(([, value]) => value != null).map(([label, value]) => (
+                    <div key={label} className="rounded bg-slate-900/70 p-3">
+                      <div className="text-slate-500 mb-1">{label}</div>
+                      <div className="text-slate-200">{typeof value === "number" ? shown(value, label.includes("epoch") ? 0 : 4) : String(value)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {config.data_split && (
               <details className="mt-3 rounded-lg border border-slate-800 bg-slate-950/55 p-3">
                 <summary className="cursor-pointer text-xs font-semibold text-cyan-200">
@@ -562,6 +587,8 @@ export default function Experiments() {
   const [showForm, setShowForm]       = useState(false);
   const [filterStatus, setFilter]     = useState("");
   const [loadError, setLoadError]     = useState("");
+  const [syncing, setSyncing]         = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -577,6 +604,22 @@ export default function Experiments() {
   }, [filterStatus]);
 
   useEffect(() => { load(); }, [load]);
+
+  const handleSync = async () => {
+    setSyncing(true);
+    setSyncMessage("");
+    try {
+      const result = await api.syncExperimentArtifacts();
+      await load();
+      setSyncMessage(
+        `Scanned ${result.discovered} saved runs: ${result.created} added, ${result.updated} refreshed, ${result.skipped_running} active runs preserved.`
+      );
+    } catch (error) {
+      setLoadError(error.message || "Could not sync saved experiment runs");
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const handleStart = async (id) => {
     try { await api.startExperiment(id); load(); }
@@ -601,6 +644,10 @@ export default function Experiments() {
           <option value="">All Status</option>
           {["pending","running","done","failed"].map(s => <option key={s} value={s}>{s}</option>)}
         </select>
+        <button className="btn-secondary flex items-center gap-2" onClick={handleSync} disabled={syncing}>
+          {syncing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+          {syncing ? "Syncing saved runs" : "Sync saved runs"}
+        </button>
         <button className="btn-primary flex items-center gap-2" onClick={() => setShowForm((v) => !v)}>
           <Plus size={15} /> New Experiment
         </button>
@@ -614,6 +661,7 @@ export default function Experiments() {
       {showForm && <CreateForm onCreated={() => { load(); setShowForm(false); }} />}
 
       {loadError && <div className="card border-rose-500/20 text-sm text-rose-200" role="alert">{loadError}</div>}
+      {syncMessage && <div className="card border-cyan-500/20 text-sm text-cyan-100" role="status">{syncMessage}</div>}
 
       {/* List */}
       {loading ? (
