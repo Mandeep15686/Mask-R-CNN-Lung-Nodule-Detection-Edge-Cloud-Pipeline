@@ -219,6 +219,8 @@ class TestFROC:
         labels = [1,   0,   0,   0,   1  ]
         result = compute_froc(probs, labels, n_scans=5)
         assert "froc_score" in result
+        assert result["protocol"] == "sampled_patch_froc_proxy_not_official_scan_level_froc"
+        assert result["sampled_patch_froc_proxy_score"] == result["froc_score"]
         assert 0.0 <= result["froc_score"] <= 1.0
         assert len(result["fps_per_scan"]) == len(result["sensitivities"])
 

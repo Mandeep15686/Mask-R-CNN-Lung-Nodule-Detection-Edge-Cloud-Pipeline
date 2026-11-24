@@ -6,7 +6,7 @@ Evaluation metrics for lung nodule segmentation.
   - Boundary F1
   - Average Surface Distance
   - Volume Error %
-  - FROC (Free-Response ROC)
+  - Sampled-patch FROC-like proxy (not scan-level candidate-matched FROC)
 """
 import numpy as np
 from scipy.ndimage import distance_transform_edt
@@ -255,8 +255,13 @@ def compute_froc(
     n_scans: int,
     thresholds: np.ndarray = None,
 ) -> dict:
-    """
-    Compute FROC (Free-Response ROC) curve.
+    """Compute a sampled-patch FROC-like proxy, not official LUNA16 FROC.
+
+    This helper treats each sampled patch as one detection and divides its
+    false positives by ``n_scans``. It does not perform candidate matching or
+    scan-level detection aggregation. The legacy key ``froc_score`` remains
+    for callers, but new reports should use the explicitly named proxy key.
+
     all_probs:  list of detection probability scores
     all_labels: list of 0/1 (1 = true nodule)
     n_scans:    total number of scans (for FP/scan normalisation)
@@ -299,6 +304,8 @@ def compute_froc(
     ).tolist()
 
     return {
+        "protocol": "sampled_patch_froc_proxy_not_official_scan_level_froc",
+        "sampled_patch_froc_proxy_score": float(np.mean(froc_sens)),
         "fps_per_scan": fps_per_scan_list,
         "sensitivities": sensitivities,
         "froc_score": float(np.mean(froc_sens)),

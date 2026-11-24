@@ -47,11 +47,11 @@ class TestCTPreprocessor:
         t = p.preprocess_bytes(sample_png_bytes)
         assert t.shape == (3, 64, 64), f"Expected (3,64,64), got {t.shape}"
 
-    def test_grey_input_replicated(self, sample_grey_bytes):
+    def test_grayscale_input_is_rejected(self, sample_grey_bytes):
         from preprocessor import CTPreprocessor
         p = CTPreprocessor(patch_size=64)
-        t = p.preprocess_bytes(sample_grey_bytes)
-        assert t.shape == (3, 64, 64)
+        with pytest.raises(ValueError, match="Expected an RGB 2.5D patch"):
+            p.preprocess_bytes(sample_grey_bytes)
 
     def test_output_range(self, sample_png_bytes):
         from preprocessor import CTPreprocessor
@@ -61,11 +61,20 @@ class TestCTPreprocessor:
         assert float(t.min()) >= 0.0
         assert float(t.max()) <= 1.0 + 1e-5
 
-    def test_resize_to_target(self, sample_png_bytes):
+    def test_wrong_dimensions_are_rejected_without_resizing(self, sample_png_bytes):
         from preprocessor import CTPreprocessor
         p = CTPreprocessor(patch_size=32)
-        t = p.preprocess_bytes(sample_png_bytes)
-        assert t.shape == (3, 32, 32)
+        with pytest.raises(ValueError, match="input is not resized"):
+            p.preprocess_bytes(sample_png_bytes)
+
+    def test_edge_preprocessing_matches_cloud_pixel_mapping(self, sample_png_bytes):
+        import torch
+        from preprocessor import CTPreprocessor
+        from backend.app.utils.preprocessing import preprocess_uploaded_image
+
+        edge = CTPreprocessor(patch_size=64).preprocess_bytes(sample_png_bytes)
+        cloud = torch.from_numpy(preprocess_uploaded_image(sample_png_bytes))
+        torch.testing.assert_close(edge, cloud)
 
     def test_numpy_input(self):
         from preprocessor import CTPreprocessor
@@ -278,6 +287,19 @@ def test_wire_compression_ratio_uses_complete_serialized_body():
         source.numel() * 4 / len(payload)
     )
     assert len(payload) > quantized.numel()  # header bytes are included
+
+
+def test_live_edge_node_disables_unvalidated_dp_and_unwired_learned_compression(monkeypatch):
+    import edge_node
+
+    monkeypatch.setattr(edge_node, "DP_EPSILON", 0.5)
+    with pytest.raises(ValueError, match="Live DP feature release is disabled"):
+        edge_node.EdgeNode()
+
+    monkeypatch.setattr(edge_node, "DP_EPSILON", 0.0)
+    monkeypatch.setattr(edge_node, "COMPRESSION", "learned")
+    with pytest.raises(ValueError, match="cloud decoder.*not implemented"):
+        edge_node.EdgeNode()
 
 
 @pytest.mark.parametrize(

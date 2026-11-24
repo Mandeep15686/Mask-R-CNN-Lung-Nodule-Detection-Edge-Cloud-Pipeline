@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Full evaluation of a trained Mask R-CNN checkpoint on the LUNA16 test set.
+Evaluation of a trained Mask R-CNN checkpoint on a selected LUNA16 subset.
 Produces:
   - Per-metric summary (Dice, IoU, HD95, Boundary F1, Sensitivity)
-  - A sampled-patch FROC proxy (not official scan-level LUNA16 FROC)
+  - Sampled-patch false-positive summaries (no candidate matching or FROC curve)
   - Per-nodule-subtype breakdown (solid / GGO / juxta-pleural)
   - Comparison table across multiple checkpoints
   - JSON + CSV reports saved to output directory
@@ -47,6 +47,57 @@ def load_checkpoint_state_dict(model, checkpoint: dict) -> None:
             "Checkpoint architecture/state keys do not match the reconstructed model. "
             f"Strict load failed: {exc}"
         ) from exc
+
+
+def evaluation_data_role_for_checkpoint(config: dict, fold: int) -> str:
+    """Classify the selected subset without calling validation an independent test."""
+    data_split = config.get("data_split") or {}
+    reserved_test_subset = config.get("test_subset")
+    if reserved_test_subset is None:
+        reserved_test_subset = data_split.get("test_subset")
+    if reserved_test_subset is not None:
+        train_subsets = set(data_split.get("train_subsets", config.get("train_subsets") or []))
+        validation_subset = data_split.get(
+            "validation_subset", config.get("validation_subset", config.get("fold"))
+        )
+        if int(reserved_test_subset) in train_subsets or (
+            validation_subset is not None
+            and int(reserved_test_subset) == int(validation_subset)
+        ):
+            raise ValueError(
+                "Checkpoint split metadata overlaps the reserved test subset with "
+                "training or validation; independent evaluation cannot be established."
+            )
+        if fold != int(reserved_test_subset):
+            raise ValueError(
+                f"Checkpoint reserves subset {reserved_test_subset} for independent "
+                f"testing; refusing evaluation on subset {fold}."
+            )
+        return "reserved_test_subset"
+    if data_split:
+        logger.warning(
+            "Checkpoint has no reserved test subset. This evaluation is not an "
+            "independent test result."
+        )
+        return "no_independent_test_subset_configured"
+    training_fold = config.get("fold")
+    if training_fold is None:
+        logger.warning(
+            "Checkpoint has no training split metadata; independence of this "
+            "evaluation subset cannot be established."
+        )
+        return "unknown_training_split"
+    if fold == int(training_fold):
+        logger.warning(
+            "Selected subset is the checkpoint's validation fold and may have "
+            "been used for model selection; it is not an independent test set."
+        )
+        return "validation_fold_used_during_training"
+    logger.warning(
+        "Selected subset was included in training because training uses all "
+        "subsets except its validation fold; this is not an independent test set."
+    )
+    return "subset_in_training_data"
 
 
 # ---------------------------------------------------------------------------
@@ -119,41 +170,7 @@ def evaluate_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = ckpt.get("config", {})
     mask_loss_cfg = config.get("mask_loss", {"alpha": 1.0})
-    data_split = config.get("data_split", {})
-    reserved_test_subset = config.get("test_subset", data_split.get("test_subset"))
-    if reserved_test_subset is not None:
-        if fold != int(reserved_test_subset):
-            raise ValueError(
-                f"Checkpoint reserves subset {reserved_test_subset} for independent "
-                f"testing; refusing evaluation on subset {fold}."
-            )
-        evaluation_data_role = "reserved_test_subset"
-    elif data_split:
-        evaluation_data_role = "no_independent_test_subset_configured"
-        logger.warning(
-            "Checkpoint has no reserved test subset. This evaluation is not an "
-            "independent test result."
-        )
-    else:
-        training_fold = config.get("fold")
-        if training_fold is None:
-            evaluation_data_role = "unknown_training_split"
-            logger.warning(
-                "Checkpoint has no training split metadata; independence of this "
-                "evaluation subset cannot be established."
-            )
-        elif fold == int(training_fold):
-            evaluation_data_role = "validation_fold_used_during_training"
-            logger.warning(
-                "Selected subset is the checkpoint's validation fold and may have "
-                "been used for model selection; it is not an independent test set."
-            )
-        else:
-            evaluation_data_role = "subset_in_training_data"
-            logger.warning(
-                "Selected subset was included in training because training uses all "
-                "subsets except its validation fold; this is not an independent test set."
-            )
+    evaluation_data_role = evaluation_data_role_for_checkpoint(config, fold)
 
     # Reconstruct architecture values from the checkpoint. Never download
     # pretrained weights during evaluation; the trained state replaces them.
@@ -300,9 +317,16 @@ def evaluate_checkpoint(
         "loss_description":     config.get("mask_loss", {}),
         "fold":                 fold,
         "evaluation_data_role": evaluation_data_role,
+        "segmentation_target": (
+            "synthetic_spherical_approximation_from_center_and_diameter"
+        ),
+        "segmentation_metric_interpretation": (
+            "Agreement with generated masks; not expert-contour accuracy"
+        ),
         "n_samples":            len(test_ds),
         "avg_inference_ms":     float(np.mean(inference_times)) if inference_times else 0.0,
-        "evaluation_protocol": "sampled_patch_metrics_no_official_froc",
+        "evaluation_protocol": "sampled_patch_metrics_no_candidate_matching_no_official_froc",
+        "official_luna16_froc_computed": False,
         **seg_metrics,
         "subtype_metrics":      subtype_summary,
     }
@@ -343,6 +367,9 @@ def compare_checkpoints(
     if results:
         flat_keys = [
             "config_id", "checkpoint", "fold", "n_samples",
+            "evaluation_data_role", "segmentation_target",
+            "segmentation_metric_interpretation", "evaluation_protocol",
+            "official_luna16_froc_computed",
             "dice", "iou", "sensitivity", "specificity",
             "hd95", "boundary_f1", "asd", "vol_err",
             "sampled_negative_patch_false_positive_rate",

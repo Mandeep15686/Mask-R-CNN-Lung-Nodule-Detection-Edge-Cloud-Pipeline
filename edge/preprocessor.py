@@ -1,12 +1,13 @@
-"""CT patch preprocessing on the edge device."""
+"""Preprocess exported 2.5D RGB patches on the edge device.
+
+PNG/JPEG data is already windowed and quantized for model input. It is not
+raw DICOM data and cannot be reconstructed into Hounsfield units here.
+"""
 import io
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
-
-HU_MIN, HU_MAX = -1000, 400
-
 
 class CTPreprocessor:
     def __init__(self, patch_size: int = 64):
@@ -14,24 +15,27 @@ class CTPreprocessor:
 
     def preprocess_bytes(self, image_bytes: bytes, fmt: str = "png") -> torch.Tensor:
         """
-        Convert raw CT patch bytes → (3, H, W) float32 tensor in [0,1].
-        Input can be PNG/JPEG grey CT or 3-channel 2.5D patch.
+        Decode a model-ready RGB 2.5D patch as (3, H, W) in [0,1].
+
+        Grayscale PNGs and resized images are rejected: repeating or resizing
+        channels would silently create a different model input distribution.
+        PNG/JPEG pixel values are not interpreted as Hounsfield units.
         """
         img = Image.open(io.BytesIO(image_bytes))
-        if img.mode == "L":
-            # Single-channel grey → replicate to 3 channels (2.5D approximation)
-            arr = np.array(img, dtype=np.float32)
-            arr = np.clip(arr, 0, 255) / 255.0
-            arr3 = np.stack([arr, arr, arr], axis=0)   # (3, H, W)
-        else:
-            img = img.convert("RGB")
-            arr = np.array(img, dtype=np.float32) / 255.0
-            arr3 = arr.transpose(2, 0, 1)             # (3, H, W)
-
-        t = torch.tensor(arr3)
-        if t.shape[-2:] != (self.patch_size, self.patch_size):
-            t = TF.resize(t, [self.patch_size, self.patch_size])
-        return t
+        if img.format not in {"PNG", "JPEG"}:
+            raise ValueError(f"Unsupported image format {img.format!r}; use PNG or JPEG")
+        if img.mode != "RGB":
+            raise ValueError(
+                f"Expected an RGB 2.5D patch (three adjacent slices), got mode {img.mode!r}"
+            )
+        if img.size != (self.patch_size, self.patch_size):
+            raise ValueError(
+                f"Expected {self.patch_size}x{self.patch_size} RGB patch, got "
+                f"{img.width}x{img.height}; input is not resized"
+            )
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        arr3 = np.ascontiguousarray(arr.transpose(2, 0, 1), dtype=np.float32)
+        return torch.from_numpy(arr3)
 
     def preprocess_numpy(self, patch_np: np.ndarray) -> torch.Tensor:
         """

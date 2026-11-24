@@ -538,11 +538,11 @@ The `cn1_split_analysis.py` script uses modeled LAN/Wi-Fi/4G/5G bandwidth and RT
 
 | CN objective | Current code/evaluation state |
 | --- | --- |
-| Split-point optimization | Profiling/simulation scripts and measurement endpoints exist; the extractor/cloud feature-map mismatch blocks successful cloud split inference. No best split has been established. |
-| Feature compression | Local compressor supports `none`, `int8`, and an optional learned bottleneck; the current edge wire encoding serializes float32 values, so INT8 wire savings are not established. |
-| Federated learning | Flower simulation and client/server modes exist; this does not demonstrate training across real hospitals. |
-| Adaptive scheduling | A network heuristic exists, but automatic selection is not wired into the scan inference workflow. |
-| Differential privacy | A standalone experimental script exists; it is not a live mechanism or a validated end-to-end privacy guarantee. |
+| Split-point optimization | The edge/cloud software path transfers cumulative backbone levels, verifies checkpoint identity and normalization, then runs remaining backbone stages, FPN, RPN, and RoI heads. This does not establish an optimal split on real hospital networks. |
+| Feature compression | `none` and `int8` are supported by the live wire protocol; INT8 is sent as one-byte values plus quantization metadata. Ratios compare float32 tensor bytes with the complete serialized body and include header overhead. Learned compression is disabled in live edge/cloud inference because decoder integration is absent. |
+| Federated learning | Flower simulation/client/server code exists. The ten-subset script is labeled single-machine simulation evidence, not deployment across real hospitals. |
+| Adaptive scheduling | The edge probes before extraction and chooses local inference below the configured bandwidth/latency thresholds; failed cloud inference also falls back locally. Remote event logging is best-effort and cannot be guaranteed while the backend is unreachable. |
+| Differential privacy | Offline experimental analysis only. Live edge feature releases reject `DP_EPSILON > 0` until sensitivity, composition accounting, and the deployed mechanism are independently validated. |
 
 ## Other research scripts
 
@@ -600,7 +600,7 @@ There is no separate frontend test script configured in `frontend/package.json` 
 | `SPLIT_LAYER` | Edge node | `layer2` |
 | `COMPRESSION` | Edge node | `int8` |
 | `HEARTBEAT_SEC` | Edge node | `30` seconds |
-| `LEARNED_COMPRESSOR_CHECKPOINT` | Edge learned compressor | Optional checkpoint path; learned compression needs a trained compatible checkpoint |
+| `LEARNED_COMPRESSOR_CHECKPOINT` | Experimental compressor module | A checkpoint alone does not enable live learned compression; cloud decoder integration and compatible training are not implemented |
 Docker Compose defaults `APP_ENV` to `production`; set it explicitly to `development` only for a local setup that intentionally has no edge token. The edge extractor loads the checkpoint at `EDGE_MODEL_PATH`, and split inference verifies its SHA-256 against the backend checkpoint and checks that edge/cloud input normalization matches. Keep `EDGE_MODEL_PATH` and `MODEL_PATH` pointed at the same file. Docker Compose reads the root `.env`; a manually launched Python process does not automatically read `.env` in this code. Export/set the needed variables in the shell before launching a local process.
 
 The FastAPI app creates its tables at startup. An initial Alembic migration is also checked in under `backend/alembic/versions/`; set `DATABASE_URL` before invoking Alembic for a deployment migration workflow.
@@ -617,13 +617,14 @@ The backend database contains `experiments`, `training_runs`, `inference_results
 - **Limited split:** development data may contain only `subset0` and `subset1`. With one used for training and one for validation, there is no independent test set. Do not describe validation as test performance.
 - **Patch sampling:** training and evaluation are patch-based. Negative examples are sampled patches, not a verified clinical negative cohort. Current false-positive fields are explicitly patch-level proxies.
 - **Negative background approximation:** the raw loader searches crop-safe non-air voxels and excludes physical neighborhoods around annotations; this intensity-based sampling is not a lung segmentation mask. Cache generation prefers labeled class-0 candidate locations when available, but it does not turn patch labels into expert contours.
-- **FROC:** the evaluation script does not perform official scan-level candidate matching; its FROC-like summary is a sampled-patch proxy.
+- **FROC:** the evaluation script does not compute official scan-level candidate-matched FROC. The standalone helper is explicitly a sampled-patch FROC-like proxy.
 - **Spacing and preprocessing:** new cache generation resamples scans to the configured target spacing (default 1 mm isotropic). Older caches may have different preprocessing/spacing metadata. Do not combine inconsistent caches in a comparison.
-- **Edge/cloud feature contract:** the edge feature extractor and backend continuation currently expect incompatible feature maps. The feature endpoint validates/authenticates input but returns HTTP `501` for the current extractor payload; that request does not produce a cloud prediction.
-- **Compression claims:** some feature serialization transmits float32 values even when the local compressor reports int8. The UI labels ratios as unverified. Do not claim wire-level savings until transmitted-byte measurement confirms them.
-- **Scheduling:** network-based scheduling logic is not integrated into automatic inference-path selection.
+- **Edge/cloud feature contract:** split inference requires matching checkpoint fingerprints, cumulative feature keys, and matching normalization metadata. The software continuation is covered by tests; this does not replace deployment testing across device/runtime combinations.
+- **Compression claims:** INT8 wire bytes and the complete request-body size are measured. This establishes payload byte savings only; it does not establish end-to-end latency, energy, or detection-utility benefits.
+- **Edge image input:** uploaded PNG/JPEG files must already be model-ready 64×64 RGB 2.5D patches. Their 8-bit pixels are mapped to [0,1]; the edge service does not reconstruct Hounsfield units or decode raw DICOM.
+- **Scheduling:** bandwidth/RTT-based routing is integrated into the edge scan path. Fallback event logging is best-effort and can be lost when the backend is offline.
 - **Federated learning:** Flower code supports simulation/client/server workflows; local LUNA16 partitions do not represent ten real hospitals or establish multi-institution deployment.
-- **Differential privacy:** the DP script is a standalone experimental analysis, not a live privacy guarantee for the web/edge pipeline. Formal claims require validated sensitivity, privacy accounting, and the deployed mechanism.
+- **Differential privacy:** live edge DP feature transmission is disabled. The offline noise/accountant implementation is experimental and must not be described as an end-to-end (ε, δ)-DP guarantee.
 - **System telemetry:** CPU/RAM and CUDA memory are returned only when the host dependencies/runtime expose them. GPU utilization and temperature may be unavailable; the dashboard does not fabricate values.
 - **Clinical use:** no clinical validation, regulatory clearance, radiologist workflow, or diagnostic guarantee is provided.
 

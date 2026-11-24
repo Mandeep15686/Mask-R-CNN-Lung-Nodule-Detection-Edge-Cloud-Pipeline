@@ -5,9 +5,9 @@ Runs on the hospital edge device (e.g. NVIDIA Jetson / PACS workstation).
 
 Responsibilities:
   1. Accept CT scan patches (from scanner / DICOM PACS)
-  2. HU windowing + normalisation (preprocessor)
+  2. Decode a model-ready windowed RGB patch (not raw HU/DICOM reconstruction)
   3. Early-layer feature extraction (layer1 + layer2 of ResNet-50)
-  4. Feature compression (INT8 quantisation or learned bottleneck)
+  4. Feature compression (none or INT8; learned codec is not wired into live inference)
   5. Transmit compressed features to cloud API
   6. Receive + cache nodule detection results
   7. Heartbeat + network monitoring
@@ -47,7 +47,7 @@ HOSTNAME        = os.getenv("HOSTNAME",         "edge-01.hospital.local")
 NODE_IP         = os.getenv("NODE_IP",          "192.168.1.10")
 EDGE_API_TOKEN  = os.getenv("EDGE_API_TOKEN",    "")
 SPLIT_LAYER     = os.getenv("SPLIT_LAYER",      "layer2")       # layer1 | layer2 | layer3
-COMPRESSION     = os.getenv("COMPRESSION",      "int8")         # none | int8 | learned
+COMPRESSION     = os.getenv("COMPRESSION",      "int8")         # live: none | int8
 PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",   "1"))
 HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC","30"))
@@ -232,8 +232,19 @@ class EdgeNode:
     """Main edge node controller."""
 
     def __init__(self):
-        if COMPRESSION == "learned" and SPLIT_LAYER != "layer2":
-            raise ValueError("Learned compression checkpoint currently supports only layer2 features")
+        if DP_EPSILON > 0.0:
+            raise ValueError(
+                "Live DP feature release is disabled: the experimental clipping/noise "
+                "and accountant have not been validated as an end-to-end "
+                "(epsilon, delta)-DP mechanism. Use scripts/cn5_differential_privacy.py "
+                "for offline research only."
+            )
+        if COMPRESSION == "learned":
+            raise ValueError(
+                "Learned compression is not supported by the live edge/cloud protocol: "
+                "the cloud decoder and rate-distortion-trained checkpoint integration "
+                "are not implemented. Use none or int8."
+            )
         self.preprocessor  = CTPreprocessor(patch_size=PATCH_SIZE)
         self.extractor     = EdgeFeatureExtractor(
             split_layer=SPLIT_LAYER,
@@ -394,10 +405,15 @@ class EdgeNode:
 
         try:
             result = await self._send_features(payload_bytes, scan_uid)
+            result.setdefault("adaptive_decision", "cloud")
         except Exception as exc:
             logger.warning("[%s] Cloud feature inference failed; using local fallback: %s", scan_uid, exc)
             result = await self.predict_local(image_bytes, scan_uid)
             result["fallback_reason"] = str(exc)
+            result["adaptive_decision"] = "local_fallback_cloud_error"
+
+        result["probe_bandwidth_mbps"] = bw_mbps
+        result["probe_latency_ms"] = latency_ms
 
         total_ms = (time.perf_counter() - t_start) * 1000
 
@@ -409,7 +425,11 @@ class EdgeNode:
             "payload_size_kb": payload_kb,
             "inference_time_ms": result.get("cloud_inference_ms", 0),
             "split_layer": SPLIT_LAYER,
-            "compression_method": COMPRESSION,
+            "compression_method": (
+                "local_fallback_cloud_error"
+                if result.get("adaptive_decision") == "local_fallback_cloud_error"
+                else COMPRESSION
+            ),
             "compression_ratio": compression_ratio,
         })
 

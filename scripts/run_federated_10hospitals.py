@@ -136,9 +136,11 @@ def main():
     )
     logger.info("Results written to: %s", args.out)
 
-    # Write a deployment-evidence record so the status panel can confirm
-    # that a 10-hospital run has actually been executed.
+    # Write an explicitly labeled simulation record. This is not evidence of
+    # deployment across independent hospitals.
     evidence = {
+        "evidence_type": "single-machine_federated_simulation",
+        "real_hospital_deployment": False,
         "num_hospitals": NUM_HOSPITALS,
         "subsets_used": [f"subset{i}" for i in range(NUM_HOSPITALS)],
         "num_rounds": args.rounds,
@@ -148,7 +150,7 @@ def main():
         "history_path": str(Path(args.out) / "fl_history.json"),
         "summary_path": str(Path(args.out) / "fl_summary.json"),
     }
-    evidence_path = Path(args.out) / "10hospital_deployment_evidence.json"
+    evidence_path = Path(args.out) / "10hospital_simulation_evidence.json"
     os.makedirs(args.out, exist_ok=True)
     with open(evidence_path, "w") as fh:
         json.dump(evidence, fh, indent=2)
