@@ -121,7 +121,12 @@ class NetworkLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     node_id = Column(String(64), index=True)
     timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # latency_ms is retained for API compatibility and means network probe RTT.
+    # Older rows may have mixed timing semantics and are left unversioned.
     latency_ms = Column(Float)
+    edge_processing_ms = Column(Float, nullable=True)
+    total_pipeline_ms = Column(Float, nullable=True)
+    timing_schema_version = Column(Integer, nullable=True, default=2)
     bandwidth_mbps = Column(Float)
     payload_size_kb = Column(Float)
     inference_time_ms = Column(Float)
@@ -143,6 +148,18 @@ def create_tables():
         if "val_total_loss" not in columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE training_runs ADD COLUMN val_total_loss FLOAT"))
+        network_columns = {
+            column["name"] for column in inspect(engine).get_columns("network_logs")
+        }
+        with engine.begin() as connection:
+            if "edge_processing_ms" not in network_columns:
+                connection.execute(text("ALTER TABLE network_logs ADD COLUMN edge_processing_ms FLOAT"))
+            if "total_pipeline_ms" not in network_columns:
+                connection.execute(text("ALTER TABLE network_logs ADD COLUMN total_pipeline_ms FLOAT"))
+            if "timing_schema_version" not in network_columns:
+                # Existing records remain NULL because their latency semantics
+                # cannot be recovered reliably from the stored data.
+                connection.execute(text("ALTER TABLE network_logs ADD COLUMN timing_schema_version INTEGER"))
 
 
 def get_db() -> Generator[Session, None, None]:

@@ -89,8 +89,8 @@ def plot_learning_curves(
         axes[2].plot(epochs, _safe(val_hd95),   color=color, label=label)
 
     axes[0].set(title="Train Loss",           xlabel="Epoch", ylabel="Loss")
-    axes[1].set(title="Validation Dice ↑",    xlabel="Epoch", ylabel="Dice Score")
-    axes[2].set(title="Validation HD95 ↓ (vox)", xlabel="Epoch", ylabel="95% Hausdorff Dist.")
+    axes[1].set(title="Validation Dice vs generated masks ↑", xlabel="Epoch", ylabel="Pseudo-mask agreement Dice")
+    axes[2].set(title="Validation HD95 vs generated masks ↓ (vox)", xlabel="Epoch", ylabel="95% Hausdorff Dist.")
 
     for ax in axes:
         ax.legend(fontsize=8)
@@ -150,8 +150,8 @@ def plot_pareto_frontier(
             )
 
     ax.set(
-        title="Pareto Frontier: Dice ↑ vs HD95 ↓",
-        xlabel="Best Validation Dice ↑",
+        title="Pareto Frontier: Pseudo-mask Dice ↑ vs HD95 ↓",
+        xlabel="Best pseudo-mask agreement Dice ↑",
         ylabel="Best Validation HD95 ↓ (vox)",
     )
     ax.legend()

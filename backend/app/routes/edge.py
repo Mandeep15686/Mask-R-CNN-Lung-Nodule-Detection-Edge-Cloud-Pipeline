@@ -4,6 +4,7 @@ import json
 import time
 import logging
 import os
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -27,6 +28,30 @@ _BACKBONE_PREFIXES = {
     "layer3": {"layer1", "layer2", "layer3"},
 }
 _DEVELOPMENT_ENVS = {"dev", "development", "test", "testing"}
+
+
+@lru_cache(maxsize=4)
+def _load_learned_decoder(
+    checkpoint_path: str,
+    codec_sha256: str,
+    backbone_sha256: str,
+):
+    """Cache a decoder by content hash and its bound backbone checkpoint."""
+    import torch
+    from edge.compressor import FeatureCompressor, _sha256_file
+
+    if _sha256_file(checkpoint_path) != codec_sha256:
+        raise ValueError("Learned codec file changed while loading")
+
+    decoder = FeatureCompressor(
+        method="learned",
+        device=torch.device("cpu"),
+        expected_backbone_sha256=backbone_sha256,
+        checkpoint_path=checkpoint_path,
+    )
+    if decoder.codec_sha256 != codec_sha256:
+        raise ValueError("Loaded learned codec does not match the payload fingerprint")
+    return decoder
 
 
 def _validate_edge_token(supplied_token: str, *, expected_token: str | None = None,
@@ -251,6 +276,49 @@ async def infer_from_features(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid feature payload: {e}")
 
+    compression_method = feature_data.get("compression_method", "none")
+    if compression_method == "learned":
+        codec_path = os.getenv("LEARNED_COMPRESSOR_CHECKPOINT", "").strip()
+        if not codec_path or not os.path.isfile(codec_path):
+            raise HTTPException(
+                status_code=503,
+                detail="Learned feature decoder is not configured on the cloud",
+            )
+        if not feature_data.get("checkpoint_sha256"):
+            raise HTTPException(status_code=400, detail="Learned payload is missing backbone fingerprint")
+        codec_sha256 = feature_data.get("codec_sha256")
+        if not codec_sha256:
+            raise HTTPException(status_code=400, detail="Learned payload is missing codec fingerprint")
+        try:
+            from edge.compressor import _sha256_file
+
+            cloud_codec_sha256 = _sha256_file(codec_path)
+            if codec_sha256 != cloud_codec_sha256:
+                raise HTTPException(status_code=503, detail="Edge/cloud learned codec checkpoints differ")
+            decoder = _load_learned_decoder(
+                os.path.abspath(codec_path), cloud_codec_sha256,
+                str(feature_data["checkpoint_sha256"]),
+            )
+            expected_layers = _BACKBONE_PREFIXES.get(split_layer)
+            if expected_layers is None or set(features) != expected_layers:
+                raise HTTPException(status_code=400, detail="Learned feature levels do not match split_layer")
+            expanded_bytes = 0
+            for name, latent in features.items():
+                expected_latent_channels = decoder._autoencoder.LATENT_CHANNELS[name]
+                if latent.ndim != 4 or latent.shape[0] != 1 or latent.shape[1] != expected_latent_channels:
+                    raise HTTPException(status_code=400, detail=f"Invalid learned latent shape for {name}")
+                expanded_bytes += latent.shape[0] * decoder._autoencoder.CHANNELS[name] * latent.shape[2] * latent.shape[3] * 4
+            if expanded_bytes > 64 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Decoded learned features exceed 64 MiB")
+            features = decoder.decompress(features)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Could not decode learned edge features")
+            raise HTTPException(status_code=400, detail=f"Invalid learned feature payload: {exc}") from exc
+    elif compression_method not in {"none", "int8"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported compression method: {compression_method}")
+
     engine = request.app.state.inference_engine
     # BUG-FIX: previously a strict equality check against FPN output keys
     # {"0","1","2","3","pool"} raised HTTP 501 for every real edge request,
@@ -294,16 +362,21 @@ async def infer_from_features(
 
     inference_ms = (time.perf_counter() - t0) * 1000
 
-    # Log network event
+    # Store each successful edge/cloud scan once with distinct component timings.
+    # latency_ms is the edge's measured health-probe RTT, never edge compute time.
     log = NetworkLog(
         node_id=node_id,
-        latency_ms=feature_data.get("edge_processing_ms", 0),
+        latency_ms=feature_data.get("probe_latency_ms"),
+        edge_processing_ms=feature_data.get("edge_processing_ms"),
         bandwidth_mbps=feature_data.get("bandwidth_mbps", 0),
         payload_size_kb=payload_kb,
         inference_time_ms=inference_ms,
         split_layer=split_layer,
         compression_method=feature_data.get("compression_method", "none"),
         compression_ratio=feature_data.get("compression_ratio", 1.0),
+        timing_schema_version=(
+            2 if feature_data.get("probe_latency_ms") is not None else None
+        ),
     )
     db.add(log)
     db.commit()
@@ -349,23 +422,29 @@ async def network_stats(db: Session = Depends(get_db)):
             NetworkLog.split_layer,
             NetworkLog.compression_method,
             func.avg(NetworkLog.latency_ms).label("avg_latency"),
+            func.avg(NetworkLog.edge_processing_ms).label("avg_edge_processing"),
             func.avg(NetworkLog.bandwidth_mbps).label("avg_bw"),
             func.avg(NetworkLog.payload_size_kb).label("avg_payload_kb"),
             func.avg(NetworkLog.inference_time_ms).label("avg_inference_ms"),
+            func.avg(NetworkLog.total_pipeline_ms).label("avg_total_pipeline_ms"),
             func.avg(NetworkLog.compression_ratio).label("avg_compression"),
             func.count(NetworkLog.id).label("n_requests"),
         )
         .group_by(NetworkLog.split_layer, NetworkLog.compression_method)
+        .filter(NetworkLog.timing_schema_version == 2)
         .all()
     )
     return [
         {
             "split_layer": r.split_layer,
             "compression_method": r.compression_method,
-            "avg_latency_ms": round(r.avg_latency or 0, 2),
+            "avg_latency_ms": round(r.avg_latency, 2) if r.avg_latency is not None else None,
+            "avg_network_rtt_ms": round(r.avg_latency, 2) if r.avg_latency is not None else None,
+            "avg_edge_processing_ms": round(r.avg_edge_processing, 2) if r.avg_edge_processing is not None else None,
             "avg_bandwidth_mbps": round(r.avg_bw or 0, 2),
             "avg_payload_kb": round(r.avg_payload_kb or 0, 2),
-            "avg_inference_ms": round(r.avg_inference_ms or 0, 2),
+            "avg_inference_ms": round(r.avg_inference_ms, 2) if r.avg_inference_ms is not None else None,
+            "avg_total_pipeline_ms": round(r.avg_total_pipeline_ms, 2) if r.avg_total_pipeline_ms is not None else None,
             "avg_compression_ratio": round(r.avg_compression or 1, 3),
             "n_requests": r.n_requests,
         }
@@ -376,24 +455,31 @@ async def network_stats(db: Session = Depends(get_db)):
 @router.get("/split-latency-analysis")
 async def split_latency_analysis(db: Session = Depends(get_db)):
     """
-    CN Research: Compare total latency across split points.
-    Returns data for the split-point optimisation plot.
+    Return versioned timing components grouped by split point. Total pipeline
+    time is nullable when the edge did not report a complete measurement.
     """
     from sqlalchemy import func
     rows = (
         db.query(
             NetworkLog.split_layer,
-            func.avg(NetworkLog.latency_ms + NetworkLog.inference_time_ms).label("total_latency"),
+            func.avg(NetworkLog.total_pipeline_ms).label("total_latency"),
+            func.avg(NetworkLog.latency_ms).label("network_rtt"),
+            func.avg(NetworkLog.edge_processing_ms).label("edge_processing"),
+            func.avg(NetworkLog.inference_time_ms).label("cloud_inference"),
             func.avg(NetworkLog.payload_size_kb).label("payload_kb"),
             func.count(NetworkLog.id).label("n"),
         )
         .group_by(NetworkLog.split_layer)
+        .filter(NetworkLog.timing_schema_version == 2)
         .all()
     )
     return [
         {
             "split_layer": r.split_layer,
-            "avg_total_latency_ms": round(r.total_latency or 0, 2),
+            "avg_total_latency_ms": round(r.total_latency, 2) if r.total_latency is not None else None,
+            "avg_network_rtt_ms": round(r.network_rtt, 2) if r.network_rtt is not None else None,
+            "avg_edge_processing_ms": round(r.edge_processing, 2) if r.edge_processing is not None else None,
+            "avg_cloud_inference_ms": round(r.cloud_inference, 2) if r.cloud_inference is not None else None,
             "avg_payload_kb": round(r.payload_kb or 0, 2),
             "n_samples": r.n,
         }

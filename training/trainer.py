@@ -26,6 +26,14 @@ from .mgda import MGDASolver, LambdaHistory, mgda_capture_context, solve_mgda
 
 logger = logging.getLogger(__name__)
 
+SEGMENTATION_PROVENANCE = {
+    "segmentation_target": "synthetic_spherical_approximation_from_center_and_diameter",
+    "segmentation_metric_interpretation": (
+        "Agreement with generated pseudo-masks on sampled patches; not expert-contour accuracy"
+    ),
+    "segmentation_metric_scope": "sampled_patch_validation",
+}
+
 
 def _fmt_metric(value, fmt: str = ".4f") -> str:
     """Format a metric safely, showing unavailable values as N/A."""
@@ -104,6 +112,9 @@ class Trainer:
 
     def __init__(self, config: dict, run_dir: str):
         self.config = config
+        # Persist target provenance alongside every new run so standalone artifacts
+        # cannot be mistaken for evaluation against expert-drawn contours.
+        self.config.update(SEGMENTATION_PROVENANCE)
         self.seed = config.get("seed")
         if self.seed is not None:
             seed_everything(int(self.seed))
@@ -597,7 +608,10 @@ class Trainer:
                         "metrics": epoch_log,
                         "config": self.config,
                     }, best_ckpt)
-                    logger.info(f"  ✓ New best Dice: {val_dice:.4f} → saved checkpoint")
+                    logger.info(
+                        "  ✓ New best pseudo-mask agreement Dice: %.4f → saved checkpoint",
+                        val_dice,
+                    )
 
             # Save latest
             torch.save({
@@ -619,7 +633,7 @@ class Trainer:
             logger.info(
                 f"Epoch {epoch}/{self.epochs} | "
                 f"train_loss={train_metrics.get('total_loss', 0):.4f} | "
-                f"val_dice={_fmt_metric(val_metrics.get('val_dice'))} | "
+                f"val_dice_vs_pseudo_mask={_fmt_metric(val_metrics.get('val_dice'))} | "
                 f"sampled_neg_patch_fp_rate={_fmt_metric(val_metrics.get('val_sampled_negative_patch_false_positive_rate'))} | "
                 f"sampled_patch_fp_per_scan_proxy={_fmt_metric(val_metrics.get('val_sampled_patch_false_detections_per_scan_proxy'))} | "
                 f"val_hd95={_fmt_metric(val_metrics.get('val_hd95'), '.2f')} | "
@@ -665,6 +679,7 @@ class Trainer:
 
         # Final summary
         summary = {
+            **SEGMENTATION_PROVENANCE,
             "config_id": self.config.get("config_id", "unknown"),
             "training_strategy": self.training_strategy,
             "use_mgda": bool(self.config.get("use_mgda", self.training_strategy == "mgda")),
@@ -727,7 +742,7 @@ class Trainer:
             json.dump(summary, f, indent=2, allow_nan=False)
 
         logger.info(
-            f"Training complete. Best Dice: {_fmt_metric(self.best_dice)} "
+            f"Training complete. Best pseudo-mask agreement Dice: {_fmt_metric(self.best_dice)} "
             f"at epoch {self.best_epoch}"
         )
         return summary

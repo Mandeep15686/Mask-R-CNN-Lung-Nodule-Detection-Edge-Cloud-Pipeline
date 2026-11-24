@@ -217,19 +217,15 @@ class TestDifferentialPrivacy:
         # With ε=1.0, noise should be non-zero
         assert not (noised["layer2"] == 0).all()
 
-    def test_no_noise_at_inf_epsilon(self):
-        """σ(ε=∞) = 0 → features unchanged."""
+    def test_epsilon_above_calibrated_range_is_rejected(self):
         from scripts.cn5_differential_privacy import add_gaussian_dp_noise
         try:
             import torch
         except ImportError:
             pytest.skip("torch not installed")
         features = {"layer2": torch.ones(1, 64, 8, 8) * 5.0}
-        # Mimic ε=∞ by passing extremely large value
-        noised = add_gaussian_dp_noise(features, epsilon=1e9)
-        # std should be ~1e-9, effectively zero
-        diff = (noised["layer2"] - features["layer2"]).abs().max().item()
-        assert diff < 1e-3
+        with pytest.raises(ValueError, match="epsilon must be in"):
+            add_gaussian_dp_noise(features, epsilon=1e9)
 
     def test_larger_epsilon_less_noise(self):
         """Higher ε (weaker privacy) → lower σ → less noise."""
@@ -243,7 +239,7 @@ class TestDifferentialPrivacy:
         features1 = {"layer2": base.clone()}
         features2 = {"layer2": base.clone()}
         noised_low  = add_gaussian_dp_noise(features1, epsilon=0.1)   # strong privacy
-        noised_high = add_gaussian_dp_noise(features2, epsilon=10.0)  # weak privacy
+        noised_high = add_gaussian_dp_noise(features2, epsilon=1.0)  # weaker privacy
         std_low  = noised_low["layer2"].std().item()
         std_high = noised_high["layer2"].std().item()
         assert std_low > std_high
@@ -289,17 +285,56 @@ def test_wire_compression_ratio_uses_complete_serialized_body():
     assert len(payload) > quantized.numel()  # header bytes are included
 
 
-def test_live_edge_node_disables_unvalidated_dp_and_unwired_learned_compression(monkeypatch):
+def test_live_dp_uses_budgeted_release_and_learned_codec_fails_closed_without_weights(monkeypatch):
     import edge_node
+    from edge.dp import BasicCompositionAccountant
+    from compressor import FeatureCompressor
+    import torch
 
-    monkeypatch.setattr(edge_node, "DP_EPSILON", 0.5)
-    with pytest.raises(ValueError, match="Live DP feature release is disabled"):
-        edge_node.EdgeNode()
+    monkeypatch.setattr(edge_node, "_dp_accountant", BasicCompositionAccountant(0.5, 1e-5))
+    released, report = edge_node._add_dp_noise(
+        {"layer1": torch.ones(1, 4, 2, 2)}, epsilon=0.5, delta=1e-5
+    )
+    assert released["layer1"].shape == (1, 4, 2, 2)
+    assert report["epsilon_spent"] == pytest.approx(0.5)
+    assert report["delta_spent"] == pytest.approx(1e-5)
 
-    monkeypatch.setattr(edge_node, "DP_EPSILON", 0.0)
-    monkeypatch.setattr(edge_node, "COMPRESSION", "learned")
-    with pytest.raises(ValueError, match="cloud decoder.*not implemented"):
-        edge_node.EdgeNode()
+    monkeypatch.delenv("LEARNED_COMPRESSOR_CHECKPOINT", raising=False)
+    with pytest.raises(ValueError, match="trained codec checkpoint"):
+        FeatureCompressor(method="learned")
+
+
+def test_learned_codec_round_trip_has_matching_feature_shapes(tmp_path, monkeypatch):
+    import torch
+    from compressor import FeatureCompressor, _LearnedCodecBank
+
+    backbone_hash = "backbone-test-hash"
+    codec = _LearnedCodecBank()
+    path = tmp_path / "codec.pth"
+    torch.save({
+        "metadata": {
+            "format": "learned_feature_codec_v1",
+            "backbone_checkpoint_sha256": backbone_hash,
+        },
+        "codec_state": codec.state_dict(),
+    }, path)
+    monkeypatch.setenv("LEARNED_COMPRESSOR_CHECKPOINT", str(path))
+    compressor = FeatureCompressor(
+        method="learned",
+        expected_backbone_sha256=backbone_hash,
+    )
+    source = {
+        "layer1": torch.randn(1, 256, 4, 4),
+        "layer2": torch.randn(1, 512, 2, 2),
+    }
+    compressed = compressor.compress(source)
+    restored = compressor.decompress(compressed)
+    assert compressed["layer1"].shape == (1, 32, 4, 4)
+    assert compressed["layer2"].shape == (1, 64, 2, 2)
+    assert restored["layer1"].shape == source["layer1"].shape
+    assert restored["layer2"].shape == source["layer2"].shape
+    with pytest.raises(ValueError, match="different backbone"):
+        FeatureCompressor(method="learned", expected_backbone_sha256="other")
 
 
 @pytest.mark.parametrize(

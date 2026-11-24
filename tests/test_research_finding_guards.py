@@ -102,3 +102,6 @@ def test_edge_cloud_failure_records_fallback_decision_and_probe(monkeypatch):
     assert result["fallback_reason"] == "cloud unavailable"
     assert events[0]["compression_method"] == "local_fallback_cloud_error"
     assert events[0]["payload_size_kb"] > 0
+    assert events[0]["latency_ms"] == 45.0  # network probe RTT
+    assert events[0]["edge_processing_ms"] >= 0.0
+    assert events[0]["timing_schema_version"] == 2

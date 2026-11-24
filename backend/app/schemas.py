@@ -199,7 +199,10 @@ class EdgeNodeResponse(BaseModel):
 
 class NetworkLogCreate(BaseModel):
     node_id: str
-    latency_ms: float
+    latency_ms: float = Field(description="Network probe RTT in milliseconds")
+    edge_processing_ms: Optional[float] = None
+    total_pipeline_ms: Optional[float] = None
+    timing_schema_version: int = 2
     bandwidth_mbps: float
     payload_size_kb: float
     inference_time_ms: float
@@ -212,7 +215,10 @@ class NetworkLogResponse(BaseModel):
     id: int
     node_id: str
     timestamp: datetime
-    latency_ms: float
+    latency_ms: Optional[float] = None
+    edge_processing_ms: Optional[float] = None
+    total_pipeline_ms: Optional[float] = None
+    timing_schema_version: Optional[int] = None
     bandwidth_mbps: float
     payload_size_kb: float
     inference_time_ms: float

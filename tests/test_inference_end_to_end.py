@@ -139,6 +139,40 @@ def test_experiment_checkpoint_selection_is_exact_and_cached(tmp_path):
         engine.checkpoint_for_experiment("missing-exp")
 
 
+def test_checkpoint_overwrite_at_same_path_invalidates_loaded_model(tmp_path):
+    checkpoint = tmp_path / "best_model.pth"
+    _fake_checkpoint(checkpoint, config_id="model-v1")
+    engine = InferenceEngine(
+        default_checkpoint_path=checkpoint,
+        model_factory=_model_factory,
+        device="cpu",
+    )
+    previous = engine._load_checkpoint(checkpoint)
+    previous_signature = previous.file_signature
+    previous_hash = previous.sha256
+    previous_size = checkpoint.stat().st_size
+
+    replacement = _EmptyDetectionModel()
+    with torch.no_grad():
+        replacement.weight.fill_(2.0)
+    _fake_checkpoint(
+        checkpoint,
+        config_id="model-v2",
+        model_state=replacement.state_dict(),
+    )
+    assert checkpoint.stat().st_size == previous_size
+
+    refreshed = engine._load_checkpoint(checkpoint)
+
+    assert refreshed is not previous
+    assert refreshed.file_signature != previous_signature
+    assert refreshed.sha256 != previous_hash
+    assert refreshed.config_id == "model-v2"
+    assert refreshed.model.weight.item() == pytest.approx(2.0)
+    assert engine.model is refreshed.model
+    assert engine.status["config_id"] == "model-v2"
+
+
 def test_preprocessing_preserves_three_rgb_channels_without_enhancement():
     rgb = np.zeros((64, 64, 3), dtype=np.uint8)
     rgb[:, :, 0] = 32

@@ -71,6 +71,34 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_file_signature(path: Path) -> tuple[int, int, int, int, int, str]:
+    """Return metadata plus a bounded content fingerprint for cache checks.
+
+    Windows filesystems can report identical timestamps for rapid same-path
+    rewrites. Sampling fixed windows across the file catches those rewrites
+    without hashing hundreds of megabytes on every inference request.
+    """
+    stat = path.stat()
+    sample_size = min(64 * 1024, stat.st_size)
+    offsets = sorted({
+        max(0, min(stat.st_size - sample_size, int((stat.st_size - sample_size) * fraction)))
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
+    })
+    digest = hashlib.blake2s()
+    with path.open("rb") as checkpoint_file:
+        for offset in offsets:
+            checkpoint_file.seek(offset)
+            digest.update(checkpoint_file.read(sample_size))
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+        digest.hexdigest(),
+    )
+
+
 class InferenceUnavailableError(RuntimeError):
     """Raised when a trained checkpoint cannot provide predictions."""
 
@@ -102,6 +130,7 @@ class LoadedCheckpoint:
     metrics: dict
     spacing_mm: tuple[float, float, float]
     sha256: str
+    file_signature: tuple[int, int, int, int, int, str]
     inference_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -217,11 +246,25 @@ class InferenceEngine:
         path = Path(checkpoint_path).expanduser().resolve()
         key = str(path)
         with self._models_lock:
-            loaded = self._models.get(key)
-            if loaded is not None:
-                return loaded
             if not path.is_file():
+                self._models.pop(key, None)
+                if path == self.default_checkpoint_path:
+                    self.model = None
+                    self.default_config_id = None
+                    self.model_loading_error = f"Trained checkpoint not found: {path}"
                 raise CheckpointNotFoundError(f"Trained checkpoint not found: {path}")
+
+            file_signature = _checkpoint_file_signature(path)
+            loaded = self._models.get(key)
+            if loaded is not None and loaded.file_signature == file_signature:
+                return loaded
+            if loaded is not None:
+                logger.info("Checkpoint changed on disk; reloading inference model: %s", path)
+                self._models.pop(key, None)
+                if path == self.default_checkpoint_path:
+                    self.model = None
+                    self.default_config_id = None
+                    self.model_loading_error = f"Checkpoint changed and is being reloaded: {path}"
 
             checkpoint = torch.load(path, map_location=self.device, weights_only=True)
             if not isinstance(checkpoint, dict):
@@ -258,6 +301,12 @@ class InferenceEngine:
             metrics = checkpoint.get("metrics", {})
             if not isinstance(metrics, dict):
                 metrics = {}
+            checkpoint_sha256 = _sha256_file(path)
+            if _checkpoint_file_signature(path) != file_signature:
+                raise InferenceUnavailableError(
+                    f"Checkpoint changed while it was being loaded: {path}. Retry inference."
+                )
+
             loaded = LoadedCheckpoint(
                 model=model,
                 path=path,
@@ -266,7 +315,8 @@ class InferenceEngine:
                 epoch=checkpoint.get("epoch"),
                 metrics=metrics,
                 spacing_mm=spacing_mm,
-                sha256=_sha256_file(path),
+                sha256=checkpoint_sha256,
+                file_signature=file_signature,
             )
             self._models[key] = loaded
             if path == self.default_checkpoint_path:

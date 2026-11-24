@@ -430,7 +430,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
         <div className="mt-5 space-y-5 border-t border-slate-800 pt-5">
           {loading && <div className="text-xs text-slate-400 flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading run details...</div>}
           {detailError && <div className="text-sm text-red-400">{detailError}</div>}
-          {displayStatus === "running" && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-cyan-500/15 bg-cyan-500/5 px-3 py-2 text-[11px]"><span className="text-cyan-100">Live experiment monitor</span><span className={streamState === "connected" ? "text-emerald-300" : streamState === "polling" ? "text-amber-200" : "text-slate-400"}>{streamState === "connected" ? "WebSocket connected" : streamState === "polling" ? "WebSocket unavailable · polling every 5 seconds" : "Connecting to progress stream…"}</span><span className="text-slate-400">Epoch {runs.at(-1)?.epoch ?? 0}/{config.epochs ?? "—"} · loss {shown(runs.at(-1)?.train_total_loss)} · Dice {shown(runs.at(-1)?.val_dice)} · HD95 {shown(runs.at(-1)?.val_hd95, 2)} mm · LR {shown(runs.at(-1)?.lr, 6)}</span></div>}
+          {displayStatus === "running" && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-cyan-500/15 bg-cyan-500/5 px-3 py-2 text-[11px]"><span className="text-cyan-100">Live experiment monitor</span><span className={streamState === "connected" ? "text-emerald-300" : streamState === "polling" ? "text-amber-200" : "text-slate-400"}>{streamState === "connected" ? "WebSocket connected" : streamState === "polling" ? "WebSocket unavailable · polling every 5 seconds" : "Connecting to progress stream…"}</span><span className="text-slate-400">Epoch {runs.at(-1)?.epoch ?? 0}/{config.epochs ?? "—"} · loss {shown(runs.at(-1)?.train_total_loss)} · pseudo-mask Dice {shown(runs.at(-1)?.val_dice)} · HD95 {shown(runs.at(-1)?.val_hd95, 2)} mm · LR {shown(runs.at(-1)?.lr, 6)}</span></div>}
 
           <section>
             <h3 className="text-sm font-semibold text-white mb-3">Run configuration</h3>
@@ -508,7 +508,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
                              labelStyle={{ color: "#cbd5e1" }} />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
                     <Line type="monotone" dataKey="Train Loss" stroke="#f87171" strokeWidth={1.5} dot={false} />
-                    <Line type="monotone" dataKey="Val Dice" stroke="#34d399" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="Val Dice" name="Pseudo-mask Dice" stroke="#34d399" strokeWidth={2} dot={false} />
                     <Line type="monotone" dataKey="Boundary F1" stroke="#a78bfa" strokeWidth={1.5} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -518,7 +518,7 @@ function ExperimentRow({ exp, onDelete, onStart }) {
               <div className="overflow-x-auto rounded border border-slate-800">
                 <table className="min-w-[1450px] w-full text-xs">
                   <thead className="bg-slate-900 text-slate-400">
-                    <tr>{["Epoch", "LR", "Train total", "Validation loss", "BCE", "Dice loss", "Boundary", "Focal", "HD loss", "Val Dice", "IoU", "HD95", "Boundary F1", "Sensitivity", "Specificity", "ASD", "Volume error %"].map((h) => <th key={h} className="p-2 text-right first:text-left">{h}</th>)}</tr>
+                    <tr>{["Epoch", "LR", "Train total", "Validation loss", "BCE", "Dice loss", "Boundary", "Focal", "HD loss", "Pseudo-mask Dice", "IoU", "HD95", "Boundary F1", "Sensitivity", "Specificity", "ASD", "Volume error %"].map((h) => <th key={h} className="p-2 text-right first:text-left">{h}</th>)}</tr>
                   </thead>
                   <tbody>
                     {runs.map((run) => (
@@ -604,6 +604,10 @@ export default function Experiments() {
         <button className="btn-primary flex items-center gap-2" onClick={() => setShowForm((v) => !v)}>
           <Plus size={15} /> New Experiment
         </button>
+      </div>
+
+      <div className="rounded-lg border border-amber-400/20 bg-amber-400/[.06] px-4 py-3 text-xs leading-5 text-amber-100/90" role="note">
+        Segmentation metrics (Dice, IoU, HD95, Boundary F1, and related scores) measure agreement with generated spherical/elliptical pseudo-masks on sampled patches. They are not expert-contour accuracy or clinical segmentation performance.
       </div>
 
       {/* Create form */}

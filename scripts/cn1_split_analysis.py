@@ -4,12 +4,13 @@ CN1 Research: Split-Point Latency Analysis for Edge–Cloud Mask R-CNN.
 
 Profiles every candidate split point in the ResNet-50 backbone and measures:
   - Edge compute time  (time to run up to split layer)
-  - Feature map size   (KB transmitted)
-  - Cloud compute time (time for remaining layers + RPN + RoI + Mask)
+  - Feature map size   (raw float32 KB and serialized INT8 request KB)
+  - Cloud compute time (the same checkpoint-checked continuation used by the API)
   - Total latency      (edge + network + cloud)
-  - Accuracy impact    (Dice vs full-cloud baseline)
 
-Network conditions are simulated using configurable bandwidth/latency params.
+Network conditions are modeled using configurable bandwidth/latency profiles.
+This script measures software components on one host; it does not claim
+physical edge/cloud latency or clinical accuracy impact.
 
 Usage:
   python scripts/cn1_split_analysis.py \
@@ -19,6 +20,7 @@ Usage:
     --conditions LAN WiFi 4G 5G
 """
 import argparse
+import io
 import json
 import logging
 import os
@@ -56,6 +58,8 @@ def profile_split_point(
     model,
     extractor,
     sample_images:  list,
+    inference_engine=None,
+    checkpoint_sha256: str | None = None,
     n_repeats:      int = 20,
 ) -> dict:
     """
@@ -64,46 +68,132 @@ def profile_split_point(
     """
     import torch
 
-    edge_times, cloud_times, feature_sizes = [], [], []
+    if n_repeats < 1:
+        raise ValueError("n_repeats must be at least 1")
+    if not sample_images:
+        raise ValueError("At least one sample image is required for profiling")
+    if split_layer not in ("input", "cloud_only") and (
+        inference_engine is None or not checkpoint_sha256
+    ):
+        raise ValueError(
+            "Backbone split profiling requires the checkpoint-backed "
+            "InferenceEngine continuation and checkpoint SHA-256"
+        )
+
+    edge_times, cloud_times, feature_sizes, wire_payload_sizes = [], [], [], []
+
+    def synchronize(device):
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def prepare_cloud_features(img):
+        features = extractor.extract(img)
+        from compressor import FeatureCompressor
+
+        compressed = FeatureCompressor(method="int8", device=img.device).compress(features)
+        return features, compressed
+
+    # Run one untimed pass through the exact branch first. This excludes lazy
+    # CUDA/context initialization and model warm-up from the reported mean.
+    warmup_img = sample_images[0]
+    warmup_img = warmup_img.unsqueeze(0) if warmup_img.dim() == 3 else warmup_img
+    with torch.no_grad():
+        if split_layer in ("input", "cloud_only"):
+            synchronize(warmup_img.device)
+            model(list(warmup_img))
+            synchronize(warmup_img.device)
+        else:
+            _, warmup_features = prepare_cloud_features(warmup_img)
+            synchronize(warmup_img.device)
+            inference_engine.predict_from_edge_features(
+                warmup_features,
+                split_layer,
+                "cn1-split-profile-warmup",
+                expected_checkpoint_sha256=checkpoint_sha256,
+                edge_image_mean=extractor.image_mean,
+                edge_image_std=extractor.image_std,
+            )
+            synchronize(warmup_img.device)
 
     with torch.no_grad():
         for img_tensor in sample_images[:n_repeats]:
             img = img_tensor.unsqueeze(0) if img_tensor.dim() == 3 else img_tensor
 
             if split_layer == "input":
-                # Everything on cloud — edge just sends raw image
-                raw_kb = img.numel() * 4 / 1024
-                feature_sizes.append(raw_kb)
-                edge_times.append(0.1)   # negligible edge work (just IO)
+                # Input-space split sends the same RGB PNG patch accepted by
+                # the backend, rather than charging an uncompressed tensor as
+                # though it were the HTTP wire body.
+                from PIL import Image
 
+                pixels = np.rint(
+                    img[0].detach().cpu().clamp(0.0, 1.0).numpy().transpose(1, 2, 0) * 255.0
+                ).astype(np.uint8)
+                encoded = io.BytesIO()
+                Image.fromarray(pixels, mode="RGB").save(encoded, format="PNG")
+                wire_payload_sizes.append(len(encoded.getvalue()) / 1024)
+                feature_sizes.append(0.0)
+                edge_times.append(0.0)
+
+                synchronize(img.device)
                 t0 = time.perf_counter()
-                model(list(img))
+                cloud_input = torch.from_numpy(pixels.transpose(2, 0, 1).copy())
+                cloud_input = cloud_input.to(device=img.device, dtype=torch.float32) / 255.0
+                model([cloud_input])
+                synchronize(img.device)
                 cloud_times.append((time.perf_counter() - t0) * 1000)
 
             elif split_layer == "cloud_only":
-                # Identical to input — baseline: everything on cloud
-                raw_kb = img.numel() * 4 / 1024
-                feature_sizes.append(raw_kb)
-                edge_times.append(0.1)
+                # Reference baseline: patch is already at cloud, so no edge
+                # compute or network transfer is charged.
+                feature_sizes.append(0.0)
+                wire_payload_sizes.append(0.0)
+                edge_times.append(0.0)
+                synchronize(img.device)
                 t0 = time.perf_counter()
                 model(list(img))
+                synchronize(img.device)
                 cloud_times.append((time.perf_counter() - t0) * 1000)
 
             else:
-                # Edge step: extract features up to split_layer
+                # Match the live edge path: produce cumulative backbone levels,
+                # INT8-quantize and serialize them, then call the cloud's actual
+                # checkpoint/hash/normalization-checked continuation method.
+                synchronize(img.device)
                 t0 = time.perf_counter()
-                feats = extractor.extract(img)
+                feats, compressed = prepare_cloud_features(img)
+                # Retain the uncompressed feature size for comparison and use
+                # the complete INT8 wire body (including JSON header) for the
+                # modeled transmission time.
+                size_kb = sum(v.numel() * v.element_size() for v in feats.values()) / 1024
+                feature_sizes.append(size_kb)
+                from edge_node import _serialize_feature_payload
+
+                payload = _serialize_feature_payload(compressed, {
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "image_mean": extractor.image_mean,
+                    "image_std": extractor.image_std,
+                    "compression_method": "int8",
+                })
+                wire_payload_sizes.append(len(payload) / 1024)
+                synchronize(img.device)
                 edge_ms = (time.perf_counter() - t0) * 1000
                 edge_times.append(edge_ms)
 
-                # Feature size
-                size_kb = sum(v.numel() * v.element_size() for v in feats.values()) / 1024
-                feature_sizes.append(size_kb)
-
-                # Cloud step: simulate receiving features and completing inference
-                # (In practice this uses the cloud API; here we simulate with full model)
+                # This method performs the same dequantization, remaining
+                # ResNet stages, FPN, RPN, RoI heads, and postprocessing as the
+                # live cloud endpoint. A full model forward here would measure
+                # a different (and incorrect) cloud path.
+                synchronize(img.device)
                 t1 = time.perf_counter()
-                model(list(img))
+                inference_engine.predict_from_edge_features(
+                    compressed,
+                    split_layer,
+                    "cn1-split-profile",
+                    expected_checkpoint_sha256=checkpoint_sha256,
+                    edge_image_mean=extractor.image_mean,
+                    edge_image_std=extractor.image_std,
+                )
+                synchronize(img.device)
                 cloud_times.append((time.perf_counter() - t1) * 1000)
 
     return {
@@ -113,6 +203,12 @@ def profile_split_point(
         "avg_cloud_ms":       float(np.mean(cloud_times)),
         "std_cloud_ms":       float(np.std(cloud_times)),
         "avg_feature_kb":     float(np.mean(feature_sizes)),
+        "avg_wire_payload_kb": float(np.mean(wire_payload_sizes)),
+        "cloud_path": (
+            "InferenceEngine.predict_from_edge_features"
+            if split_layer not in ("input", "cloud_only")
+            else "full_cloud_model_forward"
+        ),
         "n_samples":          len(edge_times),
     }
 
@@ -128,8 +224,9 @@ def compute_total_latency(
     transmission = (feature_kb * 8) / (bandwidth_mbps * 1000) * 1000  [ms]
                    + rtt_ms (round-trip overhead)
     """
-    tx_ms = (
-        profile["avg_feature_kb"] * 8 / (condition["bandwidth_mbps"] * 1000) * 1000
+    payload_kb = profile.get("avg_wire_payload_kb", profile["avg_feature_kb"])
+    tx_ms = 0.0 if profile["split_layer"] == "cloud_only" else (
+        payload_kb * 8 / (condition["bandwidth_mbps"] * 1000) * 1000
         + condition["rtt_ms"]
     )
     total_ms = profile["avg_edge_ms"] + tx_ms + profile["avg_cloud_ms"]
@@ -155,9 +252,9 @@ def run_split_analysis(
     output_dir:      str = "./experiments/cn1_split",
 ) -> dict:
     import torch
-    from training.model import LungNoduleMaskRCNN
     from training.dataset import LUNA16Dataset
     from edge.feature_extractor import EdgeFeatureExtractor
+    from backend.app.ml.inference import InferenceEngine
     from torch.utils.data import DataLoader
 
     if conditions is None:
@@ -167,21 +264,19 @@ def run_split_analysis(
     logger.info(f"Device: {device}")
 
     # Load model
-    ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    cfg = dict(ckpt.get("config", {}))
-    cfg["pretrained_backbone"] = False
-    model = LungNoduleMaskRCNN.from_config(cfg)
-    state = dict(ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
-    old_bce_key = "composite_mask_loss.bce.loss_fn.pos_weight"
-    new_bce_key = "composite_mask_loss.bce.pos_weight"
-    if old_bce_key in state and new_bce_key not in state:
-        state[new_bce_key] = state.pop(old_bce_key)
-    model.load_state_dict(state, strict=True)
-    model.to(device).eval()
+    inference_engine = InferenceEngine(
+        default_checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    loaded = inference_engine.load_checkpoint(checkpoint_path)
+    model = loaded.model
+    cfg = loaded.config
+    det_model = model.model
     logger.info(f"Model loaded from {checkpoint_path}")
 
     # Collect sample images
-    ds = LUNA16Dataset(data_root, subsets=[fold], patch_size=64, augment=False)
+    patch_size = int(cfg.get("patch_size", 64))
+    ds = LUNA16Dataset(data_root, subsets=[fold], patch_size=patch_size, augment=False)
     loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0)
     samples = []
     with torch.no_grad():
@@ -190,6 +285,8 @@ def run_split_analysis(
                 break
             samples.append(batch["image"][0].to(device))
     logger.info(f"Collected {len(samples)} sample images")
+    if not samples:
+        raise ValueError(f"No patches found in subset {fold} under {data_root}")
 
     # Profile each split layer
     profiles = {}
@@ -202,6 +299,8 @@ def run_split_analysis(
                 split_layer=split_layer,
                 device=device,
                 checkpoint_path=checkpoint_path,
+                image_mean=tuple(det_model.transform.image_mean),
+                image_std=tuple(det_model.transform.image_std),
             )
 
         profile = profile_split_point(
@@ -209,6 +308,8 @@ def run_split_analysis(
             model=model,
             extractor=extractor,
             sample_images=samples,
+            inference_engine=inference_engine,
+            checkpoint_sha256=loaded.sha256,
             n_repeats=min(n_repeats, len(samples)),
         )
         profiles[split_layer] = profile
@@ -230,11 +331,16 @@ def run_split_analysis(
             results.append({
                 "split_layer":      split_layer,
                 "condition":        cond_name,
+                "network_measurement": "modeled_profile",
+                "energy_measurement": "not_measured",
+                "clinical_network_measurement": False,
                 "bandwidth_mbps":   cond["bandwidth_mbps"],
                 "rtt_ms":           cond["rtt_ms"],
                 "avg_edge_ms":      round(profile["avg_edge_ms"], 2),
                 "avg_cloud_ms":     round(profile["avg_cloud_ms"], 2),
                 "avg_feature_kb":   round(profile["avg_feature_kb"], 2),
+                "avg_wire_payload_kb": round(profile["avg_wire_payload_kb"], 2),
+                "cloud_path": profile["cloud_path"],
                 **latency,
             })
 
@@ -248,6 +354,7 @@ def run_split_analysis(
                 "split_layer": best["split_layer"],
                 "total_ms":    best["total_ms"],
                 "feature_kb":  best["avg_feature_kb"],
+                "wire_payload_kb": best["avg_wire_payload_kb"],
             }
 
     # Save results
@@ -255,6 +362,23 @@ def run_split_analysis(
     out_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "checkpoint":    checkpoint_path,
+        "clinical_network_measurement": False,
+        "optimization_scope": (
+            "Best profiled split among the tested software paths under the selected "
+            "modeled network profiles; not a measured hospital or carrier optimum."
+        ),
+        "energy_measurement": {
+            "status": "not_measured",
+            "edge_joules": None,
+            "cloud_joules": None,
+            "reason": "No synchronized power/energy sensors are available in this single-host profiler.",
+        },
+        "measurement_scope": (
+            "Single-host component timings; cloud continuation calls the same "
+            "checkpoint-checked InferenceEngine path as the API. Network profiles "
+            "are modeled, not measured on a deployed edge/cloud network. No "
+            "hospital-to-cloud latency or energy savings are established."
+        ),
         "split_profiles": profiles,
         "latency_matrix": results,
         "optimal_split":  optimal,
@@ -278,15 +402,16 @@ def run_split_analysis(
             row += f"{match['total_ms']:>13.1f} " if match else f"{'—':>14}"
         print(row)
 
-    print("\n  Feature map sizes per split layer:")
+    print("\n  Feature map / request sizes per split layer:")
     for split_layer, p in profiles.items():
         print(f"  {split_layer:<14}  {p['avg_feature_kb']:>8.1f} KB  "
+              f"wire={p['avg_wire_payload_kb']:.1f} KB  "
               f"(edge={p['avg_edge_ms']:.1f}ms, cloud={p['avg_cloud_ms']:.1f}ms)")
 
     print("\n  Optimal split per condition:")
     for cond_name, opt in optimal.items():
         print(f"  {cond_name:<8}  ->  {opt['split_layer']:<14}  "
-              f"total={opt['total_ms']:.1f}ms  feature={opt['feature_kb']:.1f}KB")
+              f"total={opt['total_ms']:.1f}ms  wire={opt['wire_payload_kb']:.1f}KB")
 
     print(f"\n  Full report saved to: {out_dir}/cn1_split_analysis.json")
     print(f"{'='*78}")

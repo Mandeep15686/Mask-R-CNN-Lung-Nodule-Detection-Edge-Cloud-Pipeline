@@ -7,7 +7,7 @@ Responsibilities:
   1. Accept CT scan patches (from scanner / DICOM PACS)
   2. Decode a model-ready windowed RGB patch (not raw HU/DICOM reconstruction)
   3. Early-layer feature extraction (layer1 + layer2 of ResNet-50)
-  4. Feature compression (none or INT8; learned codec is not wired into live inference)
+  4. Feature compression (none, INT8, or checkpoint-backed learned bottleneck)
   5. Transmit compressed features to cloud API
   6. Receive + cache nodule detection results
   7. Heartbeat + network monitoring
@@ -31,6 +31,7 @@ from preprocessor import CTPreprocessor
 from feature_extractor import EdgeFeatureExtractor
 from compressor import FeatureCompressor
 from network_monitor import NetworkMonitor
+from dp import BasicCompositionAccountant, gaussian_feature_release
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,18 +48,25 @@ HOSTNAME        = os.getenv("HOSTNAME",         "edge-01.hospital.local")
 NODE_IP         = os.getenv("NODE_IP",          "192.168.1.10")
 EDGE_API_TOKEN  = os.getenv("EDGE_API_TOKEN",    "")
 SPLIT_LAYER     = os.getenv("SPLIT_LAYER",      "layer2")       # layer1 | layer2 | layer3
-COMPRESSION     = os.getenv("COMPRESSION",      "int8")         # live: none | int8
+COMPRESSION     = os.getenv("COMPRESSION",      "int8")         # none | int8 | learned
 PATCH_SIZE      = int(os.getenv("PATCH_SIZE",   "64"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",   "1"))
 HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC","30"))
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Differential privacy: set DP_EPSILON > 0 to add Gaussian noise to features
-# before compression. Set to 0 (default) to disable live DP noise injection.
+# Patient-level feature privacy: epsilon=0 disables releases; a positive epsilon
+# enables a joint clipped Gaussian mechanism and strict basic composition.
 _DP_EPSILON_STR = os.getenv("DP_EPSILON", "0").strip()
 DP_EPSILON      = float(_DP_EPSILON_STR) if _DP_EPSILON_STR else 0.0
 DP_DELTA        = float(os.getenv("DP_DELTA", "1e-5"))
 DP_SENSITIVITY  = float(os.getenv("DP_SENSITIVITY", "1.0"))
+DP_EPSILON_BUDGET = float(os.getenv("DP_EPSILON_BUDGET", str(DP_EPSILON or 1.0)))
+DP_DELTA_BUDGET = float(os.getenv("DP_DELTA_BUDGET", str(DP_DELTA)))
 PROJECT_ROOT    = Path(__file__).resolve().parents[1]
+DP_ACCOUNTANT_PATH = Path(
+    os.getenv("DP_ACCOUNTANT_PATH", str(PROJECT_ROOT / "data" / "edge_dp_accountant.json"))
+).expanduser()
+if not DP_ACCOUNTANT_PATH.is_absolute():
+    DP_ACCOUNTANT_PATH = (PROJECT_ROOT / DP_ACCOUNTANT_PATH).resolve()
 EDGE_MODEL_PATH = Path(
     os.getenv("EDGE_MODEL_PATH")
     or os.getenv("MODEL_PATH")
@@ -68,96 +76,35 @@ if not EDGE_MODEL_PATH.is_absolute():
     EDGE_MODEL_PATH = (PROJECT_ROOT / EDGE_MODEL_PATH).resolve()
 
 
-class _DPAccountant:
-    """
-    Per-node privacy accountant using the moments/Rényi composition rule.
-
-    Each call to ``record_release`` accumulates privacy spend.  When the
-    total exceeds the configured budget (DP_EPSILON_BUDGET), the accountant
-    returns False from ``can_release`` and the edge node refuses to send
-    more features until reset (e.g. at the start of a new patient session).
-
-    This is a simplified RDP accountant (alpha=10 Rényi order); a full
-    implementation would use google/dp-accounting or autodp.
-    """
-
-    _RENYI_ALPHA = 10  # Rényi order
-
-    def __init__(self, epsilon_budget: float, delta: float):
-        self.epsilon_budget = epsilon_budget
-        self.delta = delta
-        self._epsilon_spent: float = 0.0
-        self._n_releases: int = 0
-
-    def record_release(self, sigma: float, sensitivity: float) -> None:
-        """Add one Gaussian mechanism release to the privacy ledger."""
-        # RDP ε(α) for Gaussian: α * sensitivity² / (2σ²)
-        rdp = self._RENYI_ALPHA * (sensitivity ** 2) / (2.0 * sigma ** 2)
-        # Convert RDP → (ε, δ)-DP via standard bound
-        eps_dp = rdp + (
-            np.log(1.0 / self.delta) / (self._RENYI_ALPHA - 1)
-        )
-        self._epsilon_spent += eps_dp
-        self._n_releases += 1
-
-    def can_release(self) -> bool:
-        return self._epsilon_spent < self.epsilon_budget
-
-    def reset(self) -> None:
-        self._epsilon_spent = 0.0
-        self._n_releases = 0
-
-    @property
-    def epsilon_spent(self) -> float:
-        return self._epsilon_spent
-
-    @property
-    def n_releases(self) -> int:
-        return self._n_releases
-
-
-# Module-level accountant; shared across all scans in a session.
-_dp_accountant: "_DPAccountant | None" = None
+_dp_accountant: BasicCompositionAccountant | None = None
 if DP_EPSILON > 0.0:
-    _dp_budget = float(os.getenv("DP_EPSILON_BUDGET", str(DP_EPSILON * 100)))
-    _dp_accountant = _DPAccountant(epsilon_budget=_dp_budget, delta=DP_DELTA)
+    if DP_EPSILON > 1.0:
+        raise ValueError("DP_EPSILON must be in (0, 1] for this Gaussian calibration")
+    if DP_EPSILON_BUDGET < DP_EPSILON or DP_DELTA_BUDGET < DP_DELTA:
+        raise ValueError("DP budgets must allow at least one configured release")
+    _dp_accountant = BasicCompositionAccountant(
+        epsilon_budget=DP_EPSILON_BUDGET,
+        delta_budget=DP_DELTA_BUDGET,
+        ledger_path=DP_ACCOUNTANT_PATH,
+    )
 
 
-def _add_dp_noise(features: dict, epsilon: float, delta: float = 1e-5, sensitivity: float = 1.0) -> dict:
-    """
-    Inject calibrated Gaussian noise into feature tensors for (ε, δ)-DP.
-
-    Steps:
-      1. L2-clip each feature tensor to bound the sensitivity (per-sample).
-      2. Add Gaussian noise scaled to the clipped sensitivity.
-      3. Record the release in the module-level privacy accountant.
-
-    σ = (sensitivity / epsilon) * sqrt(2 * ln(1.25 / delta))
-
-    The clipping norm equals ``sensitivity``, which the caller supplies via
-    DP_SENSITIVITY.  Set this to the empirical 95th-percentile L2 norm of
-    your feature tensors for a tight but safe bound.
-    """
-    if _dp_accountant is not None and not _dp_accountant.can_release():
-        raise RuntimeError(
-            f"DP budget exhausted after {_dp_accountant.n_releases} releases "
-            f"(ε_spent={_dp_accountant.epsilon_spent:.4f} ≥ budget={_dp_accountant.epsilon_budget:.4f}). "
-            "Call _dp_accountant.reset() to start a new privacy epoch."
-        )
-
-    sigma = (sensitivity / epsilon) * (2.0 * np.log(1.25 / delta)) ** 0.5
-    noised = {}
-    for k, v in features.items():
-        fp = v.dequantize().float() if v.is_quantized else v.float()
-        # Per-sample L2 clipping: scale each tensor so its L2 norm ≤ sensitivity
-        l2_norm = fp.norm(p=2)
-        fp = fp * (sensitivity / (l2_norm + 1e-8)).clamp(max=1.0)
-        noised[k] = fp + torch.randn_like(fp) * sigma
-
-    if _dp_accountant is not None:
-        _dp_accountant.record_release(sigma=sigma, sensitivity=sensitivity)
-
-    return noised
+def _add_dp_noise(
+    features: dict,
+    epsilon: float,
+    delta: float = 1e-5,
+    sensitivity: float = 1.0,
+) -> tuple[dict, dict]:
+    """Release one patient's complete feature vector through the Gaussian mechanism."""
+    if _dp_accountant is None:
+        raise RuntimeError("DP accountant is disabled; set DP_EPSILON > 0")
+    return gaussian_feature_release(
+        features,
+        epsilon=epsilon,
+        delta=delta,
+        clip_norm=sensitivity,
+        accountant=_dp_accountant,
+    )
 
 
 def _serialize_feature_payload(features: dict, metadata: dict) -> bytes:
@@ -232,26 +179,17 @@ class EdgeNode:
     """Main edge node controller."""
 
     def __init__(self):
-        if DP_EPSILON > 0.0:
-            raise ValueError(
-                "Live DP feature release is disabled: the experimental clipping/noise "
-                "and accountant have not been validated as an end-to-end "
-                "(epsilon, delta)-DP mechanism. Use scripts/cn5_differential_privacy.py "
-                "for offline research only."
-            )
-        if COMPRESSION == "learned":
-            raise ValueError(
-                "Learned compression is not supported by the live edge/cloud protocol: "
-                "the cloud decoder and rate-distortion-trained checkpoint integration "
-                "are not implemented. Use none or int8."
-            )
         self.preprocessor  = CTPreprocessor(patch_size=PATCH_SIZE)
         self.extractor     = EdgeFeatureExtractor(
             split_layer=SPLIT_LAYER,
             device=DEVICE,
             checkpoint_path=EDGE_MODEL_PATH,
         )
-        self.compressor    = FeatureCompressor(method=COMPRESSION, device=DEVICE)
+        self.compressor    = FeatureCompressor(
+            method=COMPRESSION,
+            device=DEVICE,
+            expected_backbone_sha256=self.extractor.checkpoint_sha256,
+        )
         self.net_monitor   = NetworkMonitor(cloud_url=CLOUD_API_URL)
         self.session: Optional[aiohttp.ClientSession] = None
         self._running      = False
@@ -335,7 +273,9 @@ class EdgeNode:
 
         # Preprocess once for the local fallback and, if the link is healthy,
         # for edge feature extraction.
+        t_preprocess_start = time.perf_counter()
         patch_tensor = self.preprocessor.preprocess_bytes(image_bytes, source_format)
+        preprocessing_ms = (time.perf_counter() - t_preprocess_start) * 1000
 
         # Probe before spending time extracting/compressing features. A failed
         # or poor link should select local fallback instead of a doomed upload.
@@ -347,10 +287,17 @@ class EdgeNode:
                 bw_mbps,
                 latency_ms,
             )
-            # Record the scheduling decision so the dashboard can show fallback frequency.
+            # Record separate probe RTT and local compute duration for this fallback.
+            t_local_start = time.perf_counter()
+            result = await self.predict_local(image_bytes, scan_uid)
+            edge_processing_ms = preprocessing_ms + (time.perf_counter() - t_local_start) * 1000
+            total_pipeline_ms = (time.perf_counter() - t_start) * 1000
             await self._log_network_event({
                 "node_id": NODE_ID,
                 "latency_ms": latency_ms,
+                "edge_processing_ms": edge_processing_ms,
+                "total_pipeline_ms": total_pipeline_ms,
+                "timing_schema_version": 2,
                 "bandwidth_mbps": bw_mbps,
                 "payload_size_kb": 0.0,
                 "inference_time_ms": 0.0,
@@ -358,41 +305,45 @@ class EdgeNode:
                 "compression_method": "local_fallback",
                 "compression_ratio": 0.0,
             })
-            result = await self.predict_local(image_bytes, scan_uid)
             result["adaptive_decision"] = "local_fallback"
             result["probe_bandwidth_mbps"] = bw_mbps
             result["probe_latency_ms"] = latency_ms
+            result["edge_processing_ms"] = edge_processing_ms
+            result["total_pipeline_ms"] = total_pipeline_ms
             return result
 
         # Extract and optionally apply live DP noise before compression.
+        t_feature_start = time.perf_counter()
         with torch.no_grad():
             features = self.extractor.extract(patch_tensor.unsqueeze(0).to(DEVICE))
 
+        dp_metadata = None
         if DP_EPSILON > 0.0:
-            features = _add_dp_noise(
+            features, dp_metadata = _add_dp_noise(
                 features, epsilon=DP_EPSILON, delta=DP_DELTA, sensitivity=DP_SENSITIVITY
             )
             logger.info(
-                "[%s] DP noise applied (ε=%.4f, δ=%g, sensitivity=%.3f) | "
-                "accountant: ε_spent=%.4f, releases=%d",
-                scan_uid, DP_EPSILON, DP_DELTA, DP_SENSITIVITY,
-                _dp_accountant.epsilon_spent if _dp_accountant else 0.0,
-                _dp_accountant.n_releases if _dp_accountant else 1,
+                "[%s] Gaussian DP feature release: ε_spent=%.4f δ_spent=%g releases=%d",
+                scan_uid,
+                dp_metadata["epsilon_spent"],
+                dp_metadata["delta_spent"],
+                dp_metadata["releases"],
             )
 
         compressed_payload = self.compressor.compress(features)
         t_compress = time.perf_counter()
+        edge_processing_ms = preprocessing_ms + (t_compress - t_feature_start) * 1000
 
         payload_bytes = _serialize_feature_payload(
             compressed_payload,
             {
                 "scan_uid": scan_uid,
-                "edge_processing_ms": (t_compress - t_start) * 1000,
+                "edge_processing_ms": edge_processing_ms,
+                "probe_latency_ms": latency_ms,
                 "bandwidth_mbps": bw_mbps,
                 "compression_method": COMPRESSION,
-                "dp_epsilon": DP_EPSILON if DP_EPSILON > 0.0 else None,
-                "dp_epsilon_spent": _dp_accountant.epsilon_spent if _dp_accountant else None,
-                "dp_releases": _dp_accountant.n_releases if _dp_accountant else None,
+                "codec_sha256": getattr(self.compressor, "codec_sha256", None),
+                "dp": dp_metadata,
                 "checkpoint_sha256": self.extractor.checkpoint_sha256,
                 "image_mean": self.extractor.image_mean,
                 "image_std": self.extractor.image_std,
@@ -408,7 +359,9 @@ class EdgeNode:
             result.setdefault("adaptive_decision", "cloud")
         except Exception as exc:
             logger.warning("[%s] Cloud feature inference failed; using local fallback: %s", scan_uid, exc)
+            t_local_start = time.perf_counter()
             result = await self.predict_local(image_bytes, scan_uid)
+            edge_processing_ms += (time.perf_counter() - t_local_start) * 1000
             result["fallback_reason"] = str(exc)
             result["adaptive_decision"] = "local_fallback_cloud_error"
 
@@ -417,31 +370,33 @@ class EdgeNode:
 
         total_ms = (time.perf_counter() - t_start) * 1000
 
-        # 6. Log to cloud — use wire-verified compression_ratio
-        await self._log_network_event({
-            "node_id": NODE_ID,
-            "latency_ms": latency_ms,
-            "bandwidth_mbps": bw_mbps,
-            "payload_size_kb": payload_kb,
-            "inference_time_ms": result.get("cloud_inference_ms", 0),
-            "split_layer": SPLIT_LAYER,
-            "compression_method": (
-                "local_fallback_cloud_error"
-                if result.get("adaptive_decision") == "local_fallback_cloud_error"
-                else COMPRESSION
-            ),
-            "compression_ratio": compression_ratio,
-        })
+        # The cloud logs successful feature inference. Send an edge-side log only
+        # for fallback/error outcomes, avoiding a duplicate event per successful scan.
+        if result.get("adaptive_decision") != "cloud":
+            await self._log_network_event({
+                "node_id": NODE_ID,
+                "latency_ms": latency_ms,
+                "edge_processing_ms": edge_processing_ms,
+                "total_pipeline_ms": (time.perf_counter() - t_start) * 1000,
+                "timing_schema_version": 2,
+                "bandwidth_mbps": bw_mbps,
+                "payload_size_kb": payload_kb,
+                "inference_time_ms": result.get("cloud_inference_ms", 0),
+                "split_layer": SPLIT_LAYER,
+                "compression_method": "local_fallback_cloud_error",
+                "compression_ratio": compression_ratio,
+            })
 
         logger.info(
-            f"[{scan_uid}] edge={((t_compress-t_start)*1000):.1f}ms | "
+            f"[{scan_uid}] edge_compute={edge_processing_ms:.1f}ms | "
+            f"probe_rtt={latency_ms:.1f}ms | "
             f"payload={payload_kb:.1f}KB (ratio={compression_ratio:.1f}x) | "
             f"cloud={result.get('cloud_inference_ms',0):.1f}ms | "
             f"total={total_ms:.1f}ms"
         )
 
         result["total_pipeline_ms"] = total_ms
-        result["edge_processing_ms"] = (t_compress - t_start) * 1000
+        result["edge_processing_ms"] = edge_processing_ms
         result["compression_ratio"] = compression_ratio
         self.result_cache[scan_uid] = result
         return result

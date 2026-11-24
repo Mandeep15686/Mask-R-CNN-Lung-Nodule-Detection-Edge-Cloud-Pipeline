@@ -46,6 +46,21 @@ def _import_flower():
 # ---------------------------------------------------------------------------
 # Flower client
 # ---------------------------------------------------------------------------
+def _resolve_client_subset(client_id: int, available_subsets: list[int], requested_subset=None) -> int:
+    """Resolve the client's local subset without implying it is a hospital."""
+    if requested_subset is not None:
+        subset = int(requested_subset)
+        if subset not in available_subsets:
+            raise ValueError(
+                f"Requested local client subset{subset} is unavailable; "
+                f"found {available_subsets} under this client's data root"
+            )
+        return subset
+    if not available_subsets:
+        raise ValueError("No LUNA16 subsets found for federated client")
+    return available_subsets[client_id % len(available_subsets)]
+
+
 def _flower_client(client_id: int, data_root: str, config: dict):
     fl = _import_flower()
 
@@ -77,7 +92,9 @@ def _flower_client(client_id: int, data_root: str, config: dict):
             if not _all_subsets:
                 raise ValueError(f"No LUNA16 subsets found under {data_root}")
 
-            client_subset = _all_subsets[client_id % len(_all_subsets)]
+            client_subset = _resolve_client_subset(
+                client_id, _all_subsets, config.get("client_subset")
+            )
             subset_dir = _root / f"subset{client_subset}"
             scan_uids = sorted(
                 path.stem
@@ -350,6 +367,9 @@ def run_simulation(
 
     # Save final results
     final = {
+        "execution_mode": "single_machine_flower_simulation",
+        "institutional_validation": False,
+        "simulated_sites_are_hospitals": False,
         "strategy":    strategy_name,
         "num_clients": num_clients,
         "num_rounds":  num_rounds,
@@ -361,7 +381,11 @@ def run_simulation(
     with open(os.path.join(output_dir, "fl_summary.json"), "w") as f:
         json.dump(final, f, indent=2)
 
-    logger.info(f"Federated simulation complete. Results in {output_dir}")
+    logger.info(
+        "Federated single-machine simulation complete in %s; this is not "
+        "multi-hospital or institutional validation",
+        output_dir,
+    )
     return final
 
 
@@ -403,6 +427,14 @@ if __name__ == "__main__":
     parser.add_argument("--rounds",      type=int, default=20)
     parser.add_argument("--strategy",    choices=["fedavg","fedprox"], default="fedavg")
     parser.add_argument("--server-addr", default="[::]:8080")
+    parser.add_argument("--client-subset", type=int, default=None,
+                        help="Explicit local LUNA16 subset for one distributed client")
+    parser.add_argument("--tls-root-ca", default=None,
+                        help="CA PEM used by a client to validate the server certificate")
+    parser.add_argument("--tls-server-cert", default=None,
+                        help="Server TLS certificate PEM (server mode)")
+    parser.add_argument("--tls-server-key", default=None,
+                        help="Server TLS private key PEM (server mode)")
     args = parser.parse_args()
 
     if args.mode == "simulate":
@@ -416,12 +448,31 @@ if __name__ == "__main__":
     elif args.mode == "server":
         fl = _import_flower()
         strategy = _build_strategy(args.strategy, args.num_clients)
-        fl.server.start_server(
-            server_address=args.server_addr,
-            config=fl.server.ServerConfig(num_rounds=args.rounds),
-            strategy=strategy,
-        )
+        tls_values = (args.tls_root_ca, args.tls_server_cert, args.tls_server_key)
+        if any(tls_values) and not all(tls_values):
+            parser.error(
+                "server TLS requires --tls-root-ca, --tls-server-cert, and --tls-server-key together"
+            )
+        start_kwargs = {
+            "server_address": args.server_addr,
+            "config": fl.server.ServerConfig(num_rounds=args.rounds),
+            "strategy": strategy,
+        }
+        if all(tls_values):
+            start_kwargs["certificates"] = tuple(
+                Path(path).read_bytes()
+                for path in tls_values
+            )
+        else:
+            logger.warning("Federated server transport is plaintext; configure TLS for deployment")
+        fl.server.start_server(**start_kwargs)
     elif args.mode == "client":
         fl = _import_flower()
-        client = _flower_client(args.client_id, args.data, {})
-        fl.client.start_numpy_client(server_address=args.server_addr, client=client)
+        client_config = {"client_subset": args.client_subset}
+        client = _flower_client(args.client_id, args.data, client_config)
+        client_kwargs = {"server_address": args.server_addr, "client": client}
+        if args.tls_root_ca:
+            client_kwargs["root_certificates"] = Path(args.tls_root_ca).read_bytes()
+        else:
+            logger.warning("Federated client is not validating server TLS; set --tls-root-ca")
+        fl.client.start_numpy_client(**client_kwargs)

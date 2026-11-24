@@ -4,6 +4,7 @@ Run: pytest tests/test_api.py -v
 """
 import sys, os, tempfile, json
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "edge")))
 
 import io
 import base64
@@ -386,6 +387,8 @@ class TestEdge:
             "dtypes": ["int8", "int8"],
             "scales": [0.25, 0.5],
             "zero_points": [0, -1],
+            "probe_latency_ms": 12.5,
+            "edge_processing_ms": 48.0,
             "checkpoint_sha256": "test-checkpoint",
             "image_mean": [0.485, 0.456, 0.406],
             "image_std": [0.229, 0.224, 0.225],
@@ -402,11 +405,89 @@ class TestEdge:
         assert set(features) == {"layer1", "layer2"}
         assert all(value.is_quantized for value in features.values())
         assert (split_layer, scan_uid) == ("layer2", "scan-feature")
+        logs = client.get("/api/edge/network-log", params={"node_id": "test-edge-01"})
+        assert logs.status_code == 200
+        feature_log = next(row for row in logs.json() if row["payload_size_kb"] > 0)
+        assert feature_log["latency_ms"] == 12.5
+        assert feature_log["edge_processing_ms"] == 48.0
+        assert feature_log["timing_schema_version"] == 2
+
+    def test_feature_endpoint_decodes_learned_codec_before_continuation(
+        self, client, monkeypatch, tmp_path
+    ):
+        import torch
+        from edge.compressor import FeatureCompressor, _LearnedCodecBank, _sha256_file
+        from edge_node import _serialize_feature_payload
+        from backend.app.routes import edge as edge_routes
+
+        backbone_hash = "detector-checkpoint-test"
+        codec_path = tmp_path / "codec.pth"
+        codec_state = _LearnedCodecBank()
+        torch.save({
+            "metadata": {
+                "format": "learned_feature_codec_v1",
+                "backbone_checkpoint_sha256": backbone_hash,
+            },
+            "codec_state": codec_state.state_dict(),
+        }, codec_path)
+        monkeypatch.setenv("LEARNED_COMPRESSOR_CHECKPOINT", str(codec_path))
+        monkeypatch.delenv("EDGE_API_TOKEN", raising=False)
+        edge_routes._load_learned_decoder.cache_clear()
+
+        compressor = FeatureCompressor(
+            method="learned",
+            expected_backbone_sha256=backbone_hash,
+            checkpoint_path=str(codec_path),
+        )
+        source = {
+            "layer1": torch.randn(1, 256, 2, 2),
+            "layer2": torch.randn(1, 512, 1, 1),
+        }
+        latent = compressor.compress(source)
+        payload = _serialize_feature_payload(latent, {
+            "scan_uid": "learned-codec-test",
+            "compression_method": "learned",
+            "codec_sha256": _sha256_file(codec_path),
+            "checkpoint_sha256": backbone_hash,
+            "image_mean": [0.485, 0.456, 0.406],
+            "image_std": [0.229, 0.224, 0.225],
+        })
+        response = client.post(
+            "/api/edge/infer-features",
+            params={"node_id": "test-edge-01", "scan_uid": "learned-codec-test", "split_layer": "layer2"},
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+        assert response.status_code == 200, response.text
+        decoded, split_layer, scan_uid = TestInferenceEngine.last_edge_feature_call
+        assert decoded["layer1"].shape == source["layer1"].shape
+        assert decoded["layer2"].shape == source["layer2"].shape
+        assert (split_layer, scan_uid) == ("layer2", "learned-codec-test")
+
+        bad_payload = _serialize_feature_payload(latent, {
+            "scan_uid": "learned-codec-mismatch",
+            "compression_method": "learned",
+            "codec_sha256": "different-codec",
+            "checkpoint_sha256": backbone_hash,
+            "image_mean": [0.485, 0.456, 0.406],
+            "image_std": [0.229, 0.224, 0.225],
+        })
+        mismatch = client.post(
+            "/api/edge/infer-features",
+            params={"node_id": "test-edge-01", "scan_uid": "codec-mismatch", "split_layer": "layer2"},
+            content=bad_payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert mismatch.status_code == 503
 
     def test_log_network_event(self, client):
         r = client.post("/api/edge/network-log", json={
             "node_id": "test-edge-01",
             "latency_ms": 12.5,
+            "edge_processing_ms": 48.0,
+            "total_pipeline_ms": 210.0,
+            "timing_schema_version": 2,
             "bandwidth_mbps": 95.0,
             "payload_size_kb": 32.0,
             "inference_time_ms": 150.0,
@@ -417,6 +498,9 @@ class TestEdge:
         assert r.status_code in (200, 201)
         data = r.json()
         assert data["node_id"] == "test-edge-01"
+        assert data["latency_ms"] == 12.5
+        assert data["edge_processing_ms"] == 48.0
+        assert data["total_pipeline_ms"] == 210.0
 
     def test_network_stats(self, client):
         r = client.get("/api/edge/network-stats")

@@ -2,6 +2,7 @@
 Feature map compression for edge→cloud transmission.
 Methods: none | int8 | learned (auto-encoder bottleneck)
 """
+import hashlib
 import torch
 import torch.nn as nn
 from typing import Literal
@@ -22,21 +23,32 @@ class FeatureCompressor:
         self,
         method: CompressMethod = "int8",
         device: torch.device = torch.device("cpu"),
+        expected_backbone_sha256: str | None = None,
+        checkpoint_path: str | None = None,
     ):
         self.method = method
         self.device = device
-        self._autoencoder: nn.Module | None = None
+        self._autoencoder: _LearnedCodecBank | None = None
+        self.codec_sha256: str | None = None
         if method == "learned":
-            checkpoint = os.getenv("LEARNED_COMPRESSOR_CHECKPOINT")
+            checkpoint = checkpoint_path or os.getenv("LEARNED_COMPRESSOR_CHECKPOINT")
             if not checkpoint or not os.path.isfile(checkpoint):
                 raise ValueError(
-                    "Learned compression is disabled until a trained checkpoint is set "
+                    "Learned compression requires a trained codec checkpoint set "
                     "with LEARNED_COMPRESSOR_CHECKPOINT"
                 )
-            self._autoencoder = _LearnedBottleneck().to(device)
             state = torch.load(checkpoint, map_location=device, weights_only=True)
-            self._autoencoder.load_state_dict(state.get("model_state", state), strict=True)
+            metadata = state.get("metadata", {}) if isinstance(state, dict) else {}
+            model_state = state.get("codec_state") if isinstance(state, dict) else None
+            if not isinstance(model_state, dict) or metadata.get("format") != "learned_feature_codec_v1":
+                raise ValueError("Codec checkpoint is missing learned_feature_codec_v1 metadata/state")
+            trained_backbone = metadata.get("backbone_checkpoint_sha256")
+            if expected_backbone_sha256 and trained_backbone != expected_backbone_sha256:
+                raise ValueError("Learned codec was trained for a different backbone checkpoint")
+            self._autoencoder = _LearnedCodecBank().to(device)
+            self._autoencoder.load_state_dict(model_state, strict=True)
             self._autoencoder.eval()
+            self.codec_sha256 = _sha256_file(checkpoint)
 
     def compress(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Compress a dict of feature tensors. Returns compressed tensors."""
@@ -66,7 +78,7 @@ class FeatureCompressor:
                 return {k: v.cpu() for k, v in features.items()}
             with torch.no_grad():
                 return {
-                    k: self._autoencoder.encode(v.to(self.device)).cpu()
+                    k: self._autoencoder.encode(k, v.to(self.device)).cpu()
                     for k, v in features.items()
                 }
 
@@ -79,7 +91,7 @@ class FeatureCompressor:
             if isinstance(v, torch.Tensor) and v.dtype == torch.qint8:
                 result[k] = v.dequantize().float()
             elif self.method == "learned" and self._autoencoder is not None:
-                result[k] = self._autoencoder.decode(v.to(self.device)).cpu()
+                result[k] = self._autoencoder.decode(k, v.to(self.device)).cpu()
             else:
                 result[k] = v.float() if isinstance(v, torch.Tensor) else v
         return result
@@ -95,6 +107,14 @@ class FeatureCompressor:
         return _bytes(original) / _bytes(compressed)
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class _LearnedBottleneck(nn.Module):
     """
     Lightweight convolutional auto-encoder bottleneck.
@@ -102,7 +122,7 @@ class _LearnedBottleneck(nn.Module):
     Decoder (cloud): 64ch → 512ch.
     """
 
-    def __init__(self, in_channels: int = 512, bottleneck: int = 64):
+    def __init__(self, in_channels: int, bottleneck: int):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 256, 1),
@@ -123,3 +143,27 @@ class _LearnedBottleneck(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
+
+
+class _LearnedCodecBank(nn.Module):
+    """Independent learned 1x1 codecs for the three ResNet split levels."""
+
+    CHANNELS = {"layer1": 256, "layer2": 512, "layer3": 1024}
+    LATENT_CHANNELS = {"layer1": 32, "layer2": 64, "layer3": 128}
+
+    def __init__(self):
+        super().__init__()
+        self.codecs = nn.ModuleDict({
+            name: _LearnedBottleneck(channels, self.LATENT_CHANNELS[name])
+            for name, channels in self.CHANNELS.items()
+        })
+
+    def encode(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        if name not in self.codecs or value.shape[1] != self.CHANNELS[name]:
+            raise ValueError(f"Unexpected feature level or channel count for {name}")
+        return self.codecs[name].encode(value)
+
+    def decode(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        if name not in self.codecs or value.shape[1] != self.LATENT_CHANNELS[name]:
+            raise ValueError(f"Unexpected learned latent level or channel count for {name}")
+        return self.codecs[name].decode(value)

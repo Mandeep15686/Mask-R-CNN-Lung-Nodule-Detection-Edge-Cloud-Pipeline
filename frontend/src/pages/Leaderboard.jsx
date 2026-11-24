@@ -11,15 +11,23 @@ const tooltipStyle = { contentStyle: { background: "#0b1a2a", border: "1px solid
 const COLUMNS = [
   ["rank", "#", 0], ["config_id", "Experiment", null], ["phase", "Phase", 0], ["status", "Status", null],
   ["alpha", "α", 2], ["beta", "β", 2], ["gamma", "γ", 2], ["delta", "δ", 2], ["epsilon", "ε", 2],
-  ["best_dice", "Dice ↑", 4], ["best_iou", "IoU ↑", 4], ["best_hd95", "HD95 mm ↓", 2],
+  ["best_dice", "Pseudo-mask Dice ↑", 4], ["best_iou", "IoU ↑", 4], ["best_hd95", "HD95 mm ↓", 2],
   ["best_boundary_f1", "Boundary F1 ↑", 4], ["best_sensitivity", "Sensitivity ↑", 4], ["best_specificity", "Specificity ↑", 4],
   ["best_asd", "ASD mm ↓", 2], ["best_volume_error", "Volume error %", 2], ["best_epoch", "Epoch", 0], ["training_duration_s", "Duration s", 1],
 ];
 
 function exportCsv(rows) {
-  const fields = COLUMNS.map(([key]) => key);
+  const fields = [
+    ...COLUMNS.map(([key]) => key),
+    "segmentation_target",
+    "segmentation_metric_interpretation",
+  ];
+  const provenance = {
+    segmentation_target: "synthetic_spherical_approximation_from_center_and_diameter",
+    segmentation_metric_interpretation: "Agreement with generated pseudo-masks on sampled patches; not expert-contour accuracy",
+  };
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const csv = [fields.map(escape).join(","), ...rows.map((row) => fields.map((field) => escape(row[field])).join(","))].join("\r\n");
+  const csv = [fields.map(escape).join(","), ...rows.map((row) => fields.map((field) => escape(provenance[field] ?? row[field])).join(","))].join("\r\n");
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
   const anchor = document.createElement("a"); anchor.href = url; anchor.download = "experiment-comparison.csv"; anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -74,7 +82,7 @@ export default function Leaderboard() {
   if (loading) return <div className="flex min-h-64 items-center justify-center gap-3 text-sm text-slate-400"><Loader2 className="animate-spin text-cyan-300" size={18} /> Loading validation comparisons…</div>;
 
   return <div className="space-y-6">
-    <header className="flex flex-wrap items-end justify-between gap-3"><div><div className="text-[10px] uppercase tracking-[.18em] text-purple-200/70">DIP · loss and model comparison</div><h2 className="mt-1 text-xl font-semibold text-slate-100">Validation leaderboard</h2><p className="mt-1 text-sm text-slate-400">Per-experiment metrics come from the same best validation-Dice epoch. These are validation results, not independent test results.</p></div><div className="flex flex-wrap gap-2"><select className="input w-auto" aria-label="Filter by phase" value={phase} onChange={(event) => setPhase(event.target.value)}><option value="">All phases</option>{[1, 2, 3].map((value) => <option key={value} value={value}>Phase {value}</option>)}</select><select className="input w-auto" aria-label="Filter by status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option>{["pending", "running", "done", "failed"].map((value) => <option key={value} value={value}>{value}</option>)}</select><button className="btn btn-secondary flex items-center gap-2" onClick={() => exportCsv(rows)}><Download size={14} />Export CSV</button></div></header>
+    <header className="flex flex-wrap items-end justify-between gap-3"><div><div className="text-[10px] uppercase tracking-[.18em] text-purple-200/70">DIP · loss and model comparison</div><h2 className="mt-1 text-xl font-semibold text-slate-100">Validation leaderboard</h2><p className="mt-1 text-sm text-slate-400">Per-experiment metrics come from the same best validation-Dice epoch. These are validation results, not independent test results.</p><p className="mt-2 max-w-3xl text-xs leading-5 text-amber-200">Segmentation scores are agreement with generated spherical/elliptical pseudo-masks on sampled patches; they do not measure expert-contour accuracy.</p></div><div className="flex flex-wrap gap-2"><select className="input w-auto" aria-label="Filter by phase" value={phase} onChange={(event) => setPhase(event.target.value)}><option value="">All phases</option>{[1, 2, 3].map((value) => <option key={value} value={value}>Phase {value}</option>)}</select><select className="input w-auto" aria-label="Filter by status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option>{["pending", "running", "done", "failed"].map((value) => <option key={value} value={value}>{value}</option>)}</select><button className="btn btn-secondary flex items-center gap-2" onClick={() => exportCsv(rows)}><Download size={14} />Export CSV</button></div></header>
     {error && <div className="card text-sm text-rose-200">{error}</div>}
 
     <section className="card">
