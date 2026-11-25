@@ -30,6 +30,7 @@ from pathlib import Path
 from glob import glob
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from checkpoint_io import load_checkpoint_weights_only
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [EVAL] %(message)s")
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ def evaluate_checkpoint(
             f"Available subsets: {available_folds}"
         )
     # Load checkpoint metadata
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ckpt = load_checkpoint_weights_only(checkpoint_path, map_location=device)
     config = ckpt.get("config", {})
     mask_loss_cfg = config.get("mask_loss", {"alpha": 1.0})
     evaluation_data_role = evaluation_data_role_for_checkpoint(config, fold)

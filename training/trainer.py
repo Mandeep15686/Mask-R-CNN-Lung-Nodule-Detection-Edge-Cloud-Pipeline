@@ -18,6 +18,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 
+from checkpoint_io import load_checkpoint_weights_only
 from .model import build_model
 from .dataset import build_dataloaders
 from .metrics import MetricTracker, evaluate_batch
@@ -166,7 +167,7 @@ class Trainer:
             expected_digest = config.get("initial_state_sha256")
             if expected_digest and digest != expected_digest:
                 raise ValueError("Shared initial state SHA256 does not match experiment config")
-            initial_state = torch.load(initial_path, map_location="cpu", weights_only=True)
+            initial_state = load_checkpoint_weights_only(initial_path, map_location="cpu")
             if isinstance(initial_state, dict) and "model_state" in initial_state:
                 initial_state = initial_state["model_state"]
             self.model.load_state_dict(initial_state, strict=True)

@@ -5,6 +5,7 @@ Runs ResNet-50 up to the configured split layer on the edge device.
 import torch
 import torch.nn as nn
 import hashlib
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -55,7 +56,12 @@ class EdgeFeatureExtractor(nn.Module):
             checkpoint_path = Path(checkpoint_path).expanduser().resolve()
             if not checkpoint_path.is_file():
                 raise FileNotFoundError(f"Edge model checkpoint not found: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            project_root = Path(__file__).resolve().parents[1]
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            from checkpoint_io import load_checkpoint_weights_only
+
+            checkpoint = load_checkpoint_weights_only(checkpoint_path, map_location="cpu")
             if not isinstance(checkpoint, dict):
                 raise ValueError("Checkpoint root must be a dictionary")
             state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))

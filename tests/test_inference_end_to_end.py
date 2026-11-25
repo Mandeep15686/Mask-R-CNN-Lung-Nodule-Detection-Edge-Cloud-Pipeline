@@ -38,6 +38,7 @@ def _fake_checkpoint(path: Path, config_id="test-config", model_state=None):
     model_state = model_state or _EmptyDetectionModel().state_dict()
     torch.save({
         "epoch": 3,
+        "torch_version": torch.__version__,
         "model_state": model_state,
         "metrics": {"val_dice": 0.4, "val_hd95": 4.0},
         "config": {

@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from typing import Literal
 import os
+import sys
+from pathlib import Path
 
 CompressMethod = Literal["none", "int8", "learned"]
 
@@ -37,7 +39,12 @@ class FeatureCompressor:
                     "Learned compression requires a trained codec checkpoint set "
                     "with LEARNED_COMPRESSOR_CHECKPOINT"
                 )
-            state = torch.load(checkpoint, map_location=device, weights_only=True)
+            project_root = Path(__file__).resolve().parents[1]
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            from checkpoint_io import load_checkpoint_weights_only
+
+            state = load_checkpoint_weights_only(checkpoint, map_location=device)
             metadata = state.get("metadata", {}) if isinstance(state, dict) else {}
             model_state = state.get("codec_state") if isinstance(state, dict) else None
             if not isinstance(model_state, dict) or metadata.get("format") != "learned_feature_codec_v1":

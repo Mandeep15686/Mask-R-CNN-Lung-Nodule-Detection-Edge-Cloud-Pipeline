@@ -266,7 +266,11 @@ class InferenceEngine:
                     self.default_config_id = None
                     self.model_loading_error = f"Checkpoint changed and is being reloaded: {path}"
 
-            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+            if str(_PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(_PROJECT_ROOT))
+            from checkpoint_io import load_checkpoint_weights_only
+
+            checkpoint = load_checkpoint_weights_only(path, map_location=self.device)
             if not isinstance(checkpoint, dict):
                 raise ValueError("Checkpoint root must be a dictionary")
             state = _checkpoint_state_dict(checkpoint)

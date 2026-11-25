@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from checkpoint_io import load_checkpoint_weights_only
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [CN5-DP] %(message)s")
 logger = logging.getLogger(__name__)
@@ -172,7 +173,7 @@ def run_dp_experiment(
     logger.info(f"Device: {device} | Split: {split_layer}")
 
     # Load the checkpoint and require recorded scan-level train/validation roles.
-    ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ckpt  = load_checkpoint_weights_only(checkpoint_path, map_location=device)
     cfg = dict(ckpt.get("config", {}))
     split = cfg.get("data_split") or {}
     train_subsets = split.get("train_subsets")

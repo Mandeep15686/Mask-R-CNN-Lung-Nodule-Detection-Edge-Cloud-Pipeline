@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from checkpoint_io import load_checkpoint_weights_only
 
 
 def _target_from_sample(sample: dict, device: torch.device) -> dict:
@@ -61,7 +62,7 @@ def main() -> None:
     if not checkpoint_path.is_file() or not config_path.is_file():
         parser.error("checkpoint and sibling config.json must both exist")
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    checkpoint = load_checkpoint_weights_only(checkpoint_path, map_location="cpu")
     model_config = dict(config)
     model_config["pretrained_backbone"] = False
     model_config["mask_loss"] = {
