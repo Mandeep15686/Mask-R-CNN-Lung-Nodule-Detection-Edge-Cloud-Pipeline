@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard, FlaskConical, BarChart3, Database,
-  Scan, Network, Menu, X, Activity,
+  Scan, Network, Menu, X, Activity, BrainCircuit, Target,
 } from "lucide-react";
 import Dashboard     from "./pages/Dashboard.jsx";
 import Experiments   from "./pages/Experiments.jsx";
@@ -10,11 +10,15 @@ import Leaderboard   from "./pages/Leaderboard.jsx";
 import InferencePage from "./pages/InferencePage.jsx";
 import EdgeNetwork   from "./pages/EdgeNetwork.jsx";
 import DatasetModel  from "./pages/DatasetModel.jsx";
+import MGDASection from "./pages/MGDASection.jsx";
+import Phase3Section from "./pages/Phase3Section.jsx";
 import clsx from "clsx";
 
 const NAV = [
   { to: "/",             label: "Dashboard",    icon: LayoutDashboard },
   { to: "/experiments",  label: "Experiments",  icon: FlaskConical    },
+  { to: "/mgda",         label: "MGDA Runs",    icon: BrainCircuit    },
+  { to: "/phase3",       label: "Phase 3 TPE",  icon: Target          },
   { to: "/leaderboard",  label: "Leaderboard",  icon: BarChart3       },
   { to: "/inference",    label: "Inference",    icon: Scan            },
   { to: "/edge",         label: "Edge Network", icon: Network         },
@@ -122,6 +126,8 @@ export default function App() {
           <Routes>
             <Route path="/"            element={<Dashboard />}     />
             <Route path="/experiments/*" element={<Experiments />} />
+            <Route path="/mgda" element={<MGDASection />} />
+            <Route path="/phase3" element={<Phase3Section />} />
             <Route path="/leaderboard" element={<Leaderboard />}   />
             <Route path="/inference"   element={<InferencePage />} />
             <Route path="/edge"        element={<EdgeNetwork />}   />

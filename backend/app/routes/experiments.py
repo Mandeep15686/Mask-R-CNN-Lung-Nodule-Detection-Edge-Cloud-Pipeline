@@ -1,5 +1,6 @@
 """Experiment management routes (create, list, start, track progress)."""
 import asyncio
+import csv
 import json
 import logging
 import os
@@ -250,6 +251,124 @@ async def sync_experiment_artifacts(db: Session = Depends(get_db)):
     return {"status": "ok", **stats}
 
 
+def _read_json_file(path: Path, default):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+@router.get("/phase3/studies")
+async def list_phase3_studies():
+    """Return persisted Phase 3 TPE studies and per-trial artifacts for the UI."""
+    experiments_dir = Path(
+        os.environ.get("EXPERIMENTS_DIR", str(PROJECT_ROOT / "experiments"))
+    ).expanduser().resolve()
+    studies_dir = experiments_dir / "phase3" / "studies"
+    if not studies_dir.is_dir():
+        return {"studies": [], "source": str(studies_dir)}
+
+    studies = []
+    for study_dir in sorted(path for path in studies_dir.iterdir() if path.is_dir()):
+        best = _read_json_file(study_dir / "phase3_best.json", {})
+        trials = []
+        csv_path = study_dir / "trials.csv"
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                trial_rows = list(csv.DictReader(handle))
+        except OSError:
+            trial_rows = []
+
+        for row in trial_rows:
+            try:
+                trial_number = int(row.get("trial_number", ""))
+            except (TypeError, ValueError):
+                continue
+            trial_dir = study_dir / f"trial_{trial_number:04d}"
+            config = _read_json_file(trial_dir / "config.json", {})
+            summary = _read_json_file(trial_dir / "summary.json", {})
+            history = _read_json_file(trial_dir / "history.json", [])
+            if not isinstance(history, list):
+                history = []
+            split = config.get("data_split") or {}
+            mask_loss = config.get("mask_loss") or {}
+            log_path = trial_dir / "terminal.log"
+            if not log_path.is_file():
+                log_path = trial_dir / "experiment.log"
+            try:
+                trial_log = log_path.read_text(encoding="utf-8", errors="replace")[-30000:]
+            except OSError:
+                trial_log = ""
+            trials.append({
+                "trial_number": trial_number,
+                "state": row.get("state", "UNKNOWN"),
+                "elapsed_s": _float_or_none(row.get("elapsed_s")),
+                "score": _float_or_none(row.get("score")),
+                "metrics": summary.get("best_metrics") or {
+                    "val_dice": _float_or_none(row.get("dice")),
+                    "val_hd95": _float_or_none(row.get("hd95")),
+                    "val_boundary_f1": _float_or_none(row.get("boundary_f1")),
+                },
+                "final_metrics": summary.get("final_metrics") or {},
+                "best_epoch": summary.get("best_epoch") or _int_or_none(row.get("best_epoch")),
+                "raw_weights": config.get("phase3_raw_weights") or _weights_from_row(row, "_raw"),
+                "normalized_weights": config.get("phase3_norm_weights") or _weights_from_row(row, "_norm"),
+                "training_config": {
+                    "epochs": config.get("epochs"),
+                    "batch_size": config.get("batch_size"),
+                    "lr": config.get("lr"),
+                    "warmup_epochs": config.get("warmup_epochs"),
+                    "bce_pos_weight": mask_loss.get("bce_pos_weight"),
+                    "cache_mode": "cached" if config.get("cache_dir") else "raw",
+                    "patch_size": config.get("patch_size"),
+                    "train_subsets": split.get("train_subsets", config.get("train_subsets")),
+                    "validation_subset": split.get("validation_subset", config.get("validation_subset")),
+                    "test_subset": split.get("test_subset", config.get("test_subset")),
+                    "train_scan_count": len(split.get("train_scan_uids", [])),
+                    "validation_scan_count": len(split.get("validation_scan_uids", [])),
+                    "independent_test_available": split.get("independent_test_available", False),
+                },
+                "history": history,
+                "log": trial_log,
+                "checkpoint_available": (trial_dir / "best_model.pth").is_file(),
+                "summary_available": bool(summary),
+            })
+
+        studies.append({
+            "study_name": best.get("study_name") or study_dir.name,
+            "best": best,
+            "trials": trials,
+            "trial_count": len(trials),
+            "completed_trials": sum(row.get("state") == "COMPLETE" for row in trials),
+            "source": str(study_dir.relative_to(experiments_dir)).replace("\\", "/"),
+        })
+
+    return {"studies": studies, "source": str(studies_dir)}
+
+
+def _float_or_none(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _weights_from_row(row: dict, suffix: str) -> dict:
+    return {
+        name: _float_or_none(row.get(f"{name}{suffix}"))
+        for name in ("alpha", "beta", "gamma", "delta", "epsilon")
+    }
+
+
 @router.get("/{exp_id}", response_model=ExperimentResponse)
 async def get_experiment(exp_id: int, db: Session = Depends(get_db)):
     exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
@@ -286,12 +405,20 @@ async def get_experiment_details(exp_id: int, db: Session = Depends(get_db)):
         {column.name: getattr(run, column.name) for column in TrainingRun.__table__.columns}
         for run in runs
     ]
-    config_id = exp.config_id
-    log_path = _experiment_artifact_dir(exp) / "terminal.log"
+    artifact_dir = _experiment_artifact_dir(exp)
+    log_path = artifact_dir / "terminal.log"
+    if not log_path.is_file():
+        log_path = artifact_dir / "experiment.log"
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    summary = _read_json_file(artifact_dir / "summary.json", {})
+    history = _read_json_file(artifact_dir / "history.json", [])
+    if not isinstance(history, list):
+        history = []
     return json_safe({
         "experiment": experiment_data,
         "runs": run_data,
+        "history": history,
+        "artifact_summary": summary,
         "log": log_text,
     })
 
