@@ -51,7 +51,10 @@ def main():
     parser.add_argument("--max-configs", type=int,   default=None,         help="Phase 2: max configs to run")
     parser.add_argument("--resume", action="store_true",
                         help="Phase 2: skip configurations with complete validated artifacts")
-    parser.add_argument("--n-trials",    type=int,   default=100,          help="Phase 3: Optuna trials")
+    parser.add_argument("--n-trials",    type=int,   default=30,           help="Phase 3: target Optuna trials")
+    parser.add_argument("--epochs-per-trial", type=int, default=10, help="Phase 3: epochs per Optuna trial")
+    parser.add_argument("--seed", type=int, default=42, help="Phase 3: TPE sampler seed")
+    parser.add_argument("--study-name", default="lung_nodule_loss_weights_v1", help="Phase 3: persistent Optuna study name")
     parser.add_argument("--mgda-max-iter", type=int, default=200, help="Phase 4: Frank-Wolfe solver iterations")
     parser.add_argument("--mgda-tol", type=float, default=1e-8, help="Phase 4: Frank-Wolfe stopping tolerance")
     parser.add_argument("--mgda-log-conflict", action="store_true", help="Phase 4: include pairwise gradient conflict diagnostics")
@@ -85,7 +88,12 @@ def main():
     elif args.phase == 2:
         runner.run_phase2(max_configs=args.max_configs, resume=args.resume)
     elif args.phase == 3:
-        result = runner.run_phase3(n_trials=args.n_trials)
+        result = runner.run_phase3(
+            n_trials=args.n_trials,
+            epochs_per_trial=args.epochs_per_trial,
+            seed=args.seed,
+            study_name=args.study_name,
+        )
         print("\n=== Phase 3 Best Result ===")
         import json
         print(json.dumps(result, indent=2))

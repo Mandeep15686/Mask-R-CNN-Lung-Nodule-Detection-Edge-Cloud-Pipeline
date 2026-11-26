@@ -149,76 +149,27 @@ def generate_phase4_configs(max_iter: int = 200, tol: float = 1e-8) -> list[dict
 def run_bayesian_optimisation(
     base_cfg: dict,
     output_dir: str,
-    n_trials: int = 100,
+    n_trials: int = 30,
     n_jobs: int = 1,
+    epochs_per_trial: int = 10,
+    seed: int = 42,
+    study_name: str = "lung_nodule_loss_weights_v1",
 ) -> dict:
-    """Run Optuna TPE search over all 5 loss weights."""
-    try:
-        import optuna
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-    except ImportError:
-        raise ImportError("Install optuna: pip install optuna")
+    """Backward-compatible entry point for the persistent Phase 3 study.
 
-    from .trainer import Trainer
+    ``n_jobs`` remains accepted for older callers, but trials run sequentially
+    to share the single training GPU safely.
+    """
+    from .phase3_bayesian import run_phase3_bayesian
 
-    def objective(trial: "optuna.Trial") -> float:
-        alpha   = trial.suggest_float("alpha",   0.0, 1.0)
-        beta    = trial.suggest_float("beta",    0.0, 1.0)
-        gamma   = trial.suggest_float("gamma",   0.0, 1.0)
-        delta   = trial.suggest_float("delta",   0.0, 0.5)
-        epsilon = trial.suggest_float("epsilon", 0.0, 0.3)
-
-        if alpha + beta + gamma + delta + epsilon < 0.01:
-            return 0.0
-
-        cfg = deepcopy(base_cfg)
-        cfg["config_id"] = f"optuna_trial_{trial.number}"
-        cfg["mask_loss"] = {
-            "alpha": alpha, "beta": beta,
-            "gamma": gamma, "delta": delta, "epsilon": epsilon,
-        }
-        # Shorter training for search
-        cfg["epochs"] = max(10, base_cfg.get("epochs", 30) // 3)
-
-        run_dir = Path(output_dir) / "phase3" / f"trial_{trial.number:04d}"
-        trainer = Trainer(cfg, str(run_dir))
-        summary = trainer.train()
-
-        # Composite objective: 50% Dice + 30% (1 - HD95_norm) + 20% BoundaryF1
-        metrics = summary.get("final_metrics", {})
-        dice = metrics.get("val_dice")
-        dice = 0.0 if dice is None else dice
-        hd95 = metrics.get("val_hd95")
-        hd95 = 999.0 if hd95 is None else min(hd95, 100.0)
-        bdf1 = metrics.get("val_boundary_f1")
-        bdf1 = 0.0 if bdf1 is None else bdf1
-        score = 0.5 * dice + 0.3 * (1.0 - hd95 / 100.0) + 0.2 * bdf1
-
-        trial.set_user_attr("dice", dice)
-        trial.set_user_attr("hd95", hd95)
-        trial.set_user_attr("boundary_f1", bdf1)
-        return score
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        study_name="lung_nodule_loss_opt",
+    return run_phase3_bayesian(
+        base_cfg=base_cfg,
+        output_dir=output_dir,
+        n_trials=n_trials,
+        epochs_per_trial=epochs_per_trial,
+        seed=seed,
+        study_name=study_name,
     )
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
-
-    best = study.best_trial
-    result = {
-        "best_trial": best.number,
-        "best_score": best.value,
-        "best_params": best.params,
-        "best_dice": best.user_attrs.get("dice"),
-        "best_hd95": best.user_attrs.get("hd95"),
-        "best_boundary_f1": best.user_attrs.get("boundary_f1"),
-    }
-    with open(Path(output_dir) / "phase3_best.json", "w") as f:
-        json.dump(result, f, indent=2, allow_nan=False)
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -491,14 +442,26 @@ class ExperimentRunner:
             self._save_results()
         logger.info("Phase 2 complete.")
 
-    def run_phase3(self, n_trials: int = 100):
-        logger.info("=== PHASE 3: Bayesian Optimisation ===")
+    def run_phase3(
+        self,
+        n_trials: int = 30,
+        epochs_per_trial: int = 10,
+        seed: int = 42,
+        study_name: str = "lung_nodule_loss_weights_v1",
+    ) -> dict:
+        logger.info(
+            "=== PHASE 3: Bayesian Optimisation | trials=%d epochs/trial=%d ===",
+            n_trials, epochs_per_trial,
+        )
         result = run_bayesian_optimisation(
             base_cfg=self.base_config,
             output_dir=str(self.output_dir),
             n_trials=n_trials,
+            epochs_per_trial=epochs_per_trial,
+            seed=seed,
+            study_name=study_name,
         )
-        logger.info(f"Phase 3 best: {result}")
+        logger.info("Phase 3 best: %s", result)
         return result
 
     def run_phase4(

@@ -295,6 +295,7 @@ class CompositeMaskLoss(nn.Module):
             gamma=cfg.get("gamma", 0.0),
             delta=cfg.get("delta", 0.0),
             epsilon=cfg.get("epsilon", 0.0),
+            bce_pos_weight=cfg.get("bce_pos_weight", 1.0),
         )
 
     def active_tasks(self) -> list[str]:
